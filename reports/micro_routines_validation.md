@@ -76,17 +76,24 @@ reduced inductive grid, not silicon latency or steady-state throughput.
 
 ### Fused integration
 
-All four leaves are now also exercised together in one MIX-mode kernel over
-three key pages; see
+All four leaves, plus the CV transfer leaf, are exercised together in one
+`MIX_AIC_1_2` kernel over three key pages, driving one Cube core and both
+Vector cores with no Global Memory workspace; see
 [`fused_attention_integration.md`](fused_attention_integration.md).
 
-| Probe | Result | Scalar addr errors | Dispatch span | Model ticks |
+| Revision | Result | Scalar addr errors | Dispatch span | Model ticks |
 | --- | --- | ---: | --- | ---: |
-| fused attention (N=3) | 768/768 score entries bit-exact, max 2.000 ULP, 1152/1152 guard bytes | 0 | 707..8876 (8169 cyc, 2463 instr) | 9203 |
+| GM workspace, AIV0 only | 768/768 bit-exact, max 2.000 ULP, 1152/1152 guard bytes | 0 | 707..8876 (8169 cyc, 2463 instr) | 9203 |
+| UB→L1 CV path, AIV0+AIV1 | 768/768 bit-exact, max 2.000 ULP, 1024/1024 guard bytes | 0 | 692..6073 (5381 cyc, 2569 instr) | 6404 |
 
-23/23 intra-core HardEvent pairs and 10/10 cross-core mode-4 flags retire with
-zero residual tokens, and MTE2, Cube, Vector and MTE3 are concurrently in
-flight for 438 cycles.
+Both revisions produce bit-identical `m`, `l` and context values against the
+same oracle. In the current one, 40/40 intra-core HardEvent pairs over 28
+`(route, ID)` pairs on three cores and 21/21 cross-core mode-4 flags retire
+with zero residual tokens; the Cube waits one staging flag from each Vector
+core before every GEMM; AIV0 and AIV1 are concurrently in flight for 1551
+cycles; and MTE2, Cube, Vector and MTE3 overlap for 100 cycles, down from 438
+because deleting the GM round trip removed most of the DMA there was to
+overlap with.
 
 ### Online softmax: faults fixed this cycle
 

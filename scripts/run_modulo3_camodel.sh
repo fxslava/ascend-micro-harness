@@ -59,14 +59,19 @@ if [[ "${mode}" == "micro" ]]; then
     python3 "${repo_dir}/scripts/analyze_micro_trace.py" \
         core0.veccore0.instr_popped_log.dump \
         core0.veccore0.instr_log.dump \
+        core0.veccore1.instr_popped_log.dump \
+        core0.veccore1.instr_log.dump \
         core0.cubecore0.instr_popped_log.dump \
         core0.cubecore0.instr_log.dump | tee "camodel_${micro_name}_trace_summary.txt"
-    # The fused probe is the only one that drives AIC and AIV together, so it
-    # also gets the event-balance and engine-overlap audit.
+    # The fused probe is the only one that drives the Cube core and both Vector
+    # cores together, so it also gets the event-balance, CV-path and
+    # engine-overlap audit over all three per-core dumps.
     if [[ "${micro_name}" == "fused_attention_3tiles" ]]; then
         python3 "${repo_dir}/scripts/analyze_fused_trace.py" \
             core0.veccore0.instr_popped_log.dump \
             core0.veccore0.instr_log.dump \
+            core0.veccore1.instr_popped_log.dump \
+            core0.veccore1.instr_log.dump \
             core0.cubecore0.instr_popped_log.dump \
             core0.cubecore0.instr_log.dump \
             | tee "camodel_${micro_name}_event_summary.txt"

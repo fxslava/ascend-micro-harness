@@ -2,7 +2,11 @@
 // pages. Checks three independent things:
 //
 //   1. the whole 16x16 score panel of every page, bit-exactly, which verifies
-//      the dequant4 -> GM workspace -> L1(ZN) -> L0B -> Mmad -> Fixpipe path;
+//      the dequant4 -> UB -> L1(Zn) -> L0B -> Mmad -> Fixpipe path. There is no
+//      Global Memory workspace on that path any more: the key page is staged
+//      from Vector UB straight into Cube L1 by the CV transfer leaf, so a
+//      mistake in the fractal placement shows up here as a transposed or
+//      permuted panel rather than as a silent pass;
 //   2. the online-softmax state (m, l) and the FP32 normalised context against
 //      a CPU attention oracle, in ULP;
 //   3. the FP16 context actually stored by the outflow leaf.
@@ -25,7 +29,7 @@
 
 extern "C" void launch_camodel_fused_attention(
     void*, std::uint16_t*, std::int8_t*, std::int8_t*, std::uint32_t*,
-    std::uint16_t*, float*, float*, float*, std::uint16_t*);
+    float*, float*, float*, std::uint16_t*);
 
 namespace {
 
@@ -37,8 +41,16 @@ constexpr int kPackedBytes = kPanel / 2;
 constexpr float kKeyScale = 0.5f;
 constexpr float kValueScale = 0.25f;
 
-// Fixture generators. These mirror the device-side packing contract exactly:
-// k nibble index (d * kKeys + key), v nibble index (ch * kKeys + key).
+// Fixture generators. key_nibble and value_nibble are indexed by meaning, not
+// by packing order: key_nibble(t, d, key) is the quantised K[key][d] of page t
+// and value_nibble(t, ch, key) the quantised V[key][ch]. The oracle below is
+// therefore identical to the one the GM-workspace revision used, and only the
+// packing loop changed when the key cache moved to fractal order.
+//
+// Device packing contract: k nibble index (key * kDim + d), so the dequantised
+// UB page is the ND matrix K[key][d], whose Nz image is byte for byte the Zn
+// image of K^T that the Cube B operand needs; v nibble index (ch * kKeys + key),
+// the channel-major order update_accumulator expects for v_by_channel.
 int key_nibble(int t, int d, int key) { return (d * 8 + key + t * (d + 1) * 14) % 16; }
 int value_nibble(int t, int ch, int key) { return (ch + key + t * (ch + 3) * 3) % 16; }
 float query(int row, int d) { return static_cast<float>(((row * 3 + d * 5) % 9) - 4) / 64.0f; }
@@ -109,7 +121,6 @@ int main()
         camodel::GuardedDeviceBuffer k_packed(kTiles * kPackedBytes);
         camodel::GuardedDeviceBuffer v_packed(kTiles * kPackedBytes);
         camodel::GuardedDeviceBuffer offsets(kPanel * 4);
-        camodel::GuardedDeviceBuffer ws_k(kTiles * kPanel * 2);
         camodel::GuardedDeviceBuffer out_scores(kTiles * kPanel * 4);
         camodel::GuardedDeviceBuffer out_state(kDim * 4);
         camodel::GuardedDeviceBuffer out_normalized(kDim * 4);
@@ -124,14 +135,16 @@ int main()
             for (int d = 0; d < kKeys; ++d)
                 qv[row * kKeys + d] = half_rne(query(row, d));
 
-        // Pack two nibbles per byte, low nibble first.
+        // Pack two nibbles per byte, low nibble first. The key page is packed
+        // key-major (index key * kDim + d) and the value page channel-major
+        // (index ch * kKeys + key).
         for (int t = 0; t < kTiles; ++t)
             for (int i = 0; i < kPackedBytes; ++i) {
-                const int lo_index = 2 * i, hi_index = 2 * i + 1;
-                const int k_lo = key_nibble(t, lo_index / kKeys, lo_index % kKeys);
-                const int k_hi = key_nibble(t, hi_index / kKeys, hi_index % kKeys);
-                const int v_lo = value_nibble(t, lo_index / kKeys, lo_index % kKeys);
-                const int v_hi = value_nibble(t, hi_index / kKeys, hi_index % kKeys);
+                const int lo = 2 * i, hi = 2 * i + 1;
+                const int k_lo = key_nibble(t, lo % kDim, lo / kDim);
+                const int k_hi = key_nibble(t, hi % kDim, hi / kDim);
+                const int v_lo = value_nibble(t, lo / kKeys, lo % kKeys);
+                const int v_hi = value_nibble(t, hi / kKeys, hi % kKeys);
                 kv[t * kPackedBytes + i] = static_cast<std::uint8_t>((k_hi << 4) | k_lo);
                 vv[t * kPackedBytes + i] = static_cast<std::uint8_t>((v_hi << 4) | v_lo);
             }
@@ -140,7 +153,7 @@ int main()
                 ov[ch * kKeys + key] = static_cast<std::uint32_t>(key * sizeof(float));
 
         q.upload(); k_packed.upload(); v_packed.upload(); offsets.upload();
-        ws_k.upload(); out_scores.upload(); out_state.upload();
+        out_scores.upload(); out_state.upload();
         out_normalized.upload(); out_context.upload();
 
         launch_camodel_fused_attention(
@@ -148,7 +161,6 @@ int main()
             static_cast<std::int8_t*>(k_packed.payload()),
             static_cast<std::int8_t*>(v_packed.payload()),
             static_cast<std::uint32_t*>(offsets.payload()),
-            static_cast<std::uint16_t*>(ws_k.payload()),
             static_cast<float*>(out_scores.payload()),
             static_cast<float*>(out_state.payload()),
             static_cast<float*>(out_normalized.payload()),
@@ -156,10 +168,10 @@ int main()
         camodel::check(aclrtSynchronizeStream(session.stream), "fused attention synchronize");
 
         q.download(); k_packed.download(); v_packed.download(); offsets.download();
-        ws_k.download(); out_scores.download(); out_state.download();
+        out_scores.download(); out_state.download();
         out_normalized.download(); out_context.download();
         q.assert_guards(); k_packed.assert_guards(); v_packed.assert_guards();
-        offsets.assert_guards(); ws_k.assert_guards(); out_scores.assert_guards();
+        offsets.assert_guards(); out_scores.assert_guards();
         out_state.assert_guards(); out_normalized.assert_guards();
         out_context.assert_guards();
 
@@ -261,7 +273,7 @@ int main()
             }
         }
 
-        const std::size_t guard_bytes = 9 * 2 * camodel::kGuardBytes;
+        const std::size_t guard_bytes = 8 * 2 * camodel::kGuardBytes;
         std::printf("PASS fused attention: %d pages, %d/%d score entries bit-exact, "
                     "max %.3f ULP (worst operand %s), %d/%d FP16 context within 1 half ULP, "
                     "%zu/%zu GM guard bytes intact\n",

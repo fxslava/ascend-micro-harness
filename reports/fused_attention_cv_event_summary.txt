@@ -1,0 +1,19 @@
+intra-core HardEvents: 40 sets / 40 waits across 28 (route, ID) pairs on 3 cores; zero residual
+cross-core mode-4 flags: 21 sets / 21 waits, every absolute id paired AIV<->AIC
+double handshake: before each of 3 GEMMs the Cube waited one staging flag from each Vector core (3 from AIV0 ids 0..15, 3 from AIV1 ids 16..31)
+  AIV0: 2053 instructions (SCALAR 799, RVECEX 409, RVECST 287, RVECLD 214, FLOWCTRL 96, RVECSU 86, PUSHQ 75, RVECLP 53, MTE2 15, VEC 11, MTE3 8)
+  AIV1: 317 instructions (SCALAR 170, RVECEX 36, RVECST 33, FLOWCTRL 23, MTE3 13, VEC 12, PUSHQ 11, MTE2 7, RVECLD 6, RVECLP 3, RVECSU 3)
+  AIC: 199 instructions (SCALAR 124, FLOWCTRL 25, CUBE 18, MTE1 16, FIXP 12, MTE2 4)
+CV path: 3 MOV_UB_TO_L1 hardware moves, 0 Global Memory stores on the staging core
+outflow: 5 GM stores, first at cycle 5235, all after the last Fixpipe at cycle 1800
+dispatch span: cycles 692..6073 (5381 cycles, 2569 instructions)
+completion span: cycles 696..6093 (5397 cycles, 2571 instructions)
+engine busy cycles: MTE2 1160, Cube 1700, Vector 4094, MTE3 675
+  overlap Cube   + Vector:  1693 cycles (widest 1273..2966)
+  overlap Cube   + MTE2  :  1023 cycles (widest 1273..2296)
+  overlap Cube   + MTE3  :   100 cycles (widest 1925..1959)
+  overlap Vector + MTE2  :  1156 cycles (widest 1140..2296)
+  overlap Vector + MTE3  :   100 cycles (widest 1925..1959)
+  overlap MTE2   + MTE3  :   100 cycles (widest 1925..1959)
+four-engine overlap: 100 cycles, widest CAModel cycles 1925..1959
+AIV0 + AIV1 concurrent: 1551 cycles, widest CAModel cycles 703..1961

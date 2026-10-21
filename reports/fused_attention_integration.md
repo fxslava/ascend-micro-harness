@@ -1,117 +1,179 @@
-# Fused TurboQuant paged attention — N = 3 boundary integration
+# Fused TurboQuant paged attention — MIX_AIC_1_2, N = 3 pages
 
-Kernel: [`kernels/camodel/turboquant_paged_attention_opt.cpp`](../kernels/camodel/turboquant_paged_attention_opt.cpp).
+Kernel: [`kernels/ops/turboquant/turboquant_paged_attention_opt.cpp`](../kernels/ops/turboquant/turboquant_paged_attention_opt.cpp).
 Runner: [`tests/camodel/test_camodel_fused_attention_3tiles.cpp`](../tests/camodel/test_camodel_fused_attention_3tiles.cpp).
+CV leaf: [`routines/routine_cv_transfer_ub_to_l1.hpp`](../routines/routine_cv_transfer_ub_to_l1.hpp).
+Trace audit: [`fused_attention_cv_event_summary.txt`](fused_attention_cv_event_summary.txt).
 
 ```sh
 bash scripts/run_modulo3_camodel.sh micro fused_attention_3tiles
 ```
 
-Target: CANN 9.2.0-beta.2, `dav-3510`, `Ascend950PR_9599` CAModel, MIX mode
-(one AIC plus AIV0), `CMAKE_BUILD_TYPE=Release`.
+Target: CANN 9.2.0-beta.2, `dav-3510`, `Ascend950PR_9599` CAModel,
+`KERNEL_TYPE_MIX_AIC_1_2` (one Cube core and **both** Vector cores),
+`CMAKE_BUILD_TYPE=Release`, `blockDim = 1`.
 
-## What is integrated
+## What changed from the previous revision
 
-| Stage | Leaf | Engine path |
+| | previous | this revision |
 | --- | --- | --- |
-| Ingress | `routine_turboquant_dequant4.hpp` | MTE2 → UB, int4 → FP16 (K) and FP32 (V) |
-| GEMM | `routine_cube_matmul.hpp` | GM → L1(ZN) → L0A/L0B → L0C → UB |
-| Recurrence | `routine_vector_online_softmax.hpp` | pure Vector, replicated 32-byte state, `Brcb` broadcast |
-| Outflow | `routine_vector_normalize_store.hpp` | invoked once after the final page |
+| Key page path | UB → GM workspace → L1(Zn) | UB → L1, on chip |
+| GM workspace bytes | `ws_k`, 3 × 512 B | **0**, argument removed |
+| Vector cores used | AIV0 only, AIV1 idle | AIV0 **and** AIV1 |
+| Per-page GM stores | 1 score-panel dump per page | **0** |
+| Cube path barriers | 2 × `PipeBarrier<PIPE_ALL>` per page | **0** |
+| Steady-state control flow | runtime `for` with `% 2` ping-pong | 3 unrolled compile-time columns |
+| Model ticks | 9203 | **6404** |
+| Dispatch span | 8169 cycles | **5381 cycles** |
 
-All four leaves are used unmodified, through their published entry points.
+Numerics are unchanged: the same 768/768 bit-exact score entries and the same
+`m = 0.125`, `l = 34.0713806`, `context[0] = 1.85358536`,
+`context[15] = 1.82630539`. That bit-for-bit agreement with the already
+validated GM-workspace revision, against an oracle that did not change, is the
+"establish numerics before concurrency" evidence section 6.3 of the
+[guidelines](../MICROROUTINE_DESIGN_GUIDELINES.md) asks for.
 
-### Geometry and the one scoping decision
+## The hardware CV path
 
-Q carries `kDim = 16` query rows so the Cube operand geometry matches the
-verified 16×16 engine exactly. The online-softmax and outflow leaves are
-per-query routines, so they are instantiated for **query row 0**. The Cube
-still produces all 16 rows, and the runner checks every one of the
-3 × 256 = 768 score entries, which is what verifies the ingress and GEMM path.
-Extending the recurrence to all 16 rows would need 16 copies of the carried
-state and 16× the vector work; it is not what an N = 3 boundary probe is for.
+`routines/routine_cv_transfer_ub_to_l1.hpp` moves the dequantised FP16 key
+page from Vector UB straight into Cube L1. The public entry point is
 
-### Why the key page round-trips through GM
-
-The Te copy surface has no UB → L1 transfer. The available tags are
-`CopyGM2L1`, `CopyGM2UB`, `CopyL12L0A/B`, `CopyL12UB`, `CopyL12BT`,
-`CopyL12FB`, `CopyL0C2UB/L1/GM` and `CopyUB2GM` — there is no `CopyUB2L1`.
-Dequantisation is Vector work so it lands in UB, while the Cube B operand must
-reach L1 in ZN. The only path the verified API surface supports is therefore
-
-```
-int4 GM → UB → dequant (Vector) → GM workspace → L1(ZN) → L0B → Mmad
+```cpp
+DataCopy(LocalTensor<T> dst /*A1|B1*/, LocalTensor<T> src /*VECCALC*/,
+         DataCopyParams)
 ```
 
-which is also how a production paged-attention kernel stages a dequantised
-page when the fractal conversion has to happen in the GM→L1 converter. The
-workspace holds one slot per page, so there is no cross-core WAR on it.
+which on `dav-3510` reaches `DataCopyUB2L1Impl`
+(`impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h:619`). That function
+is `__in_pipe__(MTE3) __out_pipe__(MTE3)`, and for any AIC:AIV ratio other than
+1:1 its body is a single `CopyUbufToCbuf`, i.e. the `copy_ubuf_to_cbuf`
+hardware move in
+`impl/c_api/instr_impl/npu_arch_3510/vector_datamove_impl/asc_copy_ub2l1_impl.h`.
+The kernel `#error`s if `__MIX_CORE_AIC_RATION__ == 1`, because at 1:1 the same
+call silently becomes a KFC relay through GM.
 
-### Host packing contract
-
-Both layout choices live in the caller, which keeps the dequant leaf a pure
-1-D vector routine:
-
-- `k_packed` nibble index `(d * kKeys + key)` = quantised `K[key][d]`, so the
-  staged FP16 page is ND `[d][key]`, i.e. `K^T`, and `S = Q · K^T`.
-- `v_packed` nibble index `(ch * kKeys + key)` = quantised `V[key][ch]`, the
-  channel-major order `update_accumulator` expects for `v_by_channel`.
-- Two nibbles per byte, low nibble first, matching the dequant4 contract.
-- Scales are compile-time (`kKeyScale = 0.5`, `kValueScale = 0.25`) so no
-  scalar argument is read on device; the runner mirrors them exactly.
-
-## Pipeline structure
-
-Ingress runs **one page ahead** of the recurrence, so the Cube never waits on
-the dequantisation of the page it is about to multiply:
+The move shows up in the AIV1 trace as one instruction per page:
 
 ```
-ingress(page 0)                      # prologue
-for page in 0..2:
-    if page + 1 < 3: ingress(page + 1)
-    wait scores(page); online_softmax(page); dump panel; release score panel
-normalize_store()                    # once
+[00001827] MTE3 : (ID: 000664) MOV_UB_TO_L1  Src:UB, Dst:L1, XD:X18=0x220, XN:X14=0x1080
+[00001876] MTE3 : (ID: 000727) MOV_UB_TO_L1  Src:UB, Dst:L1, XD:X19=0x440, XN:X14=0x12a0
+[00001925] MTE3 : (ID: 000801) MOV_UB_TO_L1  Src:UB, Dst:L1, XD:X4=0x660,  XN:X2=0x14c0
 ```
 
-The dequantised value page is double buffered (`kUbVFloat0` / `kUbVFloat1`)
-because ingress of page t+1 writes it while the recurrence on page t is still
-reading it. The key staging buffer stays single because each ingress drains it
-through MTE3 before the next one runs, behind an `MTE3_V` edge.
+`XD` is the L1 destination: 0x220, 0x440, 0x660 = 544, 1088, 1632, exactly the
+three `kL1KeySlot` bases. `XN` is the UB source: 0x1080, 0x12a0, 0x14c0 = 4224,
+4768, 5312, exactly the three `kUbKeyRing` slots. The analyzer asserts both the
+count and that the staging core issues **zero** `Dst:OUT` stores, so the key
+page provably never reaches Global Memory.
 
-### Event graph
+### Why not `DataCopy(dst, src, Nd2NzParams)`
 
-Cross-core uses mode 4 (AIC ↔ AIV0), which 950PR supports in both directions
-with flagId 0..10:
+The `Nd2NzParams` overload exists for UB → L1 and is the API the task
+description names, but on `dav-3510` it is `DataCopyUB2L1ND2NZImpl`: it calls
+`PopStackBuffer<T, TPosition::LCM>()` and `GetTPipePtr()->FetchEventID()`,
+rearranges the cube inside UB with a vector `TransND2NZ`, and only then issues
+the same `CopyUbufToCbuf`. A kernel that places its own `LocalTensor`s never
+instantiates a `TPipe`, so `GetTPipePtr()` is null and both accesses land at GM
+`0x40` — the exact fault mechanism dissected in section 0 of the guidelines.
+The arch-3510 variant with none of that, `DataCopyUB2L1ND2NZImplV2`, is
+library-internal and unreachable from the public interface, so the leaf
+reimplements its burst schedule on the `DataCopyParams` overload: one
+`(NValue × 1 block)` strided burst per C0 column strip, emitted by a fold over
+a compile-time index sequence. Same instruction stream, no `TPipe`.
 
-| Flag | Direction | Meaning | Sets | Waits |
+### Fractal placement, and the one contract change
+
+ND → NZ at 32-byte block granularity is a strided *placement*, not an element
+permutation. For a 16-wide FP16 panel the row is exactly one C0 block, so the
+schedule collapses to a single contiguous 16-block burst — which is why the
+trace shows one instruction per page rather than a loop.
+
+The Cube B operand wants Zn. For one 16×16 half fractal, Nz is
+`(M1,N1,M0,N0)` row major and Zn is `(K1,N1,N0,K0)`, its transpose, so
+`Nz(X)` and `Zn(X^T)` are the same bytes. Staging the ND page `K[key][d]` as Nz
+therefore lands exactly the Zn image of `K^T` that `CopyL12L0B` expects, with
+no element permutation anywhere on chip.
+
+That costs one change to the host contract: `k_packed` is now packed key-major,
+nibble index `key * kDim + d`, instead of `d * kKeys + key`. This is a KV-cache
+layout decision, which is where it belongs — a production cache stores pages in
+the fractal order the Cube reads. The alternative would be an element transpose
+on the Vector side, which the 32-byte burst engine cannot express. `v_packed` is
+unchanged at `ch * kKeys + key`.
+
+## Work split across the two Vector cores
+
+| Core | Per page |
+| --- | --- |
+| **AIV1** | MTE2 ingress of packed K, Vector dequant to FP16, MTE3 UB → L1 staging |
+| **AIV0** | MTE2 ingress of packed V, Vector dequant to FP32, the online-softmax recurrence, and the single outflow |
+| **AIC** | quorum wait, MTE1 L1 → L0A/L0B, `Mmad`, Fixpipe L0C → AIV0 UB |
+
+The recurrence sits on AIV0 because `Te::FixpipeParams` defaults
+`subBlockId = false`, so `routine_cube_matmul.hpp`'s Fixpipe lands in sub block
+0's UB without the leaf being touched. Every leaf is used unmodified.
+
+The split is not balanced — AIV0 runs 2053 instructions against AIV1's 317 —
+but both cores do real work on the critical path, and they are concurrently in
+flight for 1551 of the 5381 dispatch cycles. A balanced split would have to cut
+the recurrence across cores, which needs 8 copies of the carried state or a
+reworked accumulator leaf; neither is what an N = 3 depth probe establishes.
+
+## Three-stage modulo schedule
+
+Column `j`, slots taken modulo `kStageDepth = 3` at compile time:
+
+| stage | work | tile | slot |
+| --- | --- | --- | --- |
+| 0 | MTE2 ingress + dequant + CV stage | `j + 2` | `(j + 2) % 3` |
+| 1 | MTE1 → L0, `Mmad`, Fixpipe | `j + 1` | `(j + 1) % 3` |
+| 2 | online-softmax recurrence | `j` | `j % 3` |
+
+Nothing in a column depends on anything else in that column. The three columns
+are instantiated as `StepColumn<2,1,0>`, `StepColumn<0,2,1>`,
+`StepColumn<1,0,2>` on each of the three cores, with `if constexpr` ramp flags,
+so the steady state has no loop, no `%`, no predicate and no scalar read of UB.
+Prologue is stage 0 for tiles 0 and 1 plus stage 1 for tile 0; ramp-down falls
+out of the compile-time flags.
+
+### Mode-4 double handshake
+
+`set_intra_block` / `wait_intra_block` ids form one space per AI Core block, of
+which the library gives the upper half to sub block 1 — `GetIntraFlagId` adds
+`subBlockId * INTRA_NUM`, and `SyncAllImpl` on a non-1:1 ratio waits both
+`SYNC_AIV_FLAG` and `SYNC_AIV_FLAG + SYNC_FLAG_ID_MAX`. The trace confirms the
+convention directly: an AIV prints `sync_id` relative to its own half while the
+AIC prints the absolute id, so AIV1's raw id 16 appears as `sync_id:0` on AIV1
+and `sync_id:16` on the AIC.
+
+| Flag | ids | Direction | Sets | Waits |
 | --- | --- | --- | ---: | ---: |
-| 0 | AIV → AIC | key page staged in GM workspace | 3 | 3 |
-| 1 | AIC → AIV | Fixpipe landed in the shared UB panel | 3 | 3 |
-| 2 | AIV → AIC | UB score panel consumed, free to overwrite | 1 primed + 3 | 3 + 1 drained |
+| slot ready, value page | 0..2 | AIV0 → AIC | 3 | 3 |
+| product ready | 4..6 | AIC → AIV0 | 3 | 3 |
+| panel free | 8..10 | AIV0 → AIC | 3 primed + 3 | 3 + 3 drained |
+| slot ready, key page | 16..18 | AIV1 → AIC | 3 | 3 |
+| L1 slot free | 20..22 | AIC → AIV1 | 3 primed + 3 | 3 + 3 drained |
 
-Intra-AIV HardEvents, 7 `(route, ID)` pairs over event IDs 0..2 (6 and 7 are
-reserved):
+Before each GEMM the Cube waits one `PIPE_MTE1` flag from each Vector core:
 
-| Route | ID | Sets | Waits | Purpose |
-| --- | ---: | ---: | ---: | --- |
-| `MTE2_V` | 0 | 4 | 4 | packed pages readable |
-| `V_MTE2` | 0 | 1 primed + 3 | 3 + 1 drained | packed buffers free (WAR) |
-| `V_MTE3` | 1 | 3 | 3 | FP16 key page ready to stage |
-| `MTE3_V` | 1 | 1 primed + 3 | 3 + 1 drained | staging buffer drained (WAR) |
-| `V_MTE3` | 2 | 4 | 4 | score panel / context ready to store |
-| `MTE3_V` | 2 | 3 | 3 | diagnostic store drained (WAR) |
-| `MTE3_S` | 2 | 1 | 1 | final store visible |
+```
+WAIT_INTRA_BLOCK  PIPE:MTE1, XT:X5=0x10, sync_id:16     <- AIV1, key staged
+WAIT_INTRA_BLOCK  PIPE:MTE1, XT:X2=0,    sync_id:0      <- AIV0, value dequantised
+```
 
-Every primed token is drained after the loop, so nothing leaks into the next
-launch. `scripts/analyze_fused_trace.py` asserts all of this from the trace
-rather than from the source.
+so a page is multiplied only once both Vector cores have finished their half of
+the staging. Intra-core ordering is 28 `(route, ID)` HardEvent pairs —
+`MTE3_V`, `MTE2_V`, `V_MTE3` on AIV1, `V_MTE2`, `MTE2_V`, `V_MTE3`, `MTE3_S` on
+AIV0, `M_MTE1`, `MTE1_M`, `FIX_M`, `MTE2_MTE1` on the AIC — with the `Mmad`
+and `Fixpipe` paired under matching `unitFlag = 3`. There is no
+`PipeBarrier<PIPE_ALL>` anywhere in the kernel.
 
 ## Measured results
 
 ```
 PASS fused attention: 3 pages, 768/768 score entries bit-exact,
   max 2.000 ULP (worst operand context), 16/16 FP16 context within 1 half ULP,
-  1152/1152 GM guard bytes intact
+  1024/1024 GM guard bytes intact
   final m=0.125 l=34.0713806  context[0]=1.85358536 context[15]=1.82630539
 ```
 
@@ -120,97 +182,87 @@ PASS fused attention: 3 pages, 768/768 score entries bit-exact,
 | Device exit code | 0 |
 | `invalid ldst addr` / `unrecognize ldst addr` / `su_ccu_mpu_err` | 0 |
 | `[error]` / `[fatal]` simulator lines | 0 |
-| Score panel | 768/768 bit-exact FP32 |
+| `core0.excp_log.dump` / `core1.excp_log.dump` | 0 bytes |
+| Score panels | 768/768 bit-exact FP32 |
 | Max error, `m` / `l` / FP32 context | 2.000 ULP (budget 8.0) |
 | FP16 context | 16/16 within one half ULP |
-| GM guard bands (`0xDEADBEEF`) | 1152/1152 bytes intact, 9 buffers |
+| GM guard bands (`0xDEADBEEF`) | 1024/1024 bytes intact, 8 buffers |
+| GM workspace bytes for key staging | 0 |
 | Replicated-state invariant | all 8 lanes of the `m` and `l` blocks identical |
-| Model ticks | 9203 |
-| Dispatch span | cycles 707..8876 (8169 cycles, 2463 instructions) |
-| Completion span | cycles 711..8897 (8186 cycles, 2343 instructions) |
+| Model ticks | 6404 |
+| Dispatch span | cycles 692..6073 (5381 cycles) |
+| Completion span | cycles 696..6093 (5397 cycles) |
 
-### Event audit and engine overlap
+Three runs of the same build gave model ticks 6404, 6432 and 6438 and an
+absolute span start of 691 or 692. The span *lengths* (5381 and 5397), every
+engine occupancy and every overlap figure were identical across all three, so
+the ±1 cycle and ±34 tick spread is launch jitter, not measurement noise in
+the numbers this report draws conclusions from.
+
+### Engine occupancy and overlap
 
 ```
-intra-core HardEvents: 23 sets / 23 waits across 7 (route, ID) pairs; IDs 0..5; zero residual
-cross-core mode-4 flags: 10 sets / 10 waits, every sync id paired AIV<->AIC
-engine busy cycles: MTE2 2073, Cube 2362, Vector 6793, MTE3 3891
-  overlap Cube   + Vector:  2250 cycles (widest 5600..6111)
-  overlap Cube   + MTE2  :   895 cycles (widest 1243..1678)
-  overlap Cube   + MTE3  :   934 cycles (widest 5676..6111)
-  overlap Vector + MTE2  :  2072 cycles (widest 1244..1797)
-  overlap Vector + MTE3  :  3326 cycles (widest 6993..7573)
-  overlap MTE2   + MTE3  :  1026 cycles (widest 2475..2999)
-four-engine overlap: 438 cycles, widest CAModel cycles 3176..3527
+engine busy cycles: MTE2 1160, Cube 1700, Vector 4094, MTE3 675
+  overlap Cube   + Vector:  1693 cycles (widest 1273..2966)
+  overlap Cube   + MTE2  :  1023 cycles (widest 1273..2296)
+  overlap Cube   + MTE3  :   100 cycles (widest 1925..1959)
+  overlap Vector + MTE2  :  1156 cycles (widest 1140..2296)
+  overlap Vector + MTE3  :   100 cycles (widest 1925..1959)
+  overlap MTE2   + MTE3  :   100 cycles (widest 1925..1959)
+four-engine overlap: 100 cycles, widest CAModel cycles 1925..1959
+AIV0 + AIV1 concurrent: 1551 cycles, widest CAModel cycles 703..1961
 ```
 
-MTE2, Cube, Vector and MTE3 are concurrently in flight for 438 cycles, with
-all six pairwise overlaps non-empty. Vector is the critical engine at 6793
-busy cycles of an 8169-cycle span.
+All six pairwise overlaps are non-empty and MTE2, Cube, Vector and MTE3 are
+concurrently in flight for 100 cycles. The four-engine window is *narrower*
+than the previous revision's 438 cycles, and that is the expected consequence
+of the change rather than a regression: removing the GM round trip cut MTE3
+occupancy from 3891 to 675 cycles and MTE2 from 2073 to 1160, so there is far
+less DMA left to overlap with, while the whole run got 30% shorter. Reporting
+the overlap figure without that context would be misleading.
 
-### What the run-ahead bought
+### Where the time goes, honestly
 
-The same kernel was first built as a strict ping-pong (ingress → GEMM →
-recurrence, no look-ahead, no double buffering) to establish numerics before
-any concurrency was introduced:
+Vector is the critical engine at 4094 of 5381 dispatch cycles, and the Cube
+retires its last Fixpipe at cycle 1800 — a third of the way through. With three
+pages, three-deep buffering and a primed panel-free back edge, the Cube drains
+the whole sequence before the recurrence has caught up, so the measured span is
+recurrence-bound and the tail from cycle ~1961 to 6073 is AIV0 finishing the
+last two recurrences plus the outflow. The back edges that would throttle the
+Cube to the recurrence rate exist and are primed and drained, but at N = 3 the
+ring never wraps, so they are structural rather than load-bearing in this run.
+This figure is a depth-boundary measurement, not a steady-state interval.
 
-| Variant | Model ticks | Dispatch span | Cube MMAD dispatch ticks |
-| --- | ---: | ---: | --- |
-| Ping-pong | 11509 | 10424 cycles | 3583, 6004, 8601 |
-| One page look-ahead | 9203 | 8169 cycles | overlapped, see above |
+## Verification checklist
 
-A 20% tick reduction and a 21.6% shorter dispatch span, with **bit-identical
-results** — the same 768/768 exact score entries and the same
-`m`, `l` and context values. Numerics were established first and then
-re-verified after the concurrency change, which is the sequencing the
-[guidelines](../MICROROUTINE_DESIGN_GUIDELINES.md) §0 argue for: a barrier
-removal can expose a latent hazard, so results must be re-checked, not just
-the error count.
-
-## Fixture design, and why it is built this way
-
-The runner's fixture is chosen so the checks can be strict:
-
-- Q is FP16 with values that are multiples of 1/64 in [-0.0625, 0.0625], and
-  the dequantised key page is a multiple of 0.5 in [0, 7.5]. Every product and
-  partial sum is then a multiple of 1/128 well inside FP32, so the reference
-  score panel is **exact** and step 1 can demand bit equality rather than a
-  tolerance. This is what makes the ingress and GEMM path verifiable at all.
-- The three pages are numerically distinct, with **strictly increasing page
-  maxima** (`0.0`, `0.0625`, `0.125`), so `alpha < 1` on every page after the
-  first and the rescaling path actually runs.
-- Per-page `p_sum` values are distinct (12.79, 12.14, 11.39) and all 16 keys
-  contribute non-negligibly, so the softmax is not degenerate.
-- All 16 context channels are distinct, so a channel or key permutation
-  cannot pass.
-
-The distinctness properties are deliberate. The earlier online-softmax WAR
-hazard survived its original validation precisely because every tile in that
-fixture shared the same maximum, which made a wrong-tile read invisible in
-`m`. A fused fixture whose pages are interchangeable would be unable to detect
-a run-ahead or double-buffering fault, which is the main thing this probe
-exists to check.
-
-## Precision note
-
-Max 2.000 ULP on the FP32 context, against a budget of 8.0. This is better
-than the 8 ULP seen in the isolated online-softmax probe for a structural
-reason: the dequant4 leaf masks nibbles to unsigned 0..15, so V is
-non-negative and the accumulator is a non-cancelling sum. The isolated probe
-used signed V with up to 10.2× cancellation. Per
-[guidelines](../MICROROUTINE_DESIGN_GUIDELINES.md) §5, a ULP budget belongs
-against the largest intermediate for a cancelling reduction; here there is no
-cancellation, so the final value is the right reference.
+| Requirement | Evidence |
+| --- | --- |
+| Zero GM workspace bytes for key staging | `ws_k` argument and buffer removed; analyzer asserts 0 `Dst:OUT` stores on the staging core |
+| Both AIV0 and AIV1 active | 2053 and 317 instructions, 1551 cycles concurrently in flight |
+| Zero scalar load/store errors | 0 matches for `invalid ldst addr`, `unrecognize ldst addr`, `su_ccu_mpu_err`; both `excp_log` dumps empty |
+| Canary guard bands intact | 1024/1024 GM bytes of `0xDEADBEEF` over 8 buffers |
+| Context within 2.0 ULP | max 2.000 ULP, worst operand `context` |
+| All 768 score entries bit-exact | 768/768, `bits(have) == bits(want)` |
+| No per-page MTE3 dump | 5 GM stores, all after the last Fixpipe at cycle 1800 |
+| No `PipeBarrier<PIPE_ALL>` | none in the kernel source; Cube path uses `M_MTE1`, `MTE1_M`, `FIX_M` and `unitFlag = 3` |
 
 ## What remains untested
 
-- Silicon. CAModel is cycle-accurate but is not hardware; it does not validate
-  timing closure, power, or multi-core scale-out.
-- `N = 3` is a depth boundary, not sustained throughput. It exercises
-  prologue, steady state and the single-page look-ahead, but the overlap
-  figures are for this depth, not a steady-state interval.
-- One AIC and one AIV (`blockDim = 1`). AIV1 is idle and no inter-AI-Core
-  (mode 0) synchronization is exercised.
-- The recurrence and outflow cover query row 0 only, as described above.
+- Silicon. CAModel is cycle accurate but is not hardware; it does not validate
+  timing closure, power, or multi-core scale out.
+- `N = 3` is a depth boundary, not sustained throughput. The ring never wraps,
+  so the reuse back edges are exercised for token balance but not for
+  contention, and the overlap figures are for this depth only.
+- One AI Core (`blockDim = 1`). No inter-AI-Core (mode 0) synchronization and
+  no multi-block key-page distribution.
+- The recurrence and outflow cover query row 0. The Cube produces all 16 rows
+  and every one of the 768 score entries is checked, but the (m, l, Acc)
+  recurrence is instantiated once, not 16 times.
+- The Vector work split is deliberately asymmetric; a balanced split needs a
+  per-core accumulator contract that these leaves do not have.
 - Dequantisation has no zero point, so the quantised range is unsigned 0..15
   times a scale. A signed or per-group quantiser is a different leaf contract.
+- `DataCopyUB2L1ND2NZImplV2`'s multi-strip branch is reimplemented and
+  compile-time asserted but, at `DValue == C0`, only the single-strip case
+  actually executes here. A panel wider than one C0 block would exercise the
+  fold.

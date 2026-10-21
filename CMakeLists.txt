@@ -47,15 +47,21 @@ set_target_properties(test_pipeline_deadlock_probe_camodel PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 
-# add_micro_camodel_probe(<name> [<kernel_basename>])
+# add_micro_camodel_probe(<name> [<kernel_basename>|<kernel_path>])
 # Builds target test_camodel_<name> from tests/camodel/test_camodel_<name>.cpp
-# against kernels/camodel/<kernel_basename>.cpp, defaulting to <name>.
+# against kernels/camodel/<kernel_basename>.cpp, defaulting to <name>. A second
+# argument containing a slash is taken as a repository-relative source path
+# instead, which is how the production operator under kernels/ops is built.
 function(add_micro_camodel_probe name)
-  set(kernel "${name}")
+  set(kernel_src "kernels/camodel/${name}.cpp")
   if(ARGC GREATER 1)
-    set(kernel "${ARGV1}")
+    if(ARGV1 MATCHES "/")
+      set(kernel_src "${ARGV1}")
+    else()
+      set(kernel_src "kernels/camodel/${ARGV1}.cpp")
+    endif()
   endif()
-  ascendc_library(camodel_${name}_kernel SHARED kernels/camodel/${kernel}.cpp)
+  ascendc_library(camodel_${name}_kernel SHARED ${kernel_src})
   ascendc_compile_definitions(camodel_${name}_kernel PRIVATE ASCEND_MICRO_CANN_LAUNCH)
   ascendc_compile_options(camodel_${name}_kernel PRIVATE
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
@@ -73,4 +79,5 @@ add_micro_camodel_probe(dequant4)
 add_micro_camodel_probe(cube_matmul)
 add_micro_camodel_probe(normalize_store)
 add_micro_camodel_probe(online_softmax)
-add_micro_camodel_probe(fused_attention_3tiles turboquant_paged_attention_opt)
+add_micro_camodel_probe(fused_attention_3tiles
+    kernels/ops/turboquant/turboquant_paged_attention_opt.cpp)

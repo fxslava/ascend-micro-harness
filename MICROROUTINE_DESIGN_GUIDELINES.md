@@ -524,29 +524,107 @@ result, for any cancelling reduction.**
 Verified by building the fused paged-attention kernel
 ([`reports/fused_attention_integration.md`](reports/fused_attention_integration.md)).
 
-### 6.1 There is no UB → L1 transfer
+### 6.1 The UB → L1 transfer exists; use the MTE3 burst form
 
-The Te copy surface offers `CopyGM2L1`, `CopyGM2UB`, `CopyL12L0A/B`,
-`CopyL12UB`, `CopyL12BT`, `CopyL12FB`, `CopyL0C2UB/L1/GM` and `CopyUB2GM`.
-There is **no `CopyUB2L1`**. So any operand that is produced by Vector work
-(dequantisation, transposition, activation) and consumed by the Cube as an
-L1 fractal has to round-trip through a GM workspace:
+**This section previously claimed that no UB → L1 path exists and that a
+Vector-produced Cube operand must round-trip through a GM workspace. That was
+wrong for CANN 9.2 / dav-3510, and the claim has been retracted.** It was
+inferred from one incomplete read of the Tensor API copy tags; the correction
+is traced below to the implementation headers and to a CAModel instruction
+trace.
+
+CANN 9.2 offers the transfer twice:
+
+| API | Position pair | What it lowers to on dav-3510 |
+| --- | --- | --- |
+| `Te` `CopyUB2L1` | ND→ND, DN→DN, NZ→NZ, ZN→ZN only (`impl/tensor_api/arch/vector/ub_to_l1/routing.h`) | `CopyUbufToCbuf` |
+| `DataCopy(LocalTensor<A1\|B1>, LocalTensor<VEC>, DataCopyParams)` | any, caller-strided | `DataCopyUB2L1Impl` → `CopyUbufToCbuf` |
+| `DataCopy(..., Nd2NzParams)` | ND→NZ | `DataCopyUB2L1ND2NZImpl` → **needs a `TPipe`** |
+
+`DataCopyUB2L1Impl`
+(`impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h:619`) is declared
+`__in_pipe__(MTE3) __out_pipe__(MTE3)`, and for any AIC:AIV ratio other than
+1:1 its whole body is one `CopyUbufToCbuf`, that is the `copy_ubuf_to_cbuf`
+hardware move in
+`impl/c_api/instr_impl/npu_arch_3510/vector_datamove_impl/asc_copy_ub2l1_impl.h`.
+No `TPipe`, no stack buffer, no Global Memory. So the path is
 
 ```
-int4 GM -> UB -> dequant (Vector) -> GM workspace -> L1(ZN) -> L0B -> Mmad
+int4 GM -> UB -> dequant (Vector) -> UB -> L1(Zn) -> L0B -> Mmad
 ```
 
-Give the workspace one slot per pipeline stage so there is no cross-core WAR
-on it, and let the layout conversion happen in the GM→L1 converter, which is
-the only engine that does it.
+and the fused kernel's trace shows it as one `MOV_UB_TO_L1 Src:UB, Dst:L1`
+MTE3 instruction per page.
+
+Three constraints come with it, and all three have teeth.
+
+1. **Declare the topology.** The direct body is guarded by
+   `#if KFC_C310_SSBUF == 1 || __MIX_CORE_AIC_RATION__ != 1`. At a 1:1 ratio
+   the identical call becomes a KFC relay that copies UB → GM and messages the
+   AIC to copy GM → L1, silently reintroducing the workspace. Declare
+   `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2)` and `#error` on
+   `__MIX_CORE_AIC_RATION__ == 1` rather than trusting the default.
+2. **Do not use the `Nd2NzParams` overload from a kernel with no `TPipe`.**
+   `DataCopyUB2L1ND2NZImpl` calls `PopStackBuffer<T, TPosition::LCM>()` and
+   `GetTPipePtr()->FetchEventID()`, so in this harness's hand-placed-tensor
+   style it is the §0 null-`TPipe` fault, not a transfer. The arch-3510 variant
+   that avoids all of it, `DataCopyUB2L1ND2NZImplV2`, is library-internal.
+   Reimplement its burst schedule on the `DataCopyParams` overload instead:
+   one `(nValue × 1 block)` strided burst per C0 column strip, with the strip
+   count a template parameter so the emitter unrolls at compile time.
+   `routines/routine_cv_transfer_ub_to_l1.hpp` is that leaf.
+3. **The burst engine places blocks; it does not permute elements.** ND → NZ at
+   32-byte granularity is a strided placement. A conversion that needs an
+   element transpose — ND → Zn for a single FP16 fractal, for instance — is not
+   expressible, because Zn is the within-fractal transpose of Nz. Fix that in
+   the cache layout, not in the transfer: for one 16×16 half fractal, `Nz(X)`
+   and `Zn(X^T)` are the same bytes, so packing the KV page key-major makes the
+   dequantised UB buffer already the Zn image of `K^T`. A production paged-KV
+   cache stores pages in the fractal order the Cube reads anyway.
+
+A GM workspace is still the right answer when the conversion genuinely needs
+the GM→L1 converter's element-level rearrangement, or on a 1:1 part. It is not
+the only answer, and on 950PR in MIX_AIC_1_2 it is the slower one: removing it
+from the fused kernel cut MTE3 occupancy from 3891 to 675 cycles and the
+dispatch span from 8169 to 5381, with bit-identical results.
+
+### 6.1b Reaching a chosen Vector core from the Cube
+
+`Te::FixpipeParams{unitFlag, subBlockId}` selects which Vector core's UB a
+`CopyL0C2UB` lands in, and `FixpipeParamsArch3510::dualDstCtl` can instead
+split the M×N cube in half and write both UBs at once (M split needs even M,
+N split needs N divisible by 32). `subBlockId` defaults to `false`, so a leaf
+that does not expose it always writes sub block 0 — put the consumer of the
+Fixpipe output on AIV0 and no leaf needs changing.
 
 ### 6.2 Cross-core edges are mode 4, and they need priming and draining too
 
-`CrossCoreSetFlag<4, pipe>` / `CrossCoreWaitFlag<4, pipe>` synchronises one
-AIC with one AIV on 950PR, in **both** directions, with flagId 0..10. The
-`pipe` template parameter on a wait is the pipe whose issuance blocks, so a
-wait guarding Vector work takes `PIPE_V` and one guarding a Fixpipe takes
-`PIPE_FIX`.
+`CrossCoreSetFlag<4, pipe>` / `CrossCoreWaitFlag<4, pipe>` lower to
+`set_intra_block` / `wait_intra_block`
+(`impl/basic_api/dav_3510/kernel_operator_sync_impl.h:790`), which synchronise
+the Cube core with the Vector cores inside one AI Core block, in **both**
+directions. Modes 0..3 instead emit `ffts_cross_core_sync` with the mode
+masked to two bits; mode 4 is the intra-block one and the one to use here.
+
+The flag id space is **per sub block**: the library's own `GetIntraFlagId`
+adds `subBlockId * INTRA_NUM` with `INTRA_NUM == 16`, and `SyncAllImpl` on a
+non-1:1 ratio has the AIC wait both `SYNC_AIV_FLAG` and
+`SYNC_AIV_FLAG + SYNC_FLAG_ID_MAX`. So ids 0..15 are AIV0's channel and 16..31
+are AIV1's, the Cube participates on both, and a "both Vector cores are ready"
+barrier is two waits, one id from each half. Keep clear of the library's
+reserved ids (`SYNC_AIC_AIV_FLAG` 13, `SYNC_AIV_ONLY_ALL` 14, and their +16
+images).
+
+In the trace an AIV prints `sync_id` **relative to its own half** while the AIC
+prints the absolute id, so AIV1's raw id 16 appears as `sync_id:0` on
+`core0.veccore1` and `sync_id:16` on `core0.cubecore0`. Rebase before counting,
+or every AIV1 flag will look unpaired.
+
+The `pipe` template parameter on a wait is the pipe whose issuance blocks, so a
+wait guarding Vector work takes `PIPE_V`, one guarding an L1→L0 load takes
+`PIPE_MTE1`, and one guarding a Fixpipe takes `PIPE_FIX`. A set is ordered
+after the preceding work *on that same pipe*, which is how "the L1 slot is free
+once MTE1 has read it" is expressed: `CrossCoreSetFlag<4, PIPE_MTE1>`.
 
 The marked-graph discipline from §3.1 applies across cores unchanged: a
 buffer-reuse back edge, such as "the shared UB score panel is free again",
@@ -602,10 +680,16 @@ tolerance.
 
 And when integrating leaves into a pipeline (§6):
 
-- [ ] Vector-produced Cube operands routed through a GM workspace, one slot
-      per stage — there is no UB → L1 path.
+- [ ] Vector-produced Cube operands staged UB → L1 with the MTE3 burst form,
+      one ring slot per pipeline stage; `KERNEL_TYPE_MIX_AIC_1_2` declared and
+      `__MIX_CORE_AIC_RATION__ == 1` rejected at compile time (§6.1). A GM
+      workspace only where the conversion needs the GM→L1 converter.
+- [ ] Both Vector cores given work, with per-sub-block mode-4 flag ids
+      (0..15 and 16..31) and a Cube-side wait from each core where the Cube
+      must not outrun either (§6.2).
 - [ ] Cross-core back edges primed and drained, and balance checked per
-      `sync_id` **across** both core dumps.
+      `sync_id` **across all three** core dumps, rebasing the AIV1 ids by
+      `INTRA_NUM` because an AIV reports `sync_id` inside its own half.
 - [ ] Ping-pong proven numerically before look-ahead or double buffering is
       added, then re-proven.
 - [ ] Fixture tiles numerically distinct: increasing maxima, distinct sums,
