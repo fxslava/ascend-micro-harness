@@ -1,0 +1,89 @@
+Ascend950PR_9599 CAModel - online softmax scalar addressing fault
+================================================================
+
+Captured from the pre-fix baseline of kernels/camodel/online_softmax.cpp
+(AscendC::ReduceSum + Duplicate(tensor,tensor) variant), CANN 9.2.0-beta.2,
+dav-3510. 16 errors per launch: 4 distinct PCs x 4 tiles.
+Note the baseline still printed a numeric PASS - see the last line.
+
+--- 1. error summary -------------------------------------------------
+invalid ldst addr occurrences: 16
+distinct faulting PCs:
+      4 PC: 0x10d0d4c8
+      4 PC: 0x10d0d4d4
+      4 PC: 0x10d0d4e0
+      4 PC: 0x10d0d4f0
+distinct faulting addresses:
+     16 ldst_addr: 64
+
+--- 2. raw simulator error lines (first occurrence) ------------------
+[error] [core0.veccore0] [su_ccu_mpu_err_t0] (PC: 0x10d0d4c8) SCALAR   : (Binary: 0x1ce6f040) (ID: 000294) LD_XD_XN_IMM dtype:B64, XD:X19=0, XN:X15=0, IMM:0x40, #POST:0, execTime:0xf9, dcacheHit:0, accessUb:0, accessDdr:1, 
+[ERROR] pem_lsu.cc:477 mem_map_calc_49bit_op0 invalid ldst addr.
+ldst_addr: 64
+[ERROR] pem_lsu.cc:438 mem_map_decode unrecognize ldst addr.
+[ERROR] pem_lsu.cc:477 mem_map_calc_49bit_op0 invalid ldst addr.
+ldst_addr: 64
+[ERROR] pem_lsu.cc:438 mem_map_decode unrecognize ldst addr.
+[error] [core0.veccore0] [su_ccu_mpu_err_t0] (PC: 0x10d0d4e0) SCALAR   : (Binary: 0x1cded040) (ID: 000300) LD_XD_XN_IMM dtype:B64, XD:X15=0x1, XN:X13=0, IMM:0x40, #POST:0, execTime:0x4, dcacheHit:1, accessUb:0, accessDdr:1, 
+[error] [core0.veccore0] [su_ccu_mpu_err_t0] (PC: 0x10d0d4d4) SCALAR   : (Binary: 0x03e6f040) (ID: 000297) ST_XD_XN_IMM dtype:B64, XD:X19=0x1, XN:X15=0, IMM:0x40, #POST:0, execTime:0x25, dcacheHit:1, accessUb:0, accessDdr:1, 
+[ERROR] pem_lsu.cc:477 mem_map_calc_49bit_op0 invalid ldst addr.
+ldst_addr: 64
+[ERROR] pem_lsu.cc:438 mem_map_decode unrecognize ldst addr.
+[error] [core0.veccore0] [su_ccu_mpu_err_t0] (PC: 0x10d0d4f0) SCALAR   : (Binary: 0x03ded040) (ID: 000304) ST_XD_XN_IMM dtype:B64, XD:X15=0, XN:X13=0, IMM:0x40, #POST:0, execTime:0x25, dcacheHit:1, accessUb:0, accessDdr:1, 
+[ERROR] pem_lsu.cc:477 mem_map_calc_49bit_op0 invalid ldst addr.
+
+--- 3. decoded instruction window, core0.veccore0 -------------------
+    (from core0.veccore0.instr_popped_log.dump, IDs 291..304)
+    SFF/SBITSET around SET_FLAG/WAIT_FLAG = dynamic event-ID allocator;
+    its free-flag bitmap pointer (X15/X13) is loaded as 0, so every
+    [base+0x40] access resolves to GM address 64.
+
+  ID 291: LD   X12 <- [X30+0x8b0]    ; control-block pointer
+  ID 292: ADD  X13  = X12 + 8
+  ID 293: LD   X15 <- [X13+0]        ; X15 = 0            <-- null TPipe
+  ID 294: LD   X19 <- [X15+0x40]     ; addr 64            <-- FAULT  AllocEventID
+  ID 295: SFF  X12 <- scan-first-free(X19)
+  ID 296: SBITSET X19 <- set bit X12
+  ID 297: ST   [X15+0x40] <- X19     ; addr 64            <-- FAULT  AllocEventID
+  ID 299: LD   X13 <- [X13+0]        ; X13 = 0
+  ID 300: LD   X15 <- [X13+0x40]     ; addr 64            <-- FAULT  ReleaseEventID
+  ID 301: SET_FLAG  PIPE:VEC, TRIGGER PIPE:SCALAR, FLAG ID:0
+  ID 302: WAIT_FLAG PIPE:VEC, TRIGGER PIPE:SCALAR, FLAG ID:0
+  ID 303: SBITSET X15 <- clear bit X12
+  ID 304: ST   [X13+0x40] <- X15     ; addr 64            <-- FAULT  ReleaseEventID
+
+--- 4. producing library code ---------------------------------------
+  impl/basic_api/dav_3510/kernel_operator_vec_reduce_impl.h:736-758
+
+      template <typename T>
+      __aicore__ inline void ReduceSumImpl(__ubuf__ T* dstLocal, ...)
+      {
+          ...
+          if constexpr (is_same<T,float> || is_same<T,half>) {
+              TEventID eventID = GetTPipePtr()->AllocEventID<HardEvent::V_S>();
+              SetFlag<HardEvent::V_S>(eventID);
+              WaitFlag<HardEvent::V_S>(eventID);
+              GetTPipePtr()->ReleaseEventID<HardEvent::V_S>(eventID);
+              accValFloat = dstLocal[0];          // scalar load of UB
+          }
+      }
+
+  The kernel hand-places its LocalTensors and never instantiates a TPipe,
+  so GetTPipePtr() is null.
+
+--- 5. baseline outcome ---------------------------------------------
+PASS native online softmax: 4 tiles, max absolute error 2.38418579e-07, 512/512 GM guard bytes intact
+Total tick: 7841
+
+--- 6. post-fix outcome ---------------------------------------------
+    (final state: ReduceRepeat + Brcb + primed/drained V_MTE2 back edge)
+
+PASS native online softmax: 4 tiles, max absolute error 2.38418579e-07, max 8.000 ULP (worst operand acc), 512/512 GM guard bytes intact
+CAModel cycles: dispatch 713..7671 (6958 cycles, 1882 instructions); complete 717..7691 (6974 cycles, 1765 instructions)
+RC=0  SCALAR_ADDR_ERRORS=0
+invalid ldst addr occurrences: 0
+
+Numeric accuracy is identical to the faulting baseline (2.38418579e-07 max
+absolute error in both), confirming the fixes changed addressing and
+scheduling only, not arithmetic. The 8 ULP figure is on the cancelling
+accumulator; see MICROROUTINE_DESIGN_GUIDELINES.md section 5.

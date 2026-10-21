@@ -1,8 +1,19 @@
 # Ascend 950PR 16×16 Cube Hadamard probe
 
+Micro-routine development rules — the zero-scalar-compute invariant, UB
+alignment and bank invariants (AKA3003), RAW/WAR hazard management inside the
+AIV, and the two-tier verification methodology — are in
+[`MICROROUTINE_DESIGN_GUIDELINES.md`](MICROROUTINE_DESIGN_GUIDELINES.md).
+Read it before adding a routine.
+
 The three-stage modulo synchronization probe is documented in
 [`reports/modulo3_deadlock_probe.md`](reports/modulo3_deadlock_probe.md). Run it
 under WSL/CAModel with `bash scripts/run_modulo3_camodel.sh`.
+
+The four micro-routine CAModel probes run with
+`bash scripts/run_modulo3_camodel.sh micro <dequant4|cube_matmul|normalize_store|online_softmax>`.
+Latest results are in
+[`reports/micro_routines_validation.md`](reports/micro_routines_validation.md).
 
 `routines/routine_cube_hadamard16.hpp` dispatches one FP16×FP16→FP32
 `Mmad` followed by one L0C→GM `Fixpipe` copy. The caller precomputes the

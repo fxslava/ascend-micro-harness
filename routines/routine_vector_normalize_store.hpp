@@ -44,6 +44,15 @@ struct NativeNormalizeStoreEngine {
     AscendC::LocalTensor<Output> ub_output;
     AscendC::GlobalTensor<Output> gm_output;
 
+    // Duplicate's tensor-source form broadcasts l[0] to count lanes. Unlike
+    // the online-softmax stage, l is not guaranteed replicated here and count
+    // may exceed one Brcb repeat (64 FP32), so Duplicate is the right API --
+    // but on dav-3510 it lowers to an *unmasked* Reg::LoadAlign of a whole
+    // vector register (VECTOR_REG_WIDTH == 256 bytes) from the source base,
+    // independent of count. It performs no scalar read and needs no TPipe, so
+    // it is not a scalar hazard; it is a footprint hazard. The caller must
+    // therefore keep kVecReg bytes of addressable UB behind l. See the
+    // static_assert on kLDenominator in kernels/camodel/normalize_store.cpp.
     __aicore__ inline void broadcast_denominator(std::uint32_t count)
     {
         AscendC::Duplicate(l_broadcast, l, count);

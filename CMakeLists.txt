@@ -46,3 +46,23 @@ target_compile_options(test_pipeline_deadlock_probe_camodel PRIVATE
 set_target_properties(test_pipeline_deadlock_probe_camodel PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+
+function(add_micro_camodel_probe name)
+  ascendc_library(camodel_${name}_kernel SHARED kernels/camodel/${name}.cpp)
+  ascendc_compile_definitions(camodel_${name}_kernel PRIVATE ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(camodel_${name}_kernel PRIVATE
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+  add_executable(test_camodel_${name} tests/camodel/test_camodel_${name}.cpp)
+  target_include_directories(test_camodel_${name} PRIVATE "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_camodel_${name} PRIVATE camodel_${name}_kernel ascendcl
+      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  target_link_options(test_camodel_${name} PRIVATE "-Wl,-rpath-link,${SIM_LIB_DIR}")
+  target_compile_options(test_camodel_${name} PRIVATE -Wall -Wextra -Werror)
+  set_target_properties(test_camodel_${name} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+endfunction()
+
+add_micro_camodel_probe(dequant4)
+add_micro_camodel_probe(cube_matmul)
+add_micro_camodel_probe(normalize_store)
+add_micro_camodel_probe(online_softmax)
