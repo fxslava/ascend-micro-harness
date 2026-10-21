@@ -346,6 +346,45 @@ persists across launches and will hang or mis-trigger the next one.
 Omitting this back edge is what produced the table in §0. It is invisible to
 any test whose tiles happen to agree on the value being checked.
 
+**A `HardEvent` names the route, and the wait stalls the *consumer* queue.**
+`HardEvent::A_B` is producer `A`, consumer `B`: `SetFlag<A_B>` is issued on
+`A`'s queue and `WaitFlag<A_B>` stalls **`B`'s** queue, nothing else. The
+CAModel trace states both halves — the `PIPE:`/`TRIGGER PIPE:` pair is the
+route, and the pipe column at the left of the line is the queue the
+instruction was issued on:
+
+```
+MTE3  : SET_FLAG   PIPE:MTE3, TRIGGER PIPE:VEC   <- issued on MTE3, frees V
+VEC   : WAIT_FLAG  PIPE:MTE3, TRIGGER PIPE:VEC   <- stalls V
+MTE2  : WAIT_FLAG  PIPE:VEC,  TRIGGER PIPE:MTE2  <- stalls MTE2
+```
+
+So the route has to be chosen by **which queue must stall**, not by which
+engines are involved in the hazard. A ring slot that MTE2 refills and the
+Vector pipe reads needs `V_MTE2`; `MTE3_V` placed in front of the `DataCopy`
+looks like it guards the refill and reads like it in source order, but it
+stalls `V` and leaves MTE2 ungated. The fused paged-attention kernel shipped
+exactly that mistake on its staging core for one revision.
+
+Two consequences, and the second is why it survived validation:
+
+1. **A queue with no incoming wait free runs.** Per core, per queue, count the
+   waits that can stall it. A queue stalled by nothing will run as far ahead
+   as its instruction stream allows, however carefully the *other* queues are
+   synchronised.
+2. **A flag is one bit per `(route, ID)`, not a counter.** A producer that
+   runs ahead sets the same id twice before the first wait consumes it; the
+   second token is silently lost and the next wait on that id hangs. Source
+   level token balance still looks perfect, so balance accounting is necessary
+   and not sufficient.
+
+Neither is observable at the ring depth. With `kStageDepth` slots and one
+event id per slot, a run of exactly `kStageDepth` tiles reuses no slot and
+repeats no id, so there is no WAR hazard to hit and no id to double set.
+**Run the probe past the ring depth** — at least `2 * kStageDepth` tiles, so
+every slot is refilled at least once — or the back edges are structural rather
+than load bearing and the run proves only that the token arithmetic adds up.
+
 ### 3.2 Intra-pipe hazards — `PipeBarrier<PIPE_V>`, leaf-owned
 
 A `PipeBarrier<PIPE_V>` orders the vector pipe **against itself**. It
@@ -622,9 +661,62 @@ or every AIV1 flag will look unpaired.
 
 The `pipe` template parameter on a wait is the pipe whose issuance blocks, so a
 wait guarding Vector work takes `PIPE_V`, one guarding an L1→L0 load takes
-`PIPE_MTE1`, and one guarding a Fixpipe takes `PIPE_FIX`. A set is ordered
-after the preceding work *on that same pipe*, which is how "the L1 slot is free
-once MTE1 has read it" is expressed: `CrossCoreSetFlag<4, PIPE_MTE1>`.
+`PIPE_MTE1`, and one guarding a Fixpipe takes `PIPE_FIX`.
+
+### 6.2a A mode-4 set is a scalar instruction; the `pipe` argument does not order it
+
+**This section previously claimed that "a set is ordered after the preceding
+work on that same pipe, which is how 'the L1 slot is free once MTE1 has read
+it' is expressed: `CrossCoreSetFlag<4, PIPE_MTE1>`". That is wrong, and the
+claim is retracted.** It was inferred from the API's shape and it survived the
+N = 3 fused probe because at the ring depth every producer is ahead of its
+consumer anyway. The eight-page run disproved it in the most direct way
+available: wrong numbers.
+
+`CrossCoreSetFlag<4, PIPE_x>` lowers to `set_intra_block(PIPE_x, id)`, and in
+the CAModel trace that instruction issues on the **FLOWCTRL unit**, which runs
+the scalar stream:
+
+```
+[00001279] FLOWCTRL : SET_INTRA_BLOCK  PIPE:MTE1, sync_id:20   <- "L1 slot 0 free"
+[00002862] MTE1     : LOAD_2Dv2  Src:L1, Dst:L0A, XN:X1=0
+[00002863] MTE1     : LOAD_2Dv2  Src:L1, Dst:L0B, XN:X18=0x220 <- reads L1 slot 0
+```
+
+The set is 1583 cycles in front of the load it is supposed to follow. In the
+fused kernel the Cube's scalar stream ran through six columns of flags in 130
+cycles and released six L1-slot-free tokens by cycle 1402; the staging core
+refilled L1 slot 0 with page 3 at cycle 2344; the Cube's first `Mmad` then
+multiplied page 3's keys into page 0's score panel, and the probe caught it as
+`panel 0 holds page 3's panel`.
+
+The library agrees, in the only way library code can: `SyncAllImpl`
+(`impl/basic_api/dav_3510/kernel_operator_sync_impl.h:161`) puts a
+`PipeBarrier<PIPE_ALL>` in front of its `set_intra_block` /
+`wait_intra_block` handshake. It drains every pipe rather than trusting the
+pipe argument.
+
+So a cross-core set that is supposed to mean *"the work on pipe x has
+finished"* needs the scalar stream drained behind pipe x first:
+
+```cpp
+compute_or_move_on_pipe_x();
+SetFlag<HardEvent::x_S>(id);      // pipe x -> scalar
+WaitFlag<HardEvent::x_S>(id);     // the scalar stream waits for pipe x
+CrossCoreSetFlag<4, PIPE_x>(flag);
+```
+
+Two instructions per edge, against a whole-pipeline stall for
+`PipeBarrier<PIPE_ALL>`. The available routes are `V_S`, `MTE2_S`, `MTE3_S`,
+`FIX_S` and `M_S`; **there is no `MTE1_S`**, so an MTE1 drain has to ride a
+later pipe that provably depends on it — in the fused kernel the Fixpipe, which
+`unitFlag = 3` pairs to the `Mmad`, which waited `MTE1_M`.
+
+Cross-core **waits** need none of this. `wait_intra_block` also executes on the
+scalar stream, so everything the consumer issues after it is behind the flag by
+construction. Only sets are affected, and only the ones whose meaning is "my
+earlier pipe work is done" — a priming set, whose meaning is "this buffer
+starts empty", has nothing to drain.
 
 The marked-graph discipline from §3.1 applies across cores unchanged: a
 buffer-reuse back edge, such as "the shared UB score panel is free again",
@@ -661,6 +753,31 @@ representable — the fused fixture keeps every score a multiple of 1/128 so the
 whole Cube output panel is checked **bit-exactly** rather than against a
 tolerance.
 
+**A modular page term does not survive a longer run.** The three-page fused
+fixture varied the page through `(d + 1) * 14 * t mod 16`, which gives maxima
+0, 1/16, 2/16 — strictly increasing, exactly as required. Extended to eight
+pages the same expression folds: 0, 1/16, 2/16, 7/16, 0, 2/16, 0, 0. Four of
+the eight pages never exceed the running maximum, `alpha` is exactly 1 on
+those pages and the rescale path stops being exercised at all. Modular
+arithmetic is the natural way to generate distinct tiles and the wrong way to
+generate monotone ones.
+
+What does work is a non-wrapping slope: a page-invariant base, reduced so that
+it leaves `tiles - 1` of headroom in the quantised range, plus `t` times a
+per-element slope chosen from the reduction's own weights. Give the slope a
+guaranteed positive floor so the maximum has to rise, and let the rest of it
+vary per element so the tile's *shape* changes with the page and not just its
+height — a uniform shift leaves every `p_sum` identical, which fails the
+distinct-sums property even though the maxima look perfect.
+
+**Assert the properties, do not describe them.** Every one of them is a few
+lines over the oracle the runner already computes: nibbles in range, maxima
+strictly increasing, `alpha < 1` after the first tile, `p_sum` pairwise
+distinct, output channels pairwise distinct, every reference value exactly
+representable. A fixture property stated only in a comment is one edit away
+from being false, and when it goes false the probe does not fail — it silently
+stops testing what it was built to test.
+
 ## 7. Checklist for a new micro-routine
 
 - [ ] No `GetValue`/`SetValue`/UB subscript; no `ReduceSum` on FP32/FP16.
@@ -672,6 +789,8 @@ tolerance.
 - [ ] `static_assert(kArenaEnd + 256 <= kUbWindow)`.
 - [ ] Forward **and** back event edges present; tokens primed before the
       loop and drained after it; sets == waits per `(route, ID)`.
+- [ ] Every back edge on the route whose **consumer queue** is the one that
+      must stall, and no queue left with nothing that can stall it (§3.1).
 - [ ] `PipeBarrier<PIPE_V>` only for intra-vector ordering; never as a
       substitute for a cross-engine edge.
 - [ ] Tier 1 green, then Tier 2 green with **zero** `invalid ldst addr`.
@@ -690,6 +809,12 @@ And when integrating leaves into a pipeline (§6):
 - [ ] Cross-core back edges primed and drained, and balance checked per
       `sync_id` **across all three** core dumps, rebasing the AIV1 ids by
       `INTRA_NUM` because an AIV reports `sync_id` inside its own half.
+- [ ] Every cross-core set that means "my pipe work is done" preceded by a
+      `HardEvent::x_S` drain of that pipe, because a mode-4 set runs on the
+      scalar stream and the `pipe` argument does not order it (§6.2a).
+- [ ] Probe run **past** the ring depth, at least `2 * kStageDepth` tiles, so
+      every reuse back edge is contended; the reported figure is the per-column
+      steady-state interval, not the whole-run span (§3.1).
 - [ ] Ping-pong proven numerically before look-ahead or double buffering is
       added, then re-proven.
 - [ ] Fixture tiles numerically distinct: increasing maxima, distinct sums,

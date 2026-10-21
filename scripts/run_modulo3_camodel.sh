@@ -64,10 +64,14 @@ if [[ "${mode}" == "micro" ]]; then
         core0.cubecore0.instr_popped_log.dump \
         core0.cubecore0.instr_log.dump | tee "camodel_${micro_name}_trace_summary.txt"
     # The fused probe is the only one that drives the Cube core and both Vector
-    # cores together, so it also gets the event-balance, CV-path and
-    # engine-overlap audit over all three per-core dumps.
-    if [[ "${micro_name}" == "fused_attention_3tiles" ]]; then
-        python3 "${repo_dir}/scripts/analyze_fused_trace.py" \
+    # cores together, so it also gets the event-balance, CV-path, steady-state
+    # interval and engine-overlap audit over all three per-core dumps. The page
+    # count is part of the target name and every per-page assertion in the
+    # analyzer is scaled by it.
+    if [[ "${micro_name}" == fused_attention_*tiles ]]; then
+        fused_tiles="${micro_name#fused_attention_}"
+        fused_tiles="${fused_tiles%tiles}"
+        python3 "${repo_dir}/scripts/analyze_fused_trace.py" --tiles "${fused_tiles}" \
             core0.veccore0.instr_popped_log.dump \
             core0.veccore0.instr_log.dump \
             core0.veccore1.instr_popped_log.dump \

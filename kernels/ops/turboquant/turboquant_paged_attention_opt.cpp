@@ -44,11 +44,70 @@
 //
 // Nothing in a column depends on anything else in that column, so MTE2,
 // Vector, MTE3, MTE1, Cube and Fixpipe are all free to be in flight together.
-// The three columns are instantiated as StepColumn<2,1,0>, StepColumn<0,2,1>
-// and StepColumn<1,0,2> with compile-time slot indices and compile-time ramp
-// flags: the steady state contains no loop, no modulo, no predicate and no
-// scalar read of UB. Synchronisation is HardEvent tokens inside a core and
+// The kTiles columns are emitted by a fold over a compile-time index sequence,
+// one specialisation per column, with the three slot indices and the two ramp
+// flags computed from the column number in the template argument list: the
+// steady state contains no loop, no modulo, no predicate and no scalar read of
+// UB, at any page count. Synchronisation is HardEvent tokens inside a core and
 // mode-4 intra-block flags between cores; there is no PipeBarrier<PIPE_ALL>.
+//
+// kTiles is a build parameter (FUSED_ATTENTION_TILES), because the two page
+// counts measure different things:
+//
+//   kTiles == 3   the depth boundary. No ring slot is ever reused, so the
+//                 reuse back edges are primed and drained but never contended,
+//                 and the span is a pipeline fill, not a throughput interval.
+//   kTiles == 8   wraps the depth-3 ring twice. Slot s is refilled for tile
+//                 s + 3 and again for s + 6, so every back edge below carries
+//                 real contention and the per-column interval is measurable.
+//
+// The back edges that only do work once the ring wraps:
+//
+//   AIC  -> AIV1   kFlagL1Free     L1 key slot free, after MTE1 read it
+//   AIV0 -> AIC    kFlagPanelFree  Fixpipe score panel free, after recurrence
+//   AIV1 intra     MTE3_V          FP16 key page free, after the CV burst
+//   AIV1 intra     V_MTE2          packed key page free, after the dequant
+//   AIV0 intra     V_MTE2          packed value page and value page free
+//
+// AIV1's V_MTE2 edge was missing before this revision and the N = 3 probe
+// could not see it: WaitFlag<MTE3_V> stalls the V queue, not MTE2, so nothing
+// gated the packed-key refill. With three pages the three MTE2 bursts use
+// three different ring slots and three different event ids, so there was
+// neither a WAR hazard nor a double set. With eight the MTE2 queue, which has
+// no other gate on this core, runs ahead of the throttled V queue, refills a
+// packed slot a page before its dequant has read it, and sets MTE2_V for the
+// same id twice before the first wait consumes it. See
+// reports/fused_attention_integration.md.
+//
+// A mode-4 set is a scalar instruction, so it needs a drain
+// ---------------------------------------------------------
+// CrossCoreSetFlag<4, PIPE_x> lowers to set_intra_block(PIPE_x, id), and in
+// the CAModel trace that instruction issues on the FLOWCTRL unit, which runs
+// the scalar stream: the PIPE_x argument does **not** hold the set back until
+// pipe x has drained past the work in front of it. At N = 3 that is invisible,
+// because every producer happens to be ahead of its consumer anyway. At N = 8
+// the Cube's scalar stream ran through six columns of flags in 130 cycles and
+// released six L1-slot-free tokens by cycle 1402, while its first L1 -> L0B
+// load only moved at cycle 2862; AIV1 refilled L1 slot 0 with page 3 at cycle
+// 2344 and the Cube then multiplied page 3's keys into page 0's score panel.
+//
+// So every cross-core set that is supposed to mean "the work on pipe x is
+// finished" is preceded here by a drain of pipe x into the scalar pipe:
+//
+//   SetFlag<HardEvent::x_S>(id); WaitFlag<HardEvent::x_S>(id);
+//   CrossCoreSetFlag<4, PIPE_x>(flag);
+//
+// The wait stalls the scalar stream until pipe x has retired the instruction
+// the matching set was queued behind, which is exactly the ordering the pipe
+// argument looks like it provides. The library's own SyncAllImpl gets there
+// with PipeBarrier<PIPE_ALL> in front of its intra-block handshake; a full
+// barrier per page would serialise the whole pipeline, and one route per edge
+// costs two instructions. There is no MTE1_S route, so the Cube's L1-free edge
+// rides the FIX_S drain: the Fixpipe is paired to the Mmad by unitFlag = 3 and
+// the Mmad waits MTE1_M, so a retired Fixpipe proves the L1 -> L0 loads are
+// done. Cross-core *waits* need no such treatment: wait_intra_block also
+// stalls the scalar stream, and everything the consumer issues afterwards is
+// therefore behind the flag.
 //
 // Mode-4 double handshake
 // -----------------------
@@ -82,6 +141,7 @@
 // Scales are compile time so no scalar argument is read on device.
 
 #include <cstdint>
+#include <utility>
 
 #if defined(__CCE_AICORE__)
 #include "tensor_api/tensor.h"
@@ -93,9 +153,17 @@
 #include "../../../routines/routine_vector_normalize_store.hpp"
 #endif
 
+// The page count is the one build parameter. Three is the depth boundary that
+// established the numerics; eight wraps the depth-3 ring twice.
+#ifndef FUSED_ATTENTION_TILES
+#define FUSED_ATTENTION_TILES 3
+#endif
+
 namespace fused_attention {
-constexpr std::uint32_t kTiles = 3;
+constexpr std::uint32_t kTiles = FUSED_ATTENTION_TILES;
 constexpr std::uint32_t kStageDepth = 3;
+static_assert(kTiles >= kStageDepth,
+              "the prologue stages kStageDepth - 1 pages before the first column");
 constexpr std::uint32_t kDim = 16;   // head dim, channel count and Cube M
 constexpr std::uint32_t kKeys = 16;  // keys per page
 constexpr std::uint32_t kPanel = kDim * kKeys;
@@ -150,7 +218,11 @@ constexpr std::uint32_t kRingSlotF16 = kPanelF16Bytes + kBankSkewBytes;  // 544
 constexpr std::uint32_t kRingSlotPacked = kPackedBytes + kBankSkewBytes; // 160
 
 // The Fixpipe landing ring stays at UB 0 so the Cube side can form a raw
-// __ubuf__ pointer without depending on any Vector-side allocation.
+// __ubuf__ pointer without depending on any Vector-side allocation. It is
+// kStageDepth panels deep and no deeper: that is what makes the panel-free
+// back edge a real WAR guard once the ring wraps. Widening it to kTiles would
+// let the whole sequence be checked without the archive below, but it would
+// also uncontend the edge this revision exists to contend.
 constexpr std::uint32_t kUbScoreRing = 0u;
 constexpr std::uint32_t kUbScoreRingBytes = kStageDepth * kRingSlotF32;
 
@@ -205,7 +277,16 @@ constexpr std::uint32_t kUbWeighted = NextSlot(kUbPRepeated, kPanel * kF32);
 constexpr std::uint32_t kUbLBroadcast = NextSlot(kUbWeighted, kPanel * kF32);
 constexpr std::uint32_t kUbNormalized = NextSlot(kUbLBroadcast, kDim * kF32);
 constexpr std::uint32_t kUbContext = NextSlot(kUbNormalized, kDim * kF32);
-constexpr std::uint32_t kArenaEnd = kUbContext + kDim * kF16;
+
+// Score archive, one slot per page, written by the recurrence from the panel
+// it has just consumed and read back by the single end-of-sequence outflow.
+// The Fixpipe ring is only kStageDepth deep, so without this the panels of
+// tiles 0..kTiles - 4 would be overwritten before the outflow could read them
+// and only the last three would be checkable. The copy is a Vector Muls by
+// 1.0f, which is bit exact for every finite value including signed zeros, so
+// the archived panel is the Fixpipe output bit for bit.
+constexpr std::uint32_t kUbScoreArchive = NextSlot(kUbContext, kDim * kF16);
+constexpr std::uint32_t kArenaEnd = kUbScoreArchive + kTiles * kRingSlotF32;
 
 static_assert(kUbScoreRing % kBlock == 0 && kUbPackedKRing % kBlock == 0 &&
               kUbPackedVRing % kBlock == 0 && kUbKeyRing % kBlock == 0 &&
@@ -215,7 +296,8 @@ static_assert(kUbScoreRing % kBlock == 0 && kUbPackedKRing % kBlock == 0 &&
               kUbMPrev % kBlock == 0 && kUbAccPrev % kBlock == 0 &&
               kUbTileMaxBc % kBlock == 0 && kUbPRepeated % kBlock == 0 &&
               kUbWeighted % kBlock == 0 && kUbLBroadcast % kBlock == 0 &&
-              kUbNormalized % kBlock == 0 && kUbContext % kBlock == 0,
+              kUbNormalized % kBlock == 0 && kUbContext % kBlock == 0 &&
+              kUbScoreArchive % kBlock == 0,
               "every UB operand base must be 32-byte aligned");
 static_assert(kRingSlotF32 % kBlock == 0 && kRingSlotF16 % kBlock == 0 &&
               kRingSlotPacked % kBlock == 0,
@@ -245,6 +327,8 @@ template <std::uint32_t Slot>
 constexpr std::uint32_t kPackedKSlot = kUbPackedKRing + Slot * kRingSlotPacked;
 template <std::uint32_t Slot>
 constexpr std::uint32_t kPackedVSlot = kUbPackedVRing + Slot * kRingSlotPacked;
+template <std::uint32_t Tile>
+constexpr std::uint32_t kArchiveSlot = kUbScoreArchive + Tile * kRingSlotF32;
 
 // ---------------------------------------------------------------- L1 layout
 // Q is page invariant and reaches L1 once. The key ring has one slot per
@@ -289,6 +373,33 @@ constexpr std::uint16_t kFlagL1Free = 20u + Slot;          // 20..22 AIC  -> AIV
 // and the epilogue uses 3.
 constexpr std::int32_t kEvtEpilogue = 3;
 
+// ------------------------------------------------- compile-time column list
+// The schedule is kTiles columns long. Column j is the triple
+//
+//   ingress slot (j + 2) % kStageDepth   present while j + 2 <  kTiles
+//   GEMM    slot (j + 1) % kStageDepth   present while j + 1 <  kTiles
+//   recur   slot  j      % kStageDepth   always
+//
+// and every one of those five values is a constant expression in a template
+// argument list, evaluated by the front end. A fold over an index sequence
+// instantiates one column body per column, in order, with no runtime loop
+// counter, no runtime modulo and no predicate: exactly what the three
+// hand-written columns of the N = 3 revision did, generalised to any page
+// count. This is the same idiom routine_cv_transfer_ub_to_l1.hpp uses to
+// unroll its burst strips.
+template <std::uint32_t Column>
+constexpr std::uint32_t kIngressSlot = (Column + 2u) % kStageDepth;
+template <std::uint32_t Column>
+constexpr std::uint32_t kGemmSlot = (Column + 1u) % kStageDepth;
+template <std::uint32_t Column>
+constexpr std::uint32_t kRecurSlot = Column % kStageDepth;
+template <std::uint32_t Column>
+constexpr bool kHasIngress = Column + 2u < kTiles;
+template <std::uint32_t Column>
+constexpr bool kHasGemm = Column + 1u < kTiles;
+
+using ColumnSeq = std::make_integer_sequence<std::uint32_t, kTiles>;
+
 // ============================================================ AIV1: key path
 // MTE2 ingress of the packed key page, Vector dequantisation to FP16, and the
 // direct UB -> L1 staging burst. This is the whole CV path; it touches Global
@@ -319,31 +430,54 @@ __aicore__ inline void StageKeyPage(KeyEngine& engine, std::uint32_t tile)
     cv.ub_base_bytes = kKeySlot<Slot>;
     cv.l1_base_bytes = kL1KeySlot<Slot>;
 
-    // The slot body is serialised against its own previous incarnation by one
-    // back edge: MTE3 has drained both the packed buffer and the FP16 page
-    // before MTE2 refills the slot. Different slots remain free to overlap.
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(evt);
+    // Two back edges serialise this slot body against its own incarnation
+    // kStageDepth tiles earlier, and they gate two different queues:
+    //
+    //   V_MTE2  the dequant of tile - kStageDepth has read the packed page,
+    //           so MTE2 may refill it. WaitFlag<V_MTE2> stalls the MTE2 queue.
+    //   MTE3_V  the CV burst of tile - kStageDepth has read the FP16 page, so
+    //           the dequant may overwrite it. WaitFlag<MTE3_V> stalls V.
+    //
+    // Without the first one nothing on this core gates MTE2 at all: the MTE2
+    // queue free runs past the V queue, which is throttled by the L1-free flag
+    // from the Cube. Different slots remain free to overlap.
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evt);
     AscendC::DataCopy(dq.packed, engine.k_packed[tile * kPackedBytes], kPackedBytes);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evt);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(evt);
     ascend_micro::turboquant_dequant4(dq, kPanel);
-    // The Cube must have finished loading L1 slot Slot into L0B before the
-    // staging burst overwrites it. Primed once per slot by the Cube.
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evt);
+    // The Cube must have finished with L1 slot Slot before the staging burst
+    // overwrites it. The Cube releases the slot after the Fixpipe of the page
+    // that read it, which is one Mmad later than strictly necessary but is an
+    // ordering the hardware actually guarantees. Primed once per slot.
     AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(kFlagL1Free<Slot>);
     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evt);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evt);
     ascend_micro::cv_transfer_nd2nz<kKeys, kDim, kDim, 1u, 1u>(cv);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(evt);
+    // Drain MTE3 into the scalar pipe before announcing the L1 slot: the
+    // cross-core set is a scalar instruction and would otherwise overtake the
+    // staging burst it is reporting.
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(evt);
     AscendC::CrossCoreSetFlag<4, PIPE_MTE3>(kFlagSlotReadyKey<Slot>);
 }
 
-template <std::uint32_t IngressSlot, std::uint32_t GemmSlot,
-          std::uint32_t RecurSlot, bool HasIngress, bool HasGemm>
-__aicore__ inline void StepColumnKey(KeyEngine& engine, std::uint32_t base)
+template <std::uint32_t Column>
+__aicore__ inline void StepColumnKey(KeyEngine& engine)
 {
-    static_assert(IngressSlot < kStageDepth && GemmSlot < kStageDepth &&
-                  RecurSlot < kStageDepth);
-    if constexpr (HasIngress) StageKeyPage<IngressSlot>(engine, base + 2u);
+    static_assert(kIngressSlot<Column> < kStageDepth);
+    if constexpr (kHasIngress<Column>)
+        StageKeyPage<kIngressSlot<Column>>(engine, Column + 2u);
+}
+
+template <std::uint32_t... Columns>
+__aicore__ inline void StepColumnsKey(
+    KeyEngine& engine, std::integer_sequence<std::uint32_t, Columns...>)
+{
+    (StepColumnKey<Columns>(engine), ...);
 }
 
 __aicore__ inline void run_key_core(__gm__ std::int8_t* gm_k_packed)
@@ -351,7 +485,11 @@ __aicore__ inline void run_key_core(__gm__ std::int8_t* gm_k_packed)
     KeyEngine engine;
     engine.k_packed.SetGlobalBuffer(gm_k_packed);
 
-    // Feedback cycle priming: every ring slot starts drained.
+    // Feedback cycle priming: every ring slot starts drained, on both the
+    // MTE2 refill edge and the dequant overwrite edge.
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(2);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(0);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(1);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(2);
@@ -359,13 +497,14 @@ __aicore__ inline void run_key_core(__gm__ std::int8_t* gm_k_packed)
     StageKeyPage<0>(engine, 0);
     StageKeyPage<1>(engine, 1);
 
-    StepColumnKey<2, 1, 0, true, true>(engine, 0);
-    StepColumnKey<0, 2, 1, false, true>(engine, 1);
-    StepColumnKey<1, 0, 2, false, false>(engine, 2);
+    StepColumnsKey(engine, ColumnSeq{});
 
     // Drain every primed token and every token the Cube handed back, so no
     // event bit and no intra-block flag leaks into the next launch. These
     // waits also retire the in-flight MTE3 bursts before the kernel returns.
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(2);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(1);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(2);
@@ -404,16 +543,18 @@ __aicore__ inline void StageValuePage(ValueEngine& engine, std::uint32_t tile)
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evt);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evt);
     ascend_micro::turboquant_dequant4(dq, kPanel);
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(evt);
     AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagSlotReadyValue<Slot>);
 }
 
 // Pure streaming online softmax. The carried state (m, l, Acc) lives in UB
 // across the whole page sequence: there is no Split-K partial, no workspace
 // and no store of any kind in this stage.
-template <std::uint32_t Slot>
-__aicore__ inline void RecurPage(ValueEngine&, std::uint32_t)
+template <std::uint32_t Slot, std::uint32_t Tile>
+__aicore__ inline void RecurPage(ValueEngine&)
 {
-    static_assert(Slot < kStageDepth);
+    static_assert(Slot < kStageDepth && Tile < kTiles);
     constexpr auto ub = AscendC::TPosition::VECCALC;
     constexpr std::int32_t evt = static_cast<std::int32_t>(Slot);
 
@@ -443,26 +584,47 @@ __aicore__ inline void RecurPage(ValueEngine&, std::uint32_t)
     es.p_repeated = {ub, kUbPRepeated, kPanel};
     es.weighted = {ub, kUbWeighted, kPanel};
 
+    // The whole panel, not just the query row the recurrence reads, so the
+    // outflow can check all kTiles * kPanel entries from one UB region after
+    // the Fixpipe ring has been reused. Muls by 1.0f is an exact FP32 copy and
+    // stays on the Vector pipe, so the cross-core set below, which is issued
+    // on PIPE_V, is ordered after it: the Cube cannot overwrite the panel
+    // until this read has retired.
+    AscendC::LocalTensor<float> panel{ub, kScoreSlot<Slot>, kPanel};
+    AscendC::LocalTensor<float> archived{ub, kArchiveSlot<Tile>, kPanel};
+
     AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagProductReady<Slot>);
     ascend_micro::vector_online_softmax(es);
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Adds(es.m_prev, es.m_new, 0.0f, static_cast<std::int32_t>(kStateLanes));
     AscendC::Adds(es.l_prev, es.l_new, 0.0f, static_cast<std::int32_t>(kStateLanes));
     AscendC::Adds(es.acc_prev, es.acc_new, 0.0f, static_cast<std::int32_t>(kDim));
+    AscendC::Muls(archived, panel, 1.0f, static_cast<std::int32_t>(kPanel));
     AscendC::PipeBarrier<PIPE_V>();
-    // The value page and the score panel are both consumed now.
+    // The value page and the score panel are both consumed now. The panel is
+    // the one the Cube is waiting to overwrite, so the scalar pipe waits for
+    // the Vector queue to retire the archive copy before the flag goes out.
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evt);
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(evt);
     AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFree<Slot>);
 }
 
-template <std::uint32_t IngressSlot, std::uint32_t GemmSlot,
-          std::uint32_t RecurSlot, bool HasIngress, bool HasGemm>
-__aicore__ inline void StepColumnValue(ValueEngine& engine, std::uint32_t base)
+template <std::uint32_t Column>
+__aicore__ inline void StepColumnValue(ValueEngine& engine)
 {
-    static_assert(IngressSlot < kStageDepth && GemmSlot < kStageDepth &&
-                  RecurSlot < kStageDepth);
-    if constexpr (HasIngress) StageValuePage<IngressSlot>(engine, base + 2u);
-    RecurPage<RecurSlot>(engine, base);
+    static_assert(kIngressSlot<Column> < kStageDepth &&
+                  kRecurSlot<Column> < kStageDepth);
+    if constexpr (kHasIngress<Column>)
+        StageValuePage<kIngressSlot<Column>>(engine, Column + 2u);
+    RecurPage<kRecurSlot<Column>, Column>(engine);
+}
+
+template <std::uint32_t... Columns>
+__aicore__ inline void StepColumnsValue(
+    ValueEngine& engine, std::integer_sequence<std::uint32_t, Columns...>)
+{
+    (StepColumnValue<Columns>(engine), ...);
 }
 
 __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_v_packed,
@@ -510,19 +672,20 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_v_packed,
     StageValuePage<0>(engine, 0);
     StageValuePage<1>(engine, 1);
 
-    StepColumnValue<2, 1, 0, true, true>(engine, 0);
-    StepColumnValue<0, 2, 1, false, true>(engine, 1);
-    StepColumnValue<1, 0, 2, false, false>(engine, 2);
+    StepColumnsValue(engine, ColumnSeq{});
 
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(2);
 
     // ---- Outflow, once, after the whole page sequence ------------------
-    // Nothing above this point stores to Global Memory. The score ring is read
-    // back here as one strided MTE3 burst, kStageDepth panels of kPanelF32Bytes
-    // separated by the ring bank skew, so the runner can check every entry
-    // without the kernel ever dumping a panel per page.
+    // Nothing above this point stores to Global Memory. The score archive is
+    // read back here as one strided MTE3 burst, kTiles panels of
+    // kPanelF32Bytes separated by the archive bank skew, so the runner can
+    // check every entry of every page without the kernel ever dumping a panel
+    // per page. The V -> MTE3 edge below covers the archive writes too: the
+    // Vector queue is in order, so the token set after vector_normalize is set
+    // after the last archive Muls has retired.
     ascend_micro::NativeNormalizeStoreEngine<half> en;
     en.acc = acc_prev;
     en.l = l_prev;
@@ -536,15 +699,15 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_v_packed,
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kEvtEpilogue);
     ascend_micro::vector_store(en, kDim);
 
-    AscendC::LocalTensor<float> score_ring{ub, kUbScoreRing,
-                                           kStageDepth * kPanel};
+    AscendC::LocalTensor<float> score_archive{ub, kUbScoreArchive,
+                                              kTiles * kPanel};
     AscendC::DataCopyParams panels;
-    panels.blockCount = static_cast<std::uint16_t>(kStageDepth);
+    panels.blockCount = static_cast<std::uint16_t>(kTiles);
     panels.blockLen = static_cast<std::uint16_t>(kPanelF32Bytes / kBlock);
     panels.srcStride =
         static_cast<std::uint16_t>((kRingSlotF32 - kPanelF32Bytes) / kBlock);
     panels.dstStride = 0;
-    AscendC::DataCopy(out_scores, score_ring, panels);
+    AscendC::DataCopy(out_scores, score_archive, panels);
 
     AscendC::DataCopy(out_state[0], m_prev, kStateLanes);
     AscendC::DataCopy(out_state[kStateLanes], l_prev, kStateLanes);
@@ -583,9 +746,6 @@ __aicore__ inline void GemmPage(CubeEngine& engine, std::uint32_t)
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(evt);  // L0A/L0B free
     ascend_micro::cube_matmul_stage_l0(e);
     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(evt);
-    // The L1 slot is consumed once MTE1 has read it, so the staging core may
-    // refill it. Issued on the MTE1 queue, hence ordered after the loads.
-    AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(kFlagL1Free<Slot>);
 
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(evt);
     AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(evt);  // L0C free
@@ -597,16 +757,31 @@ __aicore__ inline void GemmPage(CubeEngine& engine, std::uint32_t)
     ascend_micro::cube_matmul_compute_dump(e);
     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(evt);
     AscendC::SetFlag<AscendC::HardEvent::FIX_M>(evt);
+    // One drain for both outgoing flags. A retired Fixpipe proves the Mmad
+    // retired, and the Mmad waited MTE1_M, so it also proves the L1 -> L0
+    // loads have read the L1 key slot and the staging core may refill it.
+    // There is no MTE1_S route to express that more tightly, and releasing the
+    // slot one Mmad later costs the staging core nothing it can use: its next
+    // burst into this slot is three pages away.
+    AscendC::SetFlag<AscendC::HardEvent::FIX_S>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(evt);
     AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagProductReady<Slot>);
+    AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(kFlagL1Free<Slot>);
 }
 
-template <std::uint32_t IngressSlot, std::uint32_t GemmSlot,
-          std::uint32_t RecurSlot, bool HasIngress, bool HasGemm>
-__aicore__ inline void StepColumnCube(CubeEngine& engine, std::uint32_t base)
+template <std::uint32_t Column>
+__aicore__ inline void StepColumnCube(CubeEngine& engine)
 {
-    static_assert(IngressSlot < kStageDepth && GemmSlot < kStageDepth &&
-                  RecurSlot < kStageDepth);
-    if constexpr (HasGemm) GemmPage<GemmSlot>(engine, base + 1u);
+    static_assert(kGemmSlot<Column> < kStageDepth);
+    if constexpr (kHasGemm<Column>)
+        GemmPage<kGemmSlot<Column>>(engine, Column + 1u);
+}
+
+template <std::uint32_t... Columns>
+__aicore__ inline void StepColumnsCube(
+    CubeEngine& engine, std::integer_sequence<std::uint32_t, Columns...>)
+{
+    (StepColumnCube<Columns>(engine), ...);
 }
 
 __aicore__ inline void run_cube_core(__gm__ half* gm_q)
@@ -640,9 +815,7 @@ __aicore__ inline void run_cube_core(__gm__ half* gm_q)
 
     GemmPage<0>(engine, 0);
 
-    StepColumnCube<2, 1, 0, true, true>(engine, 0);
-    StepColumnCube<0, 2, 1, false, true>(engine, 1);
-    StepColumnCube<1, 0, 2, false, false>(engine, 2);
+    StepColumnsCube(engine, ColumnSeq{});
 
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(1);

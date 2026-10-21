@@ -15,14 +15,24 @@ The micro-routine CAModel probes run with
 Latest results are in
 [`reports/micro_routines_validation.md`](reports/micro_routines_validation.md).
 
-`bash scripts/run_modulo3_camodel.sh micro fused_attention_3tiles` runs the
-production fused operator in
-[`kernels/ops/turboquant/turboquant_paged_attention_opt.cpp`](kernels/ops/turboquant/turboquant_paged_attention_opt.cpp):
-five leaves in one `MIX_AIC_1_2` three-stage modulo pipeline over three key
-pages, driving one Cube core and **both** Vector cores, with mode-4
+The production fused operator in
+[`kernels/ops/turboquant/turboquant_paged_attention_opt.cpp`](kernels/ops/turboquant/turboquant_paged_attention_opt.cpp)
+puts five leaves in one `MIX_AIC_1_2` three-stage modulo pipeline over a ring
+of key pages, driving one Cube core and **both** Vector cores, with mode-4
 double-handshake flags and zero Global Memory workspace — the dequantised key
 page goes straight from Vector UB into Cube L1 over the dav-3510 MTE3 channel
-(`routines/routine_cv_transfer_ub_to_l1.hpp`). See
+(`routines/routine_cv_transfer_ub_to_l1.hpp`). Its page count is a build
+parameter, so there are two probes over one kernel source:
+
+```sh
+bash scripts/run_modulo3_camodel.sh micro fused_attention_8tiles   # steady state
+bash scripts/run_modulo3_camodel.sh micro fused_attention_3tiles   # depth boundary
+```
+
+Three pages never wrap the depth-3 ring, so that run measures a pipeline fill
+and its buffer-reuse back edges are only primed and drained. Eight pages wrap
+it twice, which contends every back edge and gives a per-page steady-state
+interval — and which is how AIV1's missing packed-page WAR edge was found. See
 [`reports/fused_attention_integration.md`](reports/fused_attention_integration.md).
 
 That report also retracts an earlier claim, repeated in §6.1 of the

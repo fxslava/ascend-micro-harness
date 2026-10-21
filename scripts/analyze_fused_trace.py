@@ -2,9 +2,12 @@
 """Audit the MIX_AIC_1_2 fused attention probe from its CAModel traces.
 
 Usage:
-  analyze_fused_trace.py <aiv0_popped> <aiv0_complete>
+  analyze_fused_trace.py [--tiles N] <aiv0_popped> <aiv0_complete>
                          <aiv1_popped> <aiv1_complete>
                          <aic_popped>  <aic_complete>
+
+--tiles is the kernel's FUSED_ATTENTION_TILES, 3 if omitted. Every per-page
+assertion below is scaled by it; none of them is relaxed.
 
 Six checks, each fatal:
 
@@ -24,8 +27,16 @@ Six checks, each fatal:
      Fixpipe, which is what "one outflow at the end of the sequence" means in
      the trace rather than in the source.
 
-Then it reports cycle spans and merged engine overlap. Ticks come from one
-CAModel clock in all three dumps, so the intervals are directly comparable.
+Then it reports the per-column steady-state interval, cycle spans and merged
+engine overlap. Ticks come from one CAModel clock in all three dumps, so the
+intervals are directly comparable.
+
+The steady-state interval is the point of a run that wraps the ring: with
+kStageDepth = 3 the first three columns are pipeline fill and the last two are
+drain, so the cadence of the per-page events in between -- successive Mmad
+dispatches on the Cube, successive recurrence completions on AIV0, successive
+UB->L1 staging bursts on AIV1 -- is the throughput interval, while the whole
+dispatch span is not.
 """
 
 import re
@@ -44,7 +55,14 @@ QUORUM_PIPE = "MTE1"
 
 # AscendC::INTRA_NUM: a mode-4 flag id space of 16 per sub block.
 INTRA_NUM = 16
-TILES = 3
+
+# fused_attention::kStageDepth. The ring is three deep whatever the page count,
+# so three columns fill the pipeline and the steady state starts after them.
+STAGE_DEPTH = 3
+
+# The recurrence announces that it has consumed a score panel by setting the
+# panel-free flag on PIPE_V; ids 8..10 are that flag's slots on AIV0.
+PANEL_FREE_IDS = range(8, 8 + STAGE_DEPTH)
 
 VECTOR_PIPES = {"RVECEX", "RVECST", "RVECLD", "RVECSU", "RVECLP", "VEC"}
 CUBE_PIPES = {"CUBE", "FIXP", "MTE1", "MTE2"}
@@ -118,6 +136,35 @@ def cross_core(records, rebase, pipe=None):
     return out
 
 
+def dispatch_ticks(records, keep):
+    """Dispatch ticks of the instructions keep() selects, in issue order."""
+    return sorted(tick for _, (tick, pipe, operation) in records.items()
+                  if keep(pipe, operation))
+
+
+def cadence(name, ticks, tiles, expected=None):
+    """Print the per-page interval of one event stream and return the steady
+    state deltas. Pipeline fill is the first STAGE_DEPTH columns, so a delta is
+    a steady-state delta once both of its endpoints are past the fill."""
+    if expected is not None and len(ticks) != expected:
+        raise SystemExit(
+            f"{name}: expected {expected} per-page events, saw {len(ticks)}"
+        )
+    if len(ticks) < 2:
+        print(f"  {name:<28}: {len(ticks)} event(s), no interval")
+        return []
+    deltas = [b - a for a, b in zip(ticks, ticks[1:])]
+    steady = deltas[STAGE_DEPTH - 1:] if len(deltas) > STAGE_DEPTH else []
+    detail = " ".join(str(d) for d in deltas)
+    print(f"  {name:<28}: {len(ticks)} events, deltas {detail}")
+    if steady:
+        mid = sorted(steady)[len(steady) // 2]
+        print(f"  {'':<28}  steady state ({len(steady)} intervals, columns "
+              f"{STAGE_DEPTH}..{tiles - 1}): min {min(steady)}, median {mid}, "
+              f"max {max(steady)}")
+    return steady
+
+
 def busy(records, complete, keep):
     """Merged in-flight spans for the instructions keep() selects."""
     intervals = []
@@ -132,7 +179,7 @@ def busy(records, complete, keep):
 
 
 def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
-         aic_popped, aic_complete):
+         aic_popped, aic_complete, tiles):
     v0_in, v0_out = read(aiv0_popped), read(aiv0_complete)
     v1_in, v1_out = read(aiv1_popped), read(aiv1_complete)
     c_in, c_out = read(aic_popped), read(aic_complete)
@@ -174,11 +221,11 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
                     if k[0] == "WAIT" and k[1] < INTRA_NUM)
     from_aiv1 = sum(v for k, v in quorum.items()
                     if k[0] == "WAIT" and k[1] >= INTRA_NUM)
-    if from_aiv0 != TILES or from_aiv1 != TILES:
+    if from_aiv0 != tiles or from_aiv1 != tiles:
         raise SystemExit(
-            f"quorum not reached: before its {TILES} GEMMs the Cube waited "
+            f"quorum not reached: before its {tiles} GEMMs the Cube waited "
             f"{from_aiv0} staging flags from AIV0 and {from_aiv1} from AIV1, "
-            f"expected {TILES} of each"
+            f"expected {tiles} of each"
         )
 
     # ---- 4. both Vector cores executed --------------------------------
@@ -194,9 +241,9 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
     # ---- 5. the CV core never touches Global Memory --------------------
     cv_moves = sum(1 for _, (_, _, op) in v1_in.items() if "MOV_UB_TO_L1" in op)
     cv_stores = sum(1 for _, (_, _, op) in v1_in.items() if "Dst:OUT" in op)
-    if cv_moves != TILES:
+    if cv_moves != tiles:
         raise SystemExit(
-            f"expected {TILES} UB->L1 hardware moves on the staging core, saw {cv_moves}"
+            f"expected {tiles} UB->L1 hardware moves on the staging core, saw {cv_moves}"
         )
     if cv_stores:
         raise SystemExit(
@@ -230,7 +277,7 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
           f"across {pairs} (route, ID) pairs on 3 cores; zero residual")
     print(f"cross-core mode-4 flags: {cross_sets} sets / {cross_waits} waits, "
           f"every absolute id paired AIV<->AIC")
-    print(f"double handshake: before each of {TILES} GEMMs the Cube waited one "
+    print(f"double handshake: before each of {tiles} GEMMs the Cube waited one "
           f"staging flag from each Vector core ({from_aiv0} from AIV0 ids "
           f"0..15, {from_aiv1} from AIV1 ids 16..31)")
     for name in ("AIV0", "AIV1", "AIC"):
@@ -241,6 +288,56 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
           f"{cv_stores} Global Memory stores on the staging core")
     print(f"outflow: {len(gm_stores)} GM stores, first at cycle {gm_stores[0]}, "
           f"all after the last Fixpipe at cycle {last_fixpipe}")
+
+    # ---- steady-state interval ----------------------------------------
+    # One stream of per-page events per engine, in issue order. The Mmad
+    # mnemonic is discovered rather than assumed: it is the non-flag CUBE-pipe
+    # instruction that occurs exactly once per page.
+    cube_ops = Counter(op.split()[0] for _, (_, pipe, op) in c_in.items()
+                       if pipe == "CUBE" and "_FLAG" not in op)
+    once_per_page = sorted(op for op, n in cube_ops.items() if n == tiles)
+    named = [op for op in once_per_page if "MAD" in op]
+    mmad_ops = named[:1] or once_per_page[:1]
+    mmad = dispatch_ticks(
+        c_in, lambda p, o: p == "CUBE" and o.split()[0] in mmad_ops)
+    fixpipe = dispatch_ticks(c_in, lambda p, o: "FIX_L0C_TO_DST" in o)
+    staging = dispatch_ticks(v1_in, lambda p, o: "MOV_UB_TO_L1" in o)
+    panel_free = dispatch_ticks(
+        v0_in,
+        lambda p, o: (lambda s: bool(s) and s.group(1) == "SET" and
+                      int(s.group(3)) in PANEL_FREE_IDS)(SYNC.search(o)))
+    # The first STAGE_DEPTH panel-free sets are the priming tokens, not
+    # recurrence completions, and they are issued before the first GEMM.
+    if len(panel_free) != STAGE_DEPTH + tiles:
+        raise SystemExit(
+            f"expected {STAGE_DEPTH} primed + {tiles} per-page panel-free sets "
+            f"on AIV0, saw {len(panel_free)}"
+        )
+    recurrence = panel_free[STAGE_DEPTH:]
+
+    print(f"per-page cadence over {tiles} pages. CUBE-pipe mnemonics: " +
+          ", ".join(f"{op} x{n}" for op, n in cube_ops.most_common()))
+    streams = [
+        ("UB->L1 key staging", staging, tiles),
+        ("Mmad dispatch", mmad, len(mmad_ops) and tiles),
+        ("Fixpipe dispatch", fixpipe, tiles),
+        ("recurrence completion", recurrence, tiles),
+    ]
+    paced = []
+    for name, ticks, expected in streams:
+        deltas = cadence(name, ticks, tiles, expected=expected or None)
+        if deltas:
+            paced.append((name, sorted(deltas)[len(deltas) // 2]))
+    if not paced:
+        print(f"  no steady state at {tiles} pages: the ring never wraps, so "
+              f"every interval is pipeline fill or drain and the dispatch span "
+              f"below is a depth boundary, not a throughput figure")
+    else:
+        slowest = max(paced, key=lambda e: e[1])
+        spread = max(e[1] for e in paced) - min(e[1] for e in paced)
+        print(f"  steady-state interval: {slowest[1]} cycles per page, the "
+              f"slowest of the four streams ({slowest[0]}); the medians spread "
+              f"over {spread} cycles")
 
     # ---- cycle spans and engine overlap -------------------------------
     classes = {
@@ -312,6 +409,13 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 7:
+    argv = sys.argv[1:]
+    pages = 3
+    if argv and argv[0] == "--tiles":
+        if len(argv) < 2:
+            raise SystemExit(__doc__)
+        pages = int(argv[1])
+        argv = argv[2:]
+    if len(argv) != 6 or pages < STAGE_DEPTH:
         raise SystemExit(__doc__)
-    main(*sys.argv[1:7])
+    main(*argv, tiles=pages)
