@@ -5,3 +5,7 @@ bin/
 *.so
 *.log
 __pycache__/
+/build/
+/.vscode/
+/core*.dump
+/profile_*.toml

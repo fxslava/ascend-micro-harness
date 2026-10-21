@@ -1,5 +1,9 @@
 # Ascend 950PR 16×16 Cube Hadamard probe
 
+The three-stage modulo synchronization probe is documented in
+[`reports/modulo3_deadlock_probe.md`](reports/modulo3_deadlock_probe.md). Run it
+under WSL/CAModel with `bash scripts/run_modulo3_camodel.sh`.
+
 `routines/routine_cube_hadamard16.hpp` dispatches one FP16×FP16→FP32
 `Mmad` followed by one L0C→GM `Fixpipe` copy. The caller precomputes the
 canonical Sylvester matrix as four Kronecker `H2` factors and stages the

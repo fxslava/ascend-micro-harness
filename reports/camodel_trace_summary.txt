@@ -1,0 +1,3 @@
+hardware flags: 18 sets / 18 waits; 12 route-ID pairs; IDs 0..2; zero count residual
+three-pipe overlap: CAModel cycles 1779..1786 (MTE2 ID 136, Vector ID 254, MTE3 ID 164)
+Scalar queued final event waits by cycle 1686; last MTE3 copy completed at cycle 2798
