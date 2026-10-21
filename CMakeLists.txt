@@ -47,8 +47,15 @@ set_target_properties(test_pipeline_deadlock_probe_camodel PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 
+# add_micro_camodel_probe(<name> [<kernel_basename>])
+# Builds target test_camodel_<name> from tests/camodel/test_camodel_<name>.cpp
+# against kernels/camodel/<kernel_basename>.cpp, defaulting to <name>.
 function(add_micro_camodel_probe name)
-  ascendc_library(camodel_${name}_kernel SHARED kernels/camodel/${name}.cpp)
+  set(kernel "${name}")
+  if(ARGC GREATER 1)
+    set(kernel "${ARGV1}")
+  endif()
+  ascendc_library(camodel_${name}_kernel SHARED kernels/camodel/${kernel}.cpp)
   ascendc_compile_definitions(camodel_${name}_kernel PRIVATE ASCEND_MICRO_CANN_LAUNCH)
   ascendc_compile_options(camodel_${name}_kernel PRIVATE
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
@@ -66,3 +73,4 @@ add_micro_camodel_probe(dequant4)
 add_micro_camodel_probe(cube_matmul)
 add_micro_camodel_probe(normalize_store)
 add_micro_camodel_probe(online_softmax)
+add_micro_camodel_probe(fused_attention_3tiles turboquant_paged_attention_opt)

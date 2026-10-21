@@ -61,6 +61,16 @@ if [[ "${mode}" == "micro" ]]; then
         core0.veccore0.instr_log.dump \
         core0.cubecore0.instr_popped_log.dump \
         core0.cubecore0.instr_log.dump | tee "camodel_${micro_name}_trace_summary.txt"
+    # The fused probe is the only one that drives AIC and AIV together, so it
+    # also gets the event-balance and engine-overlap audit.
+    if [[ "${micro_name}" == "fused_attention_3tiles" ]]; then
+        python3 "${repo_dir}/scripts/analyze_fused_trace.py" \
+            core0.veccore0.instr_popped_log.dump \
+            core0.veccore0.instr_log.dump \
+            core0.cubecore0.instr_popped_log.dump \
+            core0.cubecore0.instr_log.dump \
+            | tee "camodel_${micro_name}_event_summary.txt"
+    fi
 else
     timeout 120s ./test_pipeline_deadlock_probe_camodel | tee camodel_run.log
     python3 "${repo_dir}/scripts/analyze_modulo3_trace.py" \

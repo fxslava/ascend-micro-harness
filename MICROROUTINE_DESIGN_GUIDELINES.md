@@ -519,7 +519,71 @@ result, for any cancelling reduction.**
 
 ---
 
-## 6. Checklist for a new micro-routine
+## 6. Integrating leaves into a MIX pipeline
+
+Verified by building the fused paged-attention kernel
+([`reports/fused_attention_integration.md`](reports/fused_attention_integration.md)).
+
+### 6.1 There is no UB → L1 transfer
+
+The Te copy surface offers `CopyGM2L1`, `CopyGM2UB`, `CopyL12L0A/B`,
+`CopyL12UB`, `CopyL12BT`, `CopyL12FB`, `CopyL0C2UB/L1/GM` and `CopyUB2GM`.
+There is **no `CopyUB2L1`**. So any operand that is produced by Vector work
+(dequantisation, transposition, activation) and consumed by the Cube as an
+L1 fractal has to round-trip through a GM workspace:
+
+```
+int4 GM -> UB -> dequant (Vector) -> GM workspace -> L1(ZN) -> L0B -> Mmad
+```
+
+Give the workspace one slot per pipeline stage so there is no cross-core WAR
+on it, and let the layout conversion happen in the GM→L1 converter, which is
+the only engine that does it.
+
+### 6.2 Cross-core edges are mode 4, and they need priming and draining too
+
+`CrossCoreSetFlag<4, pipe>` / `CrossCoreWaitFlag<4, pipe>` synchronises one
+AIC with one AIV on 950PR, in **both** directions, with flagId 0..10. The
+`pipe` template parameter on a wait is the pipe whose issuance blocks, so a
+wait guarding Vector work takes `PIPE_V` and one guarding a Fixpipe takes
+`PIPE_FIX`.
+
+The marked-graph discipline from §3.1 applies across cores unchanged: a
+buffer-reuse back edge, such as "the shared UB score panel is free again",
+is primed once before the loop and drained once after it. In the trace these
+appear as `SET_INTRA_BLOCK` / `WAIT_INTRA_BLOCK` with a `sync_id`, and a set
+on one core must be matched by a wait on the *other* — so balance has to be
+checked per sync id across both core dumps, not per core.
+
+Note that `CrossCoreSetFlag` calls issued back to back by one core have **no
+guaranteed order** between different flagIds. Separate them with a wait if the
+order matters.
+
+### 6.3 Establish numerics before concurrency
+
+Build the integration as a strict ping-pong first, prove the numbers, then add
+look-ahead and double buffering and re-prove the numbers. The fused kernel
+went 11509 → 9203 ticks this way with bit-identical results. The reverse order
+cannot distinguish an integration bug from a pipelining bug, and §0 is the
+standing reminder that adding or removing synchronization can change
+correctness, not just speed.
+
+### 6.4 Make the pages distinguishable, or the hazard checks are theatre
+
+An integration fixture must make its tiles **numerically distinct**:
+per-tile reduction maxima strictly increasing (so the rescale path runs every
+tile), per-tile sums distinct, and every output channel distinct. A fixture
+whose pages are interchangeable cannot detect a run-ahead, double-buffering or
+wrong-slot fault, because the wrong operand produces the right answer. This is
+not hypothetical: the online-softmax V→MTE2 WAR hazard in §0 survived its
+original validation precisely because every tile shared the same maximum.
+
+Where the arithmetic permits, choose operands that make the exact result
+representable — the fused fixture keeps every score a multiple of 1/128 so the
+whole Cube output panel is checked **bit-exactly** rather than against a
+tolerance.
+
+## 7. Checklist for a new micro-routine
 
 - [ ] No `GetValue`/`SetValue`/UB subscript; no `ReduceSum` on FP32/FP16.
 - [ ] Broadcasts via `Brcb` from a replicated block, or `Duplicate` with a
@@ -535,3 +599,16 @@ result, for any cancelling reduction.**
 - [ ] Tier 1 green, then Tier 2 green with **zero** `invalid ldst addr`.
 - [ ] Per-tile numeric check, not just an end-of-run check.
 - [ ] ULP budget stated against the largest intermediate.
+
+And when integrating leaves into a pipeline (§6):
+
+- [ ] Vector-produced Cube operands routed through a GM workspace, one slot
+      per stage — there is no UB → L1 path.
+- [ ] Cross-core back edges primed and drained, and balance checked per
+      `sync_id` **across** both core dumps.
+- [ ] Ping-pong proven numerically before look-ahead or double buffering is
+      added, then re-proven.
+- [ ] Fixture tiles numerically distinct: increasing maxima, distinct sums,
+      distinct output channels.
+- [ ] Engine overlap demonstrated from the trace, not inferred from source
+      order.

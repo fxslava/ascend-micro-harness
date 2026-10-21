@@ -74,6 +74,20 @@ Cycle spans come from `scripts/analyze_micro_trace.py` over the per-core
 `instr_log` / `instr_popped_log` dumps. These are simulator figures for a
 reduced inductive grid, not silicon latency or steady-state throughput.
 
+### Fused integration
+
+All four leaves are now also exercised together in one MIX-mode kernel over
+three key pages; see
+[`fused_attention_integration.md`](fused_attention_integration.md).
+
+| Probe | Result | Scalar addr errors | Dispatch span | Model ticks |
+| --- | --- | ---: | --- | ---: |
+| fused attention (N=3) | 768/768 score entries bit-exact, max 2.000 ULP, 1152/1152 guard bytes | 0 | 707..8876 (8169 cyc, 2463 instr) | 9203 |
+
+23/23 intra-core HardEvent pairs and 10/10 cross-core mode-4 flags retire with
+zero residual tokens, and MTE2, Cube, Vector and MTE3 are concurrently in
+flight for 438 cycles.
+
 ### Online softmax: faults fixed this cycle
 
 The pre-fix baseline emitted 16 CAModel errors per launch

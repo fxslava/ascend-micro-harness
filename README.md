@@ -10,10 +10,16 @@ The three-stage modulo synchronization probe is documented in
 [`reports/modulo3_deadlock_probe.md`](reports/modulo3_deadlock_probe.md). Run it
 under WSL/CAModel with `bash scripts/run_modulo3_camodel.sh`.
 
-The four micro-routine CAModel probes run with
+The micro-routine CAModel probes run with
 `bash scripts/run_modulo3_camodel.sh micro <dequant4|cube_matmul|normalize_store|online_softmax>`.
 Latest results are in
 [`reports/micro_routines_validation.md`](reports/micro_routines_validation.md).
+
+`bash scripts/run_modulo3_camodel.sh micro fused_attention_3tiles` runs the
+integrated kernel: all four leaves plugged into one MIX-mode three-stage
+pipeline over three key pages, with cross-core mode-4 handshakes between the
+Cube and Vector cores. See
+[`reports/fused_attention_integration.md`](reports/fused_attention_integration.md).
 
 `routines/routine_cube_hadamard16.hpp` dispatches one FP16×FP16→FP32
 `Mmad` followed by one L0C→GM `Fixpipe` copy. The caller precomputes the
