@@ -6,8 +6,18 @@ toolkit="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.2.0-beta.2}"
 soc="${SOC_VERSION:-Ascend950PR_9599}"
 build_dir="${MODULO3_BUILD_DIR:-$(mktemp -d /tmp/ascend-modulo3-camodel-XXXXXX)}"
 sim_lib_dir="${toolkit}/tools/simulator/${soc}/lib"
+# A probe that issues more device instructions needs more wall clock in the
+# cycle-accurate model; the reshape-and-cache operator runs 64 Mmads and eight
+# chunks of Vector work against the fused probe's eight Mmads.
+run_timeout="${MODULO3_TIMEOUT:-120s}"
 mode="${1:-all}"
 micro_name="${2:-dequant4}"
+
+# The reshape-and-cache operator is addressable by its short name too, so the
+# probe name does not have to repeat the operator family.
+if [[ "${micro_name}" == "reshape_and_cache_a8" ]]; then
+    micro_name="turboquant_reshape_and_cache_a8"
+fi
 
 if [[ ! -f "${toolkit}/set_env.sh" ]]; then
     echo "CANN environment not found: ${toolkit}/set_env.sh" >&2
@@ -51,7 +61,7 @@ fi
 # selects a different simulator library set on this installation.
 cd "${build_dir}"
 if [[ "${mode}" == "micro" ]]; then
-    timeout 120s "./test_camodel_${micro_name}" 2>&1 | tee "camodel_${micro_name}_run.log"
+    timeout "${run_timeout}" "./test_camodel_${micro_name}" 2>&1 | tee "camodel_${micro_name}_run.log"
     if grep -Eiq '\[(error|fatal)\]|invalid ldst addr|unrecognize ldst addr' "camodel_${micro_name}_run.log"; then
         echo "CAModel reported execution errors" >&2
         exit 1
@@ -80,8 +90,23 @@ if [[ "${mode}" == "micro" ]]; then
             core0.cubecore0.instr_log.dump \
             | tee "camodel_${micro_name}_event_summary.txt"
     fi
+    # The reshape-and-cache operator drives the same three cores but a
+    # four-stage ring with a different flag graph, so it has its own audit
+    # rather than reusing the fused attention one. Without this branch the
+    # V4 checks would silently not run, which is the trap the workflow warns
+    # about.
+    if [[ "${micro_name}" == "turboquant_reshape_and_cache_a8" ]]; then
+        python3 "${repo_dir}/scripts/analyze_reshape_trace.py" \
+            core0.veccore0.instr_popped_log.dump \
+            core0.veccore0.instr_log.dump \
+            core0.veccore1.instr_popped_log.dump \
+            core0.veccore1.instr_log.dump \
+            core0.cubecore0.instr_popped_log.dump \
+            core0.cubecore0.instr_log.dump \
+            | tee "camodel_${micro_name}_event_summary.txt"
+    fi
 else
-    timeout 120s ./test_pipeline_deadlock_probe_camodel | tee camodel_run.log
+    timeout "${run_timeout}" ./test_pipeline_deadlock_probe_camodel | tee camodel_run.log
     python3 "${repo_dir}/scripts/analyze_modulo3_trace.py" \
         core0.veccore0.instr_popped_log.dump \
         core0.veccore0.instr_log.dump | tee camodel_trace_summary.txt

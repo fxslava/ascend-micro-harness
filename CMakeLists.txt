@@ -111,3 +111,10 @@ add_micro_camodel_probe(fused_attention_3tiles
 add_micro_camodel_probe(fused_attention_8tiles
     kernels/ops/turboquant/turboquant_paged_attention_opt.cpp
     FUSED_ATTENTION_TILES=8)
+
+# The prefill reshape-and-cache operator. Its grid is fixed by the strip shape
+# -- eight chunks of one 16-token page -- so there is no build parameter: the
+# eight chunks already wrap the depth-4 L1 ring and the depth-2 per-core UB
+# rings twice, which is what V3 asks a second probe for elsewhere.
+add_micro_camodel_probe(turboquant_reshape_and_cache_a8
+    kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp)

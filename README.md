@@ -45,6 +45,39 @@ interval — and which is how AIV1's missing packed-page WAR edge was found. See
 That report also retracts an earlier claim, repeated in §6.1 of the
 guidelines, that no UB → L1 transfer exists on this part.
 
+The prefill counterpart in
+[`kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp`](kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp)
+is a **four-stage** `MIX_AIC_1_2` ring over the eight chunks of one 16-token ×
+1024-channel strip: MTE2 stages each raw INT8 page from Global Memory into the
+L1 ring with no Unified Buffer hop, the Cube applies the inner factor of a
+randomised Hadamard as INT8×INT8→INT32 Mmads, both Vector cores apply the sign
+diagonal and the outer butterfly cascade and quantise to INT4, and MTE3 writes
+a 2 KiB packed page plus a 64-byte scale slice per chunk. Eight chunks over a
+depth-4 L1 ring and depth-2 per-core UB rings wrap every ring twice, so one run
+contends every buffer-reuse back edge.
+
+```sh
+bash scripts/run_modulo3_camodel.sh micro reshape_and_cache_a8
+```
+
+Its quantiser uses a power-of-two scale extracted by integer ops on the FP32
+bit pattern, so the whole path from INT8 input to packed nibble carries exactly
+one rounding step and the KV cache is checked **bit-exactly against an integer
+oracle for an arbitrary input**, not against a tolerance or a crafted fixture.
+Its Tier-1 probe checks what that comparison cannot — that the dense
+256×256 rotation satisfies `M Mᵀ = 256 I` and that the kernel's butterfly
+cascade reproduces it exactly:
+
+```sh
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
+    tests/test_reshape_and_cache_a8_probe.cpp \
+    -o bin/test_reshape_and_cache_a8_probe
+bin/test_reshape_and_cache_a8_probe
+```
+
+Results, including what the trace does and does not establish, are in
+[`reports/reshape_and_cache_a8.md`](reports/reshape_and_cache_a8.md).
+
 `routines/routine_cube_hadamard16.hpp` dispatches one FP16×FP16→FP32
 `Mmad` followed by one L0C→GM `Fixpipe` copy. The caller precomputes the
 canonical Sylvester matrix as four Kronecker `H2` factors and stages the
