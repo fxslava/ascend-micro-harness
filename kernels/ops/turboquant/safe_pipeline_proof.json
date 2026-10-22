@@ -1,0 +1,557 @@
+{
+  "schema": 1,
+  "semantics": "consuming one-bit latch; Set-on-full is rejected",
+  "scope": "generated abstract protocol only; no C++/CAModel equivalence claim",
+  "source_sha256": "a8a71565987efc84efa3a90c4f959c2816c2d830f5e5469fbb938244ddb3f1f2",
+  "chunks": 8,
+  "assignment": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "ids_per_sub_block": 4,
+  "optimality": "minimum within two-slot separate-channel/no-extra-throttle grammar",
+  "wait_placement": {
+    "free": "late",
+    "ready": "late"
+  },
+  "placement_candidates": [
+    {
+      "free_cut": 0,
+      "ready_cut": 0,
+      "legal": true,
+      "slack_score": 0,
+      "reason": "precedes both protected accesses"
+    },
+    {
+      "free_cut": 0,
+      "ready_cut": 1,
+      "legal": true,
+      "slack_score": 1,
+      "reason": "precedes both protected accesses"
+    },
+    {
+      "free_cut": 0,
+      "ready_cut": 2,
+      "legal": false,
+      "slack_score": 2,
+      "reason": "wait would follow its protected memory access"
+    },
+    {
+      "free_cut": 1,
+      "ready_cut": 0,
+      "legal": true,
+      "slack_score": 1,
+      "reason": "precedes both protected accesses"
+    },
+    {
+      "free_cut": 1,
+      "ready_cut": 1,
+      "legal": true,
+      "slack_score": 2,
+      "reason": "precedes both protected accesses"
+    },
+    {
+      "free_cut": 1,
+      "ready_cut": 2,
+      "legal": false,
+      "slack_score": 3,
+      "reason": "wait would follow its protected memory access"
+    },
+    {
+      "free_cut": 2,
+      "ready_cut": 0,
+      "legal": false,
+      "slack_score": 2,
+      "reason": "wait would follow its protected memory access"
+    },
+    {
+      "free_cut": 2,
+      "ready_cut": 1,
+      "legal": false,
+      "slack_score": 3,
+      "reason": "wait would follow its protected memory access"
+    },
+    {
+      "free_cut": 2,
+      "ready_cut": 2,
+      "legal": false,
+      "slack_score": 4,
+      "reason": "wait would follow its protected memory access"
+    }
+  ],
+  "finite": {
+    "states": 7888566,
+    "edges": 43607139,
+    "transitions": 255,
+    "places": 400,
+    "terminal_states": 1,
+    "safe_reachable_percent": 100,
+    "overwrites": 0,
+    "races": 0,
+    "deadlocks": 0,
+    "all_states_coreachable": true,
+    "seconds": 140.106
+  },
+  "modulo": {
+    "states": 41844109,
+    "edges": 250476791,
+    "transitions": 130,
+    "places": 263,
+    "terminal_states": 0,
+    "safe_reachable_percent": 100,
+    "overwrites": 0,
+    "races": 0,
+    "deadlocks": 0,
+    "all_states_coreachable": true,
+    "seconds": 947.427
+  },
+  "modulo_liveness": "all states can return to initial marking; every transition live",
+  "rejected_assignments": [
+    {
+      "colors": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "reason": "prologue SetFlag overwrite / aliased credit",
+      "trace": []
+    },
+    {
+      "colors": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "reason": "stale / wrong-channel flag consumed at AIV0.S: WaitFlag READY[0]",
+      "trace": [
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        0,
+        1,
+        0
+      ],
+      "reason": "stale / wrong-channel flag consumed at AIV0.S: WaitFlag READY[0]",
+      "trace": [
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "reason": "prologue SetFlag overwrite / aliased credit",
+      "trace": []
+    },
+    {
+      "colors": [
+        0,
+        1,
+        0,
+        0
+      ],
+      "reason": "prologue SetFlag overwrite / aliased credit",
+      "trace": []
+    },
+    {
+      "colors": [
+        0,
+        1,
+        0,
+        1
+      ],
+      "reason": "stale / wrong-channel flag consumed at AIV0.S: WaitFlag READY[0]",
+      "trace": [
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        1,
+        1,
+        0
+      ],
+      "reason": "stale / wrong-channel flag consumed at AIV0.S: WaitFlag READY[0]",
+      "trace": [
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        1,
+        1,
+        1
+      ],
+      "reason": "prologue SetFlag overwrite / aliased credit",
+      "trace": []
+    },
+    {
+      "colors": [
+        0,
+        0,
+        1,
+        2
+      ],
+      "reason": "1-safety overwrite: CrossFlags[0] at AIC.S: SetFlag READY[1]",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2: Wait MTE1_MTE2 c1",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "MTE2: DMA dispatch c1",
+        "MTE2 DMA complete c1",
+        "MTE2 Set MTE2_MTE1 c1",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c0",
+        "Fixpipe complete c0",
+        "PIPE_FIX Set FIX_S c0",
+        "AIC.S: Wait FIX_S c0",
+        "AIC.S: SetFlag READY[0]",
+        "MTE2: Wait MTE1_MTE2 c2",
+        "AIC.S: Wait MTE2_MTE1 c1",
+        "MTE2: DMA dispatch c2",
+        "MTE2 DMA complete c2",
+        "MTE2 Set MTE2_MTE1 c2",
+        "AIC.S: Cube dispatch c1",
+        "Cube complete c1",
+        "Cube Set M_FIX / L1 FREE c1",
+        "AIC.S: Wait M_FIX c1",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c1",
+        "Fixpipe complete c1",
+        "PIPE_FIX Set FIX_S c1",
+        "AIC.S: Wait FIX_S c1",
+        "AIC.S: SetFlag READY[0]",
+        "AIC.S: Wait MTE2_MTE1 c2",
+        "AIC.S: Cube dispatch c2",
+        "Cube complete c2",
+        "Cube Set M_FIX / L1 FREE c2",
+        "AIC.S: Wait M_FIX c2",
+        "AIC.S: WaitFlag FREE_ACK[1]",
+        "AIC.S: Fixpipe dispatch c2",
+        "Fixpipe complete c2",
+        "PIPE_FIX Set FIX_S c2",
+        "AIC.S: Wait FIX_S c2",
+        "AIC.S: SetFlag READY[1]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        1,
+        0,
+        2
+      ],
+      "reason": "stale / wrong-channel flag consumed at AIV0.S: WaitFlag READY[0]",
+      "trace": [
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        1,
+        1,
+        2
+      ],
+      "reason": "stale / wrong-channel flag consumed at AIV0.S: WaitFlag READY[1]",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c0",
+        "Fixpipe complete c0",
+        "PIPE_FIX Set FIX_S c0",
+        "AIC.S: Wait FIX_S c0",
+        "AIC.S: SetFlag READY[0]",
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]",
+        "AIV0.S: Vector landing read dispatch c0",
+        "Vector landing read complete c0",
+        "PIPE_V Set V_S c0",
+        "AIV0.S: Wait V_S c0",
+        "AIV0.S: SetFlag FREE_ACK[0]",
+        "AIV0.S: Wait MTE3_V c0",
+        "AIV0.S: quantise / pack dispatch c0",
+        "quantise / pack complete c0",
+        "PIPE_V Set V_MTE3 / V_S c0",
+        "AIV0.S: Wait V_S scratch reusable c0",
+        "AIV0.S: prepare addresses c2",
+        "AIV0.S: WaitFlag READY[1]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        1,
+        2,
+        0
+      ],
+      "reason": "stale / wrong-channel flag consumed at AIV0.S: WaitFlag READY[0]",
+      "trace": [
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        1,
+        2,
+        1
+      ],
+      "reason": "stale / wrong-channel flag consumed at AIV0.S: WaitFlag READY[1]",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c0",
+        "Fixpipe complete c0",
+        "PIPE_FIX Set FIX_S c0",
+        "AIC.S: Wait FIX_S c0",
+        "AIC.S: SetFlag READY[0]",
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]",
+        "AIV0.S: Vector landing read dispatch c0",
+        "Vector landing read complete c0",
+        "PIPE_V Set V_S c0",
+        "AIV0.S: Wait V_S c0",
+        "AIV0.S: SetFlag FREE_ACK[0]",
+        "AIV0.S: Wait MTE3_V c0",
+        "AIV0.S: quantise / pack dispatch c0",
+        "quantise / pack complete c0",
+        "PIPE_V Set V_MTE3 / V_S c0",
+        "AIV0.S: Wait V_S scratch reusable c0",
+        "AIV0.S: prepare addresses c2",
+        "AIV0.S: WaitFlag READY[1]"
+      ]
+    },
+    {
+      "colors": [
+        0,
+        1,
+        2,
+        2
+      ],
+      "reason": "prologue SetFlag overwrite / aliased credit",
+      "trace": []
+    }
+  ],
+  "negative_controls": {
+    "missing_FIX_S": {
+      "reason": "notification before queue-to-scalar drain at AIC.S: SetFlag READY[0]",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c0",
+        "AIC.S: SetFlag READY[0]"
+      ]
+    },
+    "missing_V_S": {
+      "reason": "notification before queue-to-scalar drain at AIV0.S: SetFlag FREE_ACK[0]",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c0",
+        "Fixpipe complete c0",
+        "PIPE_FIX Set FIX_S c0",
+        "AIC.S: Wait FIX_S c0",
+        "AIC.S: SetFlag READY[0]",
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]",
+        "AIV0.S: Vector landing read dispatch c0",
+        "AIV0.S: SetFlag FREE_ACK[0]"
+      ]
+    },
+    "missing_FREE_ACK_wait": {
+      "reason": "1-safety overwrite: CrossFlags[2], credit.0.0.FREE at AIV0.S: SetFlag FREE_ACK[0]",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: Fixpipe dispatch c0",
+        "Fixpipe complete c0",
+        "PIPE_FIX Set FIX_S c0",
+        "AIC.S: Wait FIX_S c0",
+        "AIC.S: SetFlag READY[0]",
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]",
+        "AIV0.S: Vector landing read dispatch c0",
+        "Vector landing read complete c0",
+        "PIPE_V Set V_S c0",
+        "AIV0.S: Wait V_S c0",
+        "AIV0.S: SetFlag FREE_ACK[0]"
+      ]
+    },
+    "nonconsuming_sticky_wait": {
+      "reason": "1-safety overwrite: CrossFlags[2] at AIV0.S: SetFlag FREE_ACK[0]",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c0",
+        "Fixpipe complete c0",
+        "PIPE_FIX Set FIX_S c0",
+        "AIC.S: Wait FIX_S c0",
+        "AIC.S: SetFlag READY[0]",
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]",
+        "AIV0.S: Vector landing read dispatch c0",
+        "Vector landing read complete c0",
+        "PIPE_V Set V_S c0",
+        "AIV0.S: Wait V_S c0",
+        "AIV0.S: SetFlag FREE_ACK[0]"
+      ]
+    },
+    "missing_MTE3_V_wait": {
+      "reason": "1-safety overwrite: AIV0.HardEvents[0].MTE3_V at PIPE_MTE3 Set MTE3_V c0",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c0",
+        "Fixpipe complete c0",
+        "PIPE_FIX Set FIX_S c0",
+        "AIC.S: Wait FIX_S c0",
+        "AIC.S: SetFlag READY[0]",
+        "AIV0.S: prepare addresses c0",
+        "AIV0.S: WaitFlag READY[0]",
+        "AIV0.S: Vector landing read dispatch c0",
+        "Vector landing read complete c0",
+        "PIPE_V Set V_S c0",
+        "AIV0.S: Wait V_S c0",
+        "AIV0.S: SetFlag FREE_ACK[0]",
+        "AIV0.S: quantise / pack dispatch c0",
+        "quantise / pack complete c0",
+        "PIPE_V Set V_MTE3 / V_S c0",
+        "AIV0.MTE3: Wait V_MTE3 c0",
+        "AIV0.MTE3: DMA store dispatch c0",
+        "DMA store complete c0",
+        "PIPE_MTE3 Set MTE3_V c0"
+      ]
+    },
+    "aliased_READY_slots": {
+      "reason": "1-safety overwrite: CrossFlags[0] at AIC.S: SetFlag READY[1]",
+      "trace": [
+        "MTE2: Wait MTE1_MTE2 c0",
+        "MTE2: DMA dispatch c0",
+        "MTE2 DMA complete c0",
+        "MTE2: Wait MTE1_MTE2 c1",
+        "MTE2 Set MTE2_MTE1 c0",
+        "AIC.S: Wait MTE2_MTE1 c0",
+        "MTE2: DMA dispatch c1",
+        "MTE2 DMA complete c1",
+        "MTE2 Set MTE2_MTE1 c1",
+        "AIC.S: Cube dispatch c0",
+        "Cube complete c0",
+        "Cube Set M_FIX / L1 FREE c0",
+        "AIC.S: Wait M_FIX c0",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c0",
+        "Fixpipe complete c0",
+        "PIPE_FIX Set FIX_S c0",
+        "AIC.S: Wait FIX_S c0",
+        "AIC.S: SetFlag READY[0]",
+        "MTE2: Wait MTE1_MTE2 c2",
+        "AIC.S: Wait MTE2_MTE1 c1",
+        "MTE2: DMA dispatch c2",
+        "MTE2 DMA complete c2",
+        "MTE2 Set MTE2_MTE1 c2",
+        "AIC.S: Cube dispatch c1",
+        "Cube complete c1",
+        "Cube Set M_FIX / L1 FREE c1",
+        "AIC.S: Wait M_FIX c1",
+        "AIC.S: WaitFlag FREE_ACK[0]",
+        "AIC.S: Fixpipe dispatch c1",
+        "Fixpipe complete c1",
+        "PIPE_FIX Set FIX_S c1",
+        "AIC.S: Wait FIX_S c1",
+        "AIC.S: SetFlag READY[0]",
+        "AIC.S: Wait MTE2_MTE1 c2",
+        "AIC.S: Cube dispatch c2",
+        "Cube complete c2",
+        "Cube Set M_FIX / L1 FREE c2",
+        "AIC.S: Wait M_FIX c2",
+        "AIC.S: WaitFlag FREE_ACK[1]",
+        "AIC.S: Fixpipe dispatch c2",
+        "Fixpipe complete c2",
+        "PIPE_FIX Set FIX_S c2",
+        "AIC.S: Wait FIX_S c2",
+        "AIC.S: SetFlag READY[1]"
+      ]
+    }
+  }
+}
