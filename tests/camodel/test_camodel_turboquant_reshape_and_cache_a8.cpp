@@ -23,6 +23,10 @@
 //      slot mapping a whole page. A fixture whose chunks or tokens are
 //      interchangeable cannot detect a wrong-slot or wrong-core read, which is
 //      the entire point of running eight chunks over rings of depth 4 and 2;
+//   0b. the 16 resident rotation blocks in `tables`, composed the way the Cube
+//      composes them, reproduce all 65536 entries of the 256x256 matrix the
+//      oracle applies. The whole rotation is Cube work now, so this is the one
+//      place the device's operand and the oracle's matrix are tied together;
 //   1. head and tail Global Memory canaries on all eight buffers;
 //   2. every cache byte outside the written page still 0xDEADBEEF, so a stray
 //      burst or a mis-scaled page offset is caught rather than ignored;
@@ -63,6 +67,19 @@ constexpr int kNumBlocks = 4;
 constexpr int kBlockIndex = 1;  // not 0, so a dropped page offset is visible
 constexpr int kHeadBytes = kBlockSize * kHeadSize / 2;
 constexpr float kInvSqrtLen = 1.0f / 16.0f;  // 1 / sqrt(kHeadSize)
+
+// `tables` carries the Cube's resident rotation blocks: one row-major 32x32
+// INT8 block per (sign, source group) pair, block s * kGroups + g holding
+//
+//   T[s][g][c0][i] = (s ? -1 : +1) * piSigns[g*32 + c0] * H32[c0][i].
+//
+// The kernel multiplies the page's group-g fractal by block
+// parity(c1 & g) * kGroups + g to produce output group c1, so the sign
+// diagonal and the outer Hadamard factor are both inside these blocks. The
+// oracle below is unchanged by that: it still applies the same 256x256 matrix.
+constexpr int kBlockElems = kGroup * kGroup;      // 1024 INT8
+constexpr int kTableBlocks = 2 * kGroups;         // 16
+constexpr int kTableBytes = kTableBlocks * kBlockElems;
 
 // ------------------------------------------------------------------ fixture
 int parity(unsigned v)
@@ -133,6 +150,11 @@ struct ChunkOracle {
     int q[kTokens][kHeadSize];
     float scale[kTokens];
     std::uint8_t packed[kPackedBytes];
+    // The same nibbles in the *other* cache layout. Nothing checks against
+    // this; it exists so that a failing page can be told apart from a page
+    // that is right but packed the wrong way round, which is the one failure
+    // mode a byte-by-byte comparison reports most misleadingly.
+    std::uint8_t packed_alt[kPackedBytes];
     long long chunk_max;
     bool clamped;
 };
@@ -192,13 +214,30 @@ void build_oracle(int chunk, ChunkOracle& out)
     // (index key * headSize + d), value pages channel-major
     // (index ch * blockSize + key).
     std::memset(out.packed, 0, sizeof(out.packed));
+    std::memset(out.packed_alt, 0, sizeof(out.packed_alt));
     const bool is_key = chunk >= kHeads;
     for (int t = 0; t < kTokens; ++t)
         for (int ch = 0; ch < kHeadSize; ++ch) {
             const int index = is_key ? t * kHeadSize + ch : ch * kBlockSize + t;
+            const int other = is_key ? ch * kBlockSize + t : t * kHeadSize + ch;
             const auto nib = static_cast<std::uint8_t>(out.q[t][ch] & 0xF);
             out.packed[index / 2] |= static_cast<std::uint8_t>(
                 (index % 2 == 0) ? nib : static_cast<std::uint8_t>(nib << 4));
+            out.packed_alt[other / 2] |= static_cast<std::uint8_t>(
+                (other % 2 == 0) ? nib : static_cast<std::uint8_t>(nib << 4));
+        }
+}
+
+// Decode a packed page back into q[token][channel] under the given layout, so
+// a mismatch can be reported in quantised values rather than in bytes.
+void unpack_page(const std::uint8_t* page, bool is_key, int q[kTokens][kHeadSize])
+{
+    for (int t = 0; t < kTokens; ++t)
+        for (int ch = 0; ch < kHeadSize; ++ch) {
+            const int index = is_key ? t * kHeadSize + ch : ch * kBlockSize + t;
+            const std::uint8_t byte = page[index / 2];
+            const int raw = (index % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+            q[t][ch] = raw >= 8 ? raw - 16 : raw;
         }
 }
 
@@ -295,7 +334,7 @@ int main()
         camodel::GuardedDeviceBuffer scale_cache(2 * kNumBlocks * kHeads * kBlockSize * 4);
         camodel::GuardedDeviceBuffer slot_mapping(kTokens * 4);
         camodel::GuardedDeviceBuffer pi_signs(kHeadSize * 4);
-        camodel::GuardedDeviceBuffer tables(kGroup * kGroup);
+        camodel::GuardedDeviceBuffer tables(kTableBytes);
 
         auto* kv = static_cast<std::int8_t*>(key.host_payload());
         auto* vv = static_cast<std::int8_t*>(value.host_payload());
@@ -317,10 +356,49 @@ int main()
         require(sm[0] % kBlockSize == 0, "slotMapping[0] is not page aligned");
         for (int t = 1; t < kTokens; ++t)
             require(sm[t] == sm[0] + t, "slotMapping is not one contiguous page");
+        // piSigns still reaches the device in the published signature, and the
+        // runner still asserts it is non-degenerate, but the device does not
+        // read it: the signs are inside the rotation blocks below. Both are
+        // built from the same pi_sign(), and the check that follows is what
+        // ties them together.
         for (int ch = 0; ch < kHeadSize; ++ch) ps[ch] = static_cast<float>(pi_sign(ch));
-        for (int i = 0; i < kGroup; ++i)
-            for (int j = 0; j < kGroup; ++j)
-                tb[i * kGroup + j] = static_cast<std::int8_t>(hadamard(i, j));
+        for (int s = 0; s < 2; ++s)
+            for (int g = 0; g < kGroups; ++g)
+                for (int c0 = 0; c0 < kGroup; ++c0)
+                    for (int i = 0; i < kGroup; ++i)
+                        tb[(s * kGroups + g) * kBlockElems + c0 * kGroup + i] =
+                            static_cast<std::int8_t>((s ? -1 : 1) *
+                                                     pi_sign(g * kGroup + c0) *
+                                                     hadamard(c0, i));
+
+        // ---- check 0b: the resident blocks compose to the oracle's matrix --
+        // The device applies the rotation as 64 block GEMMs per chunk, reading
+        // block parity(c1 & g) * kGroups + g for output group c1 and source
+        // group g. Composed, they must reproduce
+        //
+        //   M[c1*32 + c0][g*32 + i] = H8[c1][g] * piSigns[g*32 + c0] * H32[c0][i],
+        //
+        // which is the matrix the factored oracle applies. A wrong sign index
+        // or a transposed block still yields *some* orthogonal map, and the
+        // nibble comparison downstream would then fail without saying why;
+        // this check says why. Asserted over all 65536 entries of M.
+        int composed = 0;
+        for (int c1 = 0; c1 < kGroups; ++c1)
+            for (int g = 0; g < kGroups; ++g) {
+                const int block = parity(static_cast<unsigned>(c1 & g)) * kGroups + g;
+                const std::int8_t* entries = tb + block * kBlockElems;
+                for (int c0 = 0; c0 < kGroup; ++c0)
+                    for (int i = 0; i < kGroup; ++i) {
+                        const int want = hadamard(c1, g) * pi_sign(g * kGroup + c0) *
+                                         hadamard(c0, i);
+                        require(entries[c0 * kGroup + i] == want,
+                                "a resident rotation block does not match the "
+                                "dense matrix the oracle applies");
+                        ++composed;
+                    }
+            }
+        require(composed == kHeadSize * kHeadSize,
+                "the block composition did not cover every entry of M");
 
         key.upload();
         value.upload();
@@ -393,43 +471,110 @@ int main()
                 }
 
         // ---- checks 3-5: bit-exact payloads ------------------------------
+        // A mismatch is diagnosed rather than merely reported. Stopping at the
+        // first differing byte says nothing about *how* a page is wrong, and
+        // the plausible causes - a stale landing panel holding another chunk's
+        // panel, a wrong-token read, a layout swap, a scale exponent off by
+        // one - all look identical at one byte. So every chunk is compared in
+        // full, and a failing one is then matched against every oracle page in
+        // both layouts and against the quantisation of its own values under a
+        // different exponent.
         std::size_t key_bytes = 0, value_bytes = 0, scales = 0;
+        int failing = 0;
+        static int device_q[kTokens][kHeadSize];
         for (int c = 0; c < kChunks; ++c) {
             const bool is_key = c >= kHeads;
             const int h = c % kHeads;
             const auto* got = (is_key ? kc : vc) + page_base + h * kHeadBytes;
-            for (int i = 0; i < kPackedBytes; ++i) {
-                if (got[i] != oracle[c].packed[i]) {
-                    std::fprintf(stderr,
-                                 "chunk %d (%s head %d) byte %d: device 0x%02x "
-                                 "oracle 0x%02x\n",
-                                 c, is_key ? "key" : "value", h, i,
-                                 static_cast<unsigned>(got[i]),
-                                 static_cast<unsigned>(oracle[c].packed[i]));
-                    throw std::runtime_error("packed cache page mismatch");
-                }
-                if (is_key)
-                    ++key_bytes;
-                else
-                    ++value_bytes;
-            }
             const int scale_base =
                 (((is_key ? 0 : 1) * kNumBlocks + kBlockIndex) * kHeads + h) * kBlockSize;
-            for (int t = 0; t < kTokens; ++t) {
-                if (float_bits(sc[scale_base + t]) != float_bits(oracle[c].scale[t])) {
-                    std::fprintf(stderr,
-                                 "chunk %d (%s head %d) token %d scale: device "
-                                 "%.9g (0x%08x) oracle %.9g (0x%08x)\n",
-                                 c, is_key ? "key" : "value", h, t,
-                                 static_cast<double>(sc[scale_base + t]),
-                                 float_bits(sc[scale_base + t]),
-                                 static_cast<double>(oracle[c].scale[t]),
-                                 float_bits(oracle[c].scale[t]));
-                    throw std::runtime_error("scale cache mismatch");
+
+            int bad_bytes = 0, first_bad = -1;
+            for (int i = 0; i < kPackedBytes; ++i)
+                if (got[i] != oracle[c].packed[i]) {
+                    if (first_bad < 0) first_bad = i;
+                    ++bad_bytes;
                 }
-                ++scales;
+            int bad_scales = 0;
+            for (int t = 0; t < kTokens; ++t)
+                if (float_bits(sc[scale_base + t]) != float_bits(oracle[c].scale[t]))
+                    ++bad_scales;
+
+            if (bad_bytes == 0 && bad_scales == 0) {
+                if (is_key)
+                    key_bytes += kPackedBytes;
+                else
+                    value_bytes += kPackedBytes;
+                scales += kTokens;
+                continue;
+            }
+            ++failing;
+            std::fprintf(stderr,
+                         "\nchunk %d (%s head %d): %d/%d bytes differ (first byte "
+                         "%d: device 0x%02x oracle 0x%02x), %d/%d scales differ\n",
+                         c, is_key ? "key" : "value", h, bad_bytes, kPackedBytes,
+                         first_bad,
+                         first_bad < 0 ? 0u : static_cast<unsigned>(got[first_bad]),
+                         first_bad < 0 ? 0u
+                                       : static_cast<unsigned>(oracle[c].packed[first_bad]),
+                         bad_scales, kTokens);
+
+            // Which oracle page, in which layout, does the device page look
+            // like? A stale panel or a wrong-slot read shows up here as a high
+            // byte-match count against a chunk other than c.
+            for (int d = 0; d < kChunks; ++d)
+                for (int lay = 0; lay < 2; ++lay) {
+                    const std::uint8_t* ref =
+                        lay == 0 ? oracle[d].packed : oracle[d].packed_alt;
+                    int same = 0;
+                    for (int i = 0; i < kPackedBytes; ++i) same += (got[i] == ref[i]);
+                    if (same * 4 > kPackedBytes || d == c)
+                        std::fprintf(stderr,
+                                     "   looks like oracle chunk %d %s layout: "
+                                     "%d/%d bytes\n",
+                                     d, lay == 0 ? "own" : "swapped", same,
+                                     kPackedBytes);
+                }
+
+            // Per token: how many nibbles differ, and is there an exponent
+            // that would reproduce the device's nibbles from this chunk's own
+            // rotated values? If there is, the rotation is right and only the
+            // scale is wrong.
+            unpack_page(got, is_key, device_q);
+            for (int t = 0; t < kTokens; ++t) {
+                int diff = 0, lo = 99, hi = -99;
+                for (int ch = 0; ch < kHeadSize; ++ch) {
+                    const int delta = device_q[t][ch] - oracle[c].q[t][ch];
+                    if (delta != 0) ++diff;
+                    if (delta < lo) lo = delta;
+                    if (delta > hi) hi = delta;
+                }
+                int fit = -999;
+                for (int e2 = 0; e2 < 32 && fit == -999; ++e2) {
+                    bool all = true;
+                    for (int ch = 0; ch < kHeadSize && all; ++ch) {
+                        long long v = rint_even_shift(oracle[c].y[t][ch], e2 - 2);
+                        if (v > 7) v = 7;
+                        if (v < -8 || v != device_q[t][ch]) all = false;
+                    }
+                    if (all) fit = e2;
+                }
+                if (diff == 0 && !bad_scales) continue;
+                std::fprintf(stderr,
+                             "   token %2d: %3d/%d nibbles differ, delta [%d, %d], "
+                             "device scale %.9g oracle %.9g (oracle e=%d, "
+                             "exponent reproducing device: %d)\n",
+                             t, diff, kHeadSize, diff ? lo : 0, diff ? hi : 0,
+                             static_cast<double>(sc[scale_base + t]),
+                             static_cast<double>(oracle[c].scale[t]),
+                             oracle[c].exponent[t], fit);
+            }
+            if (failing >= 3) {
+                std::fprintf(stderr, "   (further failing chunks not detailed)\n");
+                break;
             }
         }
+        if (failing != 0) throw std::runtime_error("packed cache page mismatch");
 
         std::printf("PASS turboquant_reshape_and_cache_a8: 16 tokens x %d channels, "
                     "%d chunks over a depth-4 L1 ring and depth-2 UB rings\n",
@@ -449,6 +594,9 @@ int main()
                     distinct_exponents, mixed_chunks, kChunks);
         std::printf("  nibble values exercised: %d/16, INT4 upper clamp taken on "
                     "%d/%d chunks\n", covered, clamped_chunks, kChunks);
+        std::printf("  rotation table: %d blocks of %dx%d INT8 (%d B), %d composed "
+                    "entries match the oracle's matrix\n",
+                    kTableBlocks, kGroup, kGroup, kTableBytes, composed);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL turboquant_reshape_and_cache_a8: %s\n", error.what());

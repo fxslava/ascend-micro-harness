@@ -4,9 +4,14 @@ Four-stage depth-4 `MIX_AIC_1_2` prefill reshape-and-cache: one Cube core and
 **both** Vector cores over the eight chunks of a single 16-token strip, with a
 bit-exact INT4 paged KV cache.
 
+**Second revision.** The whole randomised Hadamard rotation now runs on the
+Cube; the Vector cores only reduce, scale and pack. That rebalancing also
+exposed a synchronisation fault that the first revision had been passing with —
+see [the bug the rebalancing exposed](#the-bug-the-rebalancing-exposed-a-reused-mode-4-flag-id-is-not-a-token).
+
 | Field | Value |
 | --- | --- |
-| What it proves | a four-stage ring with MTE2, Cube/Fixpipe, both Vector cores and MTE3 in flight together; an INT8×INT8→INT32 Cube Hadamard factor fed straight from GM into L1 with no Unified Buffer hop; a KV cache whose every nibble and every scale is reproduced bit for bit by an integer host oracle |
+| What it proves | a four-stage ring with MTE2, Cube/Fixpipe, both Vector cores and MTE3 in flight together; the *complete* orthogonal rotation as INT8×INT8→INT32 Cube work fed straight from Global Memory into L1 with no Unified Buffer hop; a KV cache whose every nibble and every scale is reproduced bit for bit by an integer host oracle |
 | What it omits | multi-core tiling (`blockDim` is 1), ragged shapes, a non-page-aligned slot mapping, silicon |
 | Target | `Ascend950PR_9599` CAModel, `__NPU_ARCH__ == 3510`, CANN 9.2.0-beta.2, `dav-3510` |
 | Kernel type | `KERNEL_TYPE_MIX_AIC_1_2`, `#error` on `__MIX_CORE_AIC_RATION__ == 1` |
@@ -15,6 +20,7 @@ bit-exact INT4 paged KV cache.
 Sources:
 [`kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp`](../kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp),
 [`tests/camodel/test_camodel_turboquant_reshape_and_cache_a8.cpp`](../tests/camodel/test_camodel_turboquant_reshape_and_cache_a8.cpp),
+[`tests/test_reshape_and_cache_a8_probe.cpp`](../tests/test_reshape_and_cache_a8_probe.cpp),
 [`scripts/analyze_reshape_trace.py`](../scripts/analyze_reshape_trace.py).
 
 ## Commands
@@ -23,10 +29,8 @@ Sources:
 bash scripts/run_modulo3_camodel.sh micro reshape_and_cache_a8
 ```
 
-with `MODULO3_TIMEOUT=900s` (the probe needs 70 s of wall clock in the
-cycle-accurate model, against the fused attention probe's few seconds, so the
-script's 120 s default is now overridable). `MODULO3_BUILD_DIR` was a fresh
-ext4 directory, `ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.2.0-beta.2`,
+with `MODULO3_TIMEOUT=300s`. `MODULO3_BUILD_DIR` was a fresh ext4 directory,
+`ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.2.0-beta.2`,
 `SOC_VERSION=Ascend950PR_9599`, `RUN_MODE=sim`, `CMAKE_BUILD_TYPE=Release`.
 
 The Tier-1 host probe:
@@ -38,214 +42,382 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
 bin/test_reshape_and_cache_a8_probe
 ```
 
-The V0 iteration loop that preceded both, ~14 s per cycle instead of ~5 min:
+The V0 iteration loop that preceded both, ~14 s per cycle instead of ~6 min:
 
 ```sh
 bisheng -I$ASCEND_HOME_PATH/x86_64-linux/asc/include -std=c++17 \
     --npu-arch=dav-3510 -O2 -fsyntax-only --asc-aicore-lang <kernel>.cpp
 ```
 
-A `-fsyntax-only` pass over the device source answers every "does this API
-exist on dav-3510 with these operand types" question in seconds, and it is how
-the INT8 Mmad shape, the Fixpipe conversion table and the INT4 pack were
-settled before a line of the pipeline was written. The Fixpipe answer came out
-of a `static_assert` in `arch/utils/check_data_type.h`: `CopyL0C2UB` supports
-`(FP32, FP32)` and `(INT32, INT32)` under `NoQuant`, and **not**
-`(FP32, INT32)`, so the INT32 panel is cast on the Vector core rather than by
-the Fixpipe.
+## What changed in this revision, and why
 
-## The design, and the three places it departs from the brief
-
-The rotation is a randomised Hadamard split across the engine classes. Per head
-of 256 channels, with `ch = c1 * 32 + c0`:
+The rotation is a randomised Hadamard. Per head of 256 channels, with
+`ch = c1 * 32 + c0`:
 
 ```
-Y = (H8 (x) I32) . diag(piSigns) . (I8 (x) H32) . x,   normalised by invSqrtLen
+Y = M . x,   M = (H8 (x) I32) . diag(piSigns) . (I8 (x) H32)
+M[c1*32 + c0][g*32 + i] = H8[c1][g] . piSigns[g*32 + c0] . H32[c0][i]      (1)
 ```
 
-the Cube applying the inner factor as one Mmad per channel group and the Vector
-cores applying the sign diagonal and then the outer factor as three radix-2
-butterfly stages. `tables` carries the 32×32 INT8 Sylvester matrix, resident in
-L1 and in both L0A and L0B; `piSigns` carries the 256-entry sign diagonal.
+The sign diagonal sits *between* the two Hadamard factors, so it is indexed by
+the intermediate channel `(g, c0)`. That is why `M` has one signed entry per
+(output channel, input channel) pair rather than a factorisation that commutes.
 
-**1. `kGroup` is 32, not 16.** The arch-3510 INT8 fractal is 16×32, so K0 is
-32: a 16-point inner factor would be a half-filled K fractal. A 32-point inner
-factor is exactly one fractal and needs no padding, which leaves the outer
-factor at order 8 and three butterfly stages on the Vector core rather than
-two.
+**The first revision split (1) across the engine classes:** the Cube applied
+the inner factor `I8 (x) H32` as one Mmad per channel group, and the Vector
+cores applied `diag(piSigns)` and then `H8 (x) I32` as three radix-2 butterfly
+stages over the group index. That is the cheap factorisation in multiply-adds
+and the expensive one in wall clock. Its own profile said so:
 
-**2. The Hadamard is the Cube's *B* operand for key chunks and its *A* operand
-for value chunks, and there are eight Mmads per chunk rather than one.** This
-is what lets one L1 image serve both cache layouts. For INT8 the NZ image of a
-16×256 page and the ZN image of its 256×16 transpose are the same bytes — both
-store fractal `c1` as 16 rows of 32 bytes at offset `c1 * 512` — so a single
-GM→L1 ND→NZ copy produces a page that reads as
+| | first revision |
+| --- | ---: |
+| Cube `WAIT_INTRA_BLOCK`, share of attributed cycles | 33.6% (21767 of 64826) |
+| Cube `MMAD`, share | 2.8% (1792) |
+| Cube `FIX_L0C_TO_DST` + its `MOV_SPR_XN` writes, share | 43.7% (28328) |
+| Vector `RV_VLD` + `RV_VST`, share of 170437 | 48.6% (82703) |
+| Vector `RVECEX`, share | 24.4% |
+| four-engine overlap | 581 cycles of a 19331-cycle dispatch span |
 
-* `A`, `NZ(16, 32)` → `C[t][c0out]`, the token-major panel the key cache needs,
-* `B`, `ZN(32, 16)` → `C[c0out][t]`, the channel-major panel the value cache
-  needs,
+The Cube waited twelve times longer for a Vector core to hand back a landing
+panel than it spent multiplying; its largest single cost was *eight* Fixpipe
+transfers per chunk rather than any arithmetic; and the Vector cost was
+register traffic, of which the sign multiply and three butterfly stages are
+four full-panel passes.
 
-with no second staging path and no element permutation anywhere. H32 is
-symmetric and square, so its row-major 1 KiB image is byte for byte both its
-own `NZ(32,32)` and its own `ZN(32,32)`.
+**This revision folds all of (1) onto the Cube.** The contraction splits over
+the eight source groups `g`, and the outer factor's sign `H8[c1][g]` goes into
+the *resident operand* instead of being applied afterwards. For output group
+`c1` and source group `g` the Cube multiplies the page's group-`g` fractal by
+the 32×32 block
 
-**3. The work is shared one chunk per Vector core, not one token half per
-core.** The brief's token split is not expressible against the value cache
-contract. Channel-major means a channel's `blockSize` nibbles are adjacent, so
-one channel of a 16-key page is 8 bytes; a core holding 8 of the 16 keys owns 4
-bytes of every such group and can never assemble a 32-byte MTE3 burst, which is
-the egress granularity. Splitting by chunk — chunk `c` to Vector core `c & 1` —
-gives each core whole 16-token chunks, so both layouts come out as one
-2048-byte burst, and adjacent chunks still sit on different cores, so the two
-Vector cores overlap. The UB budget is unchanged: depth 2 × 16 tokens is the
-same 32 KiB landing ring as depth 4 × 8 tokens, and depth 2 × 16 tokens of
-packed output is the same 4 KiB.
+```
+T[s][g][c0][i] = (s ? -1 : +1) . piSigns[g*32 + c0] . H32[c0][i],
+s = parity(c1 & g) = (H8[c1][g] < 0)                                       (2)
+```
 
-### The quantiser is power-of-two, and that is a verification decision
+and accumulates the eight products for one `c1` into one L0C region
+(`cmatrixInitVal` true on `g == 0`, false on the rest). Because the dependence
+on `c1` is a single sign there are only **16 distinct blocks, 16 KiB of
+INT8** — `tables` carries them and they stay resident in both L0A and L0B for
+the whole kernel. 64 Mmads per chunk, one per `(c1, g)` pair.
 
-With `2^e <= absmax < 2^(e+1)` the scale is `2^(e-2)` and the stored value is
-`min(rint(Y * 2^(2-e)), 7)`, clamped only from above because
-`|Y * 2^(2-e)| < 8` while round-to-nearest-even can reach +8. The exponent is
-extracted with integer ops on the FP32 bit pattern — mask the mantissa, then
-one integer subtract for `2^(e-2)` and one more for its exact reciprocal, since
-the two exponent fields sum to 254 — so no division, reciprocal or logarithm
-runs anywhere.
+Three consequences, all of them the point:
 
-That matters because `Y` is an integer (`|x| <= 128`, inner factor ×32, outer
-×8, so `|Y| <= 32768`, exact in both INT32 and FP32) and `2^(2-e)` is a power
-of two, so the product is exact and the single round-to-nearest-even is the only
-rounding in the entire path. A `7/absmax` scale would put the rounding of a
-hardware `Div` inside the verification contract, where a 1-ULP reciprocal can
-flip a tie and change a nibble. `invSqrtLen` folds into the stored scale alone,
-because scaling `Y` and `absmax` together leaves every nibble unchanged.
+* the Vector stage loses the sign multiply and three butterfly stages, four of
+  its thirteen full-panel passes, and with them the two ping-pong panels and
+  two replicated sign panels they needed;
+* the Cube emits **one Fixpipe per chunk** instead of one per channel group,
+  because the whole 16×256 panel is finished in L0C before anything leaves it;
+* the landing-panel back edge is waited *after* the Mmads rather than before
+  them, since only the Fixpipe touches Unified Buffer. The Cube's 64
+  multiplies for chunk *j* now overlap the Vector core's quantisation of chunk
+  *j − 1* instead of queueing behind it.
 
-**Consequence: this probe checks bit equality for an arbitrary INT8 input, not
-only for a crafted fixture.** That is a stronger guarantee than the fused
-attention probe's "keep every score a multiple of 1/128".
+### The cost of this, stated plainly
+
+Folding a factor that is **diagonal in 32 channels** into a GEMM costs eight
+times the multiply-adds: 1024 hardware MMADs over the run against 128. There
+is no cheaper arrangement. `H8 (x) I32` is a batch of 32 independent order-8
+transforms, one per `c0`; expressing it as a single GEMM means padding `K` and
+`N` from 8 up to the 32-wide K0 and 16-wide N0 fractals, which is the same
+factor of eight, and expressing it as 32 small GEMMs is worse. The trade is
+worth making only because the Cube was idle for two thirds of its attributed
+cycles, which is a property of *this* pipeline and not a general rule.
+
+### One L1 image, two operand roles — now for the blocks too
+
+For INT8 the NZ image of a 16×256 page and the ZN image of its 256×16
+transpose are the same bytes, which is what lets one GM→L1 copy per chunk serve
+the key chunks as an `A` operand and the value chunks as a `B` operand. The
+same symmetry covers the resident blocks: a row-major 32×32 INT8 block reads as
+its own `NZ(32,32)` and as the `ZN(32,32)` image of its transpose, so with
+`W = T[s][g]`,
+
+* value chunks, `A` = NZ load of `W` → `A[c0][i] = W[c0][i]`
+* key chunks, `B` = ZN load of `W` → `B[i][c0] = W[c0][i]`
+
+and (1) needs exactly `W[c0][i]` in both roles. The 16 blocks are therefore a
+flat 16 KiB blob in GM, in L1, and in each of L0A and L0B: one GM→L1 copy and
+one L1→L0 copy per operand role, all three byte-for-byte identity, because
+`NZ(512,32)` and `ZN(32,512)` both have a single fractal along the 32-wide
+axis.
+
+`piSigns` is consumed by whoever builds `tables` and **is no longer read by the
+device**. It stays in the published signature. The runner builds (2) from the
+same sign function it uploads, and both the runner and the Tier-1 probe check
+that the 16 blocks, composed the way the kernel composes them, reproduce all
+65536 entries of `M`.
+
+## Where this departs from the brief, and why
+
+The brief asked for the rotation to be factored as **two cascaded order-32
+GEMMs** with a permutation between them,
+
+```
+Y = (H32 (x) I8) . P . (I8 (x) H32) . x
+```
+
+stage 1 contracting over channel blocks of 32, stage 2 a stride swap in L1 or
+L0, stage 3 a second `H32` pass on the Cube, and the Fixpipe landing the fully
+rotated tensor in Vector UB. This revision delivers the brief's *objective* —
+the entire orthogonal transform on the Cube, the Vector cores reduced to
+`absmax`, power-of-two scale and INT4 pack — by a different factorisation. Two
+reasons, both load bearing.
+
+**1. Two order-32 stages cannot compose to the order-256 rotation, with any
+permutation.** Write the channel index in bits. `I8 (x) H32` transforms bits
+0..4 and `H32 (x) I8` transforms bits 3..7, so bits 3 and 4 are transformed
+*twice*. Applying `H2` twice to one bit gives `2 I`, not a transform: the
+product is `4 . (H8 (x) I4 (x) H8)` up to relabelling — an orthogonal map, but
+not `H256`, and not the map the cache contract and the host oracle specify. A
+permutation between the stages can relabel which bits each stage sees, but once
+an order-32 stage has consumed five of the eight bits only three remain, so the
+second stage can be of order 8 at most. The exact two-stage cascade is `H32`
+then `H8`, which is what the first revision already implemented — with the
+order-8 stage on the Vector core, because that is where an order-8 contraction
+is cheap.
+
+**2. A second Cube pass cannot carry the intermediate exactly.** Stage 1
+produces `|z| <= 32 * 127 = 4064`, which needs 13 bits. The Cube's operands are
+INT8, so the intermediate cannot be re-fed as INT8; FP16 represents integers
+exactly only to 2048, so `z` is not exact in FP16 either; and a `CopyL0C2L1`
+round trip, which this part does support, does not change that. A bit-exact
+two-pass cascade would need the intermediate split into two INT8 limbs — two
+more GEMMs plus Vector-side limb formation, which puts work back on the engine
+the refactor is clearing — or an FP32 Mmad path. **Bit-exactness against an
+integer oracle is this probe's headline property**, and it is not worth trading
+for a factorisation that is in any case not the specified rotation.
+
+What replaces it: a single accumulating pass with the sign diagonal and the
+order-8 outer factor folded into 16 resident 32×32 INT8 blocks, so the whole of
+`M` is applied as 64 Mmads per chunk into one L0C panel and one Fixpipe. The
+brief's pipeline table is unchanged by this — MTE2 at column *j*, Cube at
+*j − 1*, Vector at *j − 2*, MTE3 at *j − 3* — because only the content of the
+Cube stage changed.
+
+### What the brief predicted, and what was measured
+
+| Brief | Measured | |
+| --- | --- | --- |
+| Clean compilation, `cann-9.2.0-beta.2` / `Ascend950PR_9599` | clean; no warning this revision introduced | met |
+| 100% bit-exact `keyCache` and `valueCache` | 8192/8192 and 8192/8192 bytes, plus 128/128 scales | met |
+| `WAIT_INTRA_BLOCK` on `cubecore0` from 33.6% to < 10% | **0.6%** (213 of 34351 cycles) | met |
+| `RV_VLD` + `RV_VST` on `veccore0/1` from 48.6% to < 20% | **38.4%** (41059 of 106896); the absolute cost halved, 82703 → 41059 | **not met** |
+| Four-engine steady-state overlap from 581 to > 2000 cycles | **1133** cycles, 89% of the 1269-cycle ceiling the MTE2 ∩ MTE3 overlap imposes | **not met** |
+| Cube ~3500–4000 ticks, AIV ~3500 ticks | Cube busy 8885 cycles, Vector busy 11106, over a 12590-cycle span | balanced, not at those absolute numbers |
+| Net UB savings > 60 KiB | **53440 bytes** freed | **not met**, 52.2 KiB |
+| Remove `kUbWorkA/B`, `kUbFold128/64/32/16/8` | `kUbWorkB`, `kUbFold32`, `kUbFold16` and all three sign buffers removed; `kUbWork`, `kUbFold128/64/8` retained | partly |
+
+The three misses are discussed where they are measured. Two of them have the
+same cause — the key layout's `absmax` reduces along the fast axis, so it still
+needs a fold ladder and a scratch panel for `|Y|` — and the third is a ceiling
+rather than a shortfall.
 
 ## V0 — compile time
 
-Clean `bisheng --npu-arch=dav-3510 -fsyntax-only`, zero errors and zero
-warnings, and clean host compile of the runner with `-Wall -Wextra -Werror`.
-18 `static_assert`s make the layout contract a build failure rather than a
-runtime surprise: every UB and L1 operand base 32-byte aligned, every ring slot
-stride a whole number of DataBlocks and not a multiple of 256 bytes,
-`kArenaEnd + 256 <= kUbWindow`, both MTE3 burst lengths whole 32-byte bursts,
-the page a whole number of INT8 fractals, the L0 page region 512-byte aligned,
-and the L1 ring inside the L1 buffer.
+Clean `bisheng --npu-arch=dav-3510 -fsyntax-only`, zero errors, and a clean
+host compile of the runner with `-Wall -Wextra -Werror`. The `static_assert`
+set grew with the arena change and now also pins the two new invariants: every
+resident rotation block 512-byte aligned so it can serve as an L0 operand, and
+no mode-4 flag id reaching the library's reserved 11.
 
-Measured from the compiled constants, against the budget the brief sets:
+A device-side `-Wall -Wextra` pass over the kernel emits four
+`-Wunused-const-variable` warnings — `kPackedBytes`, `kScaleFloats`,
+`kStageDepth`, `kPackDepth`, from the translation of the file in which the
+device sections are preprocessed out, where those four are the geometry
+constants no `static_assert` references. All four predate this revision, which
+adds none; the device legs are not built with those flags.
 
-| Arena | This kernel | Brief |
-| --- | --- | --- |
-| L1 resident Hadamard | 1024 B at offset 0 | 256 B at offset 0 (order 16) |
-| L1 page ring | 4 slots × 4128 B from 1056, end 17568 B of 512 KiB | 4 × 4096 B, 32-byte aligned plus 32 B skew |
-| UB Fixpipe landing ring | depth 2 × 16416 B = 32832 B | depth 4 × 8 tokens × 256 ch × 4 B = 32 KiB |
-| UB packed egress ring | depth 2 × 2144 B = 4288 B (2048 packed + 64 scale + skew) | depth 4 × 8 tokens × 128 B = 4 KiB |
-| UB arena end | 146048 B of the 196608 B window, 50304 B spare behind the 256 B read pad | read pad 256 B reserved |
-| L0A / L0B | 5120 B each: H32 1024 B resident + 4096 B of page fractals | H in L0A, page fractals in L0B |
-| L0C | 16384 B, one 16×32 INT32 block per channel group | — |
+Measured from the compiled constants, against the first revision:
 
-The landing and egress rings are the brief's budgets exactly; the depth and the
-token count are swapped because a chunk, not a token half, is the unit of work
-per Vector core. The Hadamard is four times larger because `kGroup` is 32.
+| Arena | this revision | first revision |
+| --- | ---: | ---: |
+| L1 resident rotation table | 16384 B at offset 0 (16 blocks) | 1024 B at offset 0 (H32 only) |
+| L1 page ring | 4 × 4128 B from 16416, end 32928 B of 512 KiB | 4 × 4128 B from 1056, end 17568 B |
+| L0A / L0B, each | 20480 B: 16384 B table + 4096 B page fractals | 5120 B: 1024 B H32 + 4096 B page |
+| L0C | 16384 B, one 16×256 or 256×16 INT32 panel | 16384 B |
+| UB Fixpipe landing ring | depth 2 × 16416 B = 32832 B | 32832 B |
+| UB working panels | 2 × 16384 B (`cast`, `work`) | 4 × 16384 B, plus 1 KiB of raw signs |
+| UB fold ladder | 8192 + 4096 + 512 = 12800 B | 8192 + 4096 + 2048 + 1024 + 512 = 15872 B |
+| UB packed egress ring | depth 2 × 2144 B = 4288 B | 4288 B |
+| **UB arena end** | **92608 B** of the 196608 B window | 146048 B |
 
-Three things cost a build cycle each and are recorded because they are
-toolchain properties, not kernel bugs:
+**53440 bytes of Unified Buffer freed**, 103744 B now spare behind the 256-byte
+read pad. The brief expected "> 60 KiB"; 52.2 KiB is what the key-layout
+`absmax` leaves, because its reduction runs along the fast axis and still needs
+three fold buffers plus a scratch panel for `|Y|` alongside the signed FP32
+image. Aliasing the FP16 pack staging onto `work` would reach 60 KiB and was
+not done: the two are live in overlapping parts of the stage, so the alias would
+have to be argued rather than read off the arena map.
 
-* `Cast<int4b_t, int16_t>` compiles but selects a **deprecated**
-  `vcvt_s162s4` intrinsic. The INT32 → FP16 → INT4 chain is warning-free and
-  equally exact, because the staged values are integers in `[-8, 7]` and both
-  narrowing steps are lossless.
-* a scalar parameter spelled `std::uint32_t` in the `__global__` signature
-  **breaks the host leg**: CANN copies the parameter list verbatim into
-  `aclrtlaunch_triple_chevrons_func.h`, which has no `using` for `std`. Use
-  unqualified `uint32_t`. The device legs compile either way, so the failure
-  arrives late.
-* a `__gm__ const T*` **parameter of a `__global__` function** also breaks the
-  host leg: the generated `host_stub.cpp` takes it as `const void*` and assigns
-  it to a `void*` field of the argument block. The published argument order and
-  types are kept and const is dropped on that one boundary, then restored one
-  line into the body.
+L0 is where the cost landed: 20480 B of each 64 KiB L0A and L0B, against
+5120 B. It is the arrangement that fits. One Mmad per chunk against the dense
+256×256 matrix would need 64 KiB in L0B for the key chunks and 64 KiB in L0A
+for the value chunks, leaving no room for the page; materialising the eight
+per-source-group 32×256 slabs costs the same 64 KiB. 16 blocks is the only form
+in which both operand roles stay resident at once.
 
 ## V1 — host model
 
-`tests/test_reshape_and_cache_a8_probe.cpp`, 13.9 ms:
+`tests/test_reshape_and_cache_a8_probe.cpp`, 12.5 ms:
 
 ```
-PASS reshape_and_cache_a8 host probe in 13894.806 us
+PASS reshape_and_cache_a8 host probe in 12459.627 us
   orthogonality: M M^T == 256 * I over 256 x 256 signed entries
   factorisation: 24576 values over 6 input patterns identical to a dense apply,
                  largest |Y| 24576 (bound 32768)
+  rotation blocks: 16 x 32x32 INT8 (16384 B) compose to 65536/65536 entries of M
   quantiser: 4096 nibbles inside [-8, 7], 4096 round-tripped through the
              dequant4 packing, worst relative error 0.5000
 ```
 
-Re-running the bit-exact comparison the CAModel runner already does would prove
-nothing, so this probe checks the three things that comparison *cannot* see,
-because they are properties of the oracle rather than of the device:
+The third line is new, and it is the one this revision needs. The rotation is
+entirely the Cube's resident operand now, so the device's whole arithmetic
+contract is "these 16 blocks, selected by `parity(c1 & g)`, compose to `M`".
+That is checked here over all 65536 entries, and again in the CAModel runner as
+check 0b, against an `M` built independently from `dense_entry()`. A transposed
+block or a wrong sign index still yields *some* orthogonal map; it does not
+yield `M`, and without this check the only symptom would be wrong nibbles with
+nothing to point at.
 
-* **the transform is genuinely orthogonal.** The explicit 256×256 matrix
-  `M = (H8 (x) I32) . diag(piSigns) . (I8 (x) H32)` satisfies `M M^T = 256 I`
-  exactly, over every one of the 65536 entries. That is what makes
-  `invSqrtLen = 1/sqrt(headSize)` the correct normalisation and "randomised
-  Hadamard" a measured claim rather than a label;
-* **the factorisation is the one the kernel implements.** The factored oracle —
-  inner Hadamard per group, sign diagonal, then three radix-2 stages over the
-  group index — agrees with a dense apply of `M` in exact integers for 24576
-  values across six input patterns, including both INT8 extremes and the
-  alternating ±127/−128 worst case. A butterfly cascade in the wrong order, or
-  a stage transforming the wrong bit of the group index, still composes to
-  *some* orthogonal map and would agree with a device that made the same
-  mistake; it does not agree with `M`. The same run measures the largest `|Y|`
-  as 24576 against the header's bound of 32768, so the INT32/FP32 exactness
-  argument holds with margin;
-* **the nibble contract round-trips.** All 4096 quantised values land inside
-  `[-8, 7]` and come back unchanged through the unpacking the dequantisation
-  leaf implements (two per byte, low nibble first, sign-extended INT4). The
-  power-of-two reconstruction error is at most half a step everywhere the upper
-  clamp does not bite.
+The orthogonality and factorisation checks are unchanged and still earn their
+place: they are properties of the oracle, which the CAModel comparison cannot
+see because it compares *against* that oracle.
 
-Guard bands on all three mock buffers intact.
+### The quantiser is power-of-two, and that is a verification decision
 
-**Not done:** the discrete-event queue model in
-`tests/test_pipeline_deadlock_probe.cpp` was not extended from the three-stage
-ring to this four-stage one. Its unique value — finding a deadlock or a token
-leak in sub-millisecond time rather than after a five-minute build — is real,
-and this kernel simply did not need it: the flag graph was hand-checked for
-token balance and set/wait alternation per `(route, id)` before the first
-build, and V2 ran and V4 confirmed zero residual tokens on the first clean
-build. That is evidence after the fact, not instead of the stage.
+Unchanged from the first revision, and the reason the comparison downstream can
+demand bit equality. With `2^e <= absmax < 2^(e+1)` the scale is `2^(e-2)` and
+the stored value is `min(rint(Y * 2^(2-e)), 7)`, clamped only from above because
+`|Y * 2^(2-e)| < 8` while round-to-nearest-even can reach +8. The exponent is
+extracted with integer ops on the FP32 bit pattern — mask the mantissa, then one
+integer subtract for `2^(e-2)` and one more for its exact reciprocal, since the
+two exponent fields sum to 254 — so no division, reciprocal or logarithm runs
+anywhere.
 
-### The fixture, and why the first one was discarded
+`Y` is an integer: each row of `M` has 256 signed entries and `|x| <= 128`, so
+`|Y| <= 32768`, exact in both INT32 and FP32. `2^(2-e)` is a power of two, so
+the product is exact and the single round-to-nearest-even is the only rounding
+in the entire path. `invSqrtLen` folds into the stored scale alone, because
+scaling `Y` and `absmax` together leaves every nibble unchanged.
+**Consequence: this probe checks bit equality for an arbitrary INT8 input, not
+only for a crafted fixture.**
 
-Section 6.4 asks for strictly increasing per-tile maxima so an online softmax's
-rescale path runs on every tile. **This kernel has no running maximum** — each
-chunk's `absmax` is independent — so the property is not applicable, and the
-runner asserts what actually detects a wrong read instead: the eight packed
-pages, the eight chunk maxima and the sixteen token nibble runs inside every
-chunk are pairwise distinct, at least one chunk carries two different scale
-exponents, all sixteen nibble values occur, and the INT4 clamp is taken. Every
-one of those is an assertion over the oracle the runner already computes, not a
-comment.
+## The bug the rebalancing exposed: a reused mode-4 flag id is not a token
 
-The first fixture was a low-order polynomial in `(t, c)`. Measured, it failed
-three of those properties: the rotated panel came out sparse, so the per-token
-maxima repeated with period three, the nibbles clustered on 0 and ±1 with
-14/16 values ever occurring, and the upper clamp was **never** taken. A hashed
-value in `[-12, 12]` with a per-chunk amplitude ramp gives a roughly Gaussian
-rotated panel and passes all of them. The chunk index enters both the hash and
-the amplitude, because an amplitude ramp alone would be invisible — the
-quantised nibbles are scale invariant by construction, so proportional chunks
-pack identically.
+Balancing the pipeline made the first clean build produce **wrong pages on
+AIV1's two key chunks**, chunks 5 and 7, while chunks 0–4 and 6 were bit-exact.
+The runner's diagnosis identified it rather than a guess, and it is in the
+runner permanently now, because stopping at the first differing byte says
+nothing about *how* a page is wrong:
+
+```
+chunk 5 (key head 1): 1973/2048 bytes differ, 16/16 scales differ
+   looks like oracle chunk 1 own layout: 1214/2048 bytes
+   looks like oracle chunk 5 own layout:   75/2048 bytes
+chunk 7 (key head 3): 2016/2048 bytes differ, 15/16 scales differ
+   looks like oracle chunk 3 own layout: 1780/2048 bytes
+   looks like oracle chunk 7 own layout:   32/2048 bytes
+```
+
+Chunk 5 uses AIV1's landing slot 0, last written for chunk 1; chunk 7 uses slot
+1, last written for chunk 3. Both pages were **mostly the previous occupant of
+their landing slot**, with some of the right data mixed in — a read racing a
+write, not a wrong address. Every device scale came out half the oracle's, which
+is the same story: the stale panel held a lower-amplitude chunk, so `absmax`
+landed one exponent down.
+
+The trace put cycles on it. For chunk 7 on AIV1, with
+`kFlagProductReady = Owner * INTRA_NUM + Slot` — two landing slots, so each id
+carries *two* announcements across the eight chunks:
+
+| event | CAModel cycle |
+| --- | ---: |
+| Cube's chunk-3 `SET_INTRA_BLOCK sync_id:17` (panel ready, slot 1) | 6840 |
+| AIV1 consumes it and reads slot 1 for chunk 3 | 7282 |
+| AIV1 reaches its chunk-7 wait on the same id | 8988 |
+| AIV1 starts reading slot 1 for chunk 7 | 10502 |
+| Cube's chunk-7 Fixpipe **completes** | 11165 |
+| Cube's chunk-7 `SET_INTRA_BLOCK sync_id:17` | 11167 |
+
+The chunk-7 wait was released 2179 cycles before the announcement it was
+waiting for, by the set from 6840 that the chunk-3 wait had supposedly
+consumed. **A mode-4 flag is not a counting token you can cycle an id
+through.** Whether the flag is a level bit that a wait tests without clearing,
+or something subtler, was not isolated: the fix removes the dependence rather
+than characterising the mechanism.
+
+**Fix: one flag id per cross-core event, never reused.** Per Vector core, over
+its four chunks `j = Chunk / 2`:
+
+```
+productReady  Owner*16 + j            4 ids, one per chunk
+panelFree     Owner*16 + 4 + j        the id the Cube waits for at chunk j
+panelFree     Owner*16 + 4 + j + 2    the id the AIV sets after chunk j
+```
+
+so ids 4 and 5 are the two priming tokens, 6 and 7 the releases the Cube
+consumes for its last two chunks, and 8 and 9 the releases the epilogue drains.
+Ten ids per core, **every one set exactly once and waited exactly once in the
+whole kernel**, all clear of the library's reserved 11..14. The audit now
+asserts exactly that, because set and wait counts balance under reuse: counting
+alone passes vacuously.
+
+### Why it had never shown, and what that says about the first result
+
+A pipeline in which one engine runs far ahead never consumes a stale token. The
+first revision's Cube finished all eight chunks by cycle 6121 of a 19331-cycle
+run, so a stale "panel ready" always pointed at a panel that had in fact been
+written long before. **That kernel passed twice, reproducibly, with every gate
+green, and its id scheme was unsound the whole time.** Rebalancing the pipeline
+is what made the fault reachable — an argument for this refactor beyond the
+cycle counts.
+
+Two variants were built and run side by side before the cause was understood:
+the landing-panel wait placed after the Mmads, as this revision designs it, and
+placed before them, where the first revision had it. The early-wait variant
+**passed, bit-exact** — with a margin of 85 cycles between the chunk-7 Fixpipe
+completing at 10424 and AIV1 reading that panel at 10509. It passed because
+moving the wait earlier delays the Cube's Fixpipe by one Mmad block, not because
+it was correct. Shipping it would have carried the fault forward.
+
+### A wrong diagnosis, recorded
+
+The first explanation of the same trace was that the two Vector cores share one
+four-bit flag pool, so that `Owner * 16 + Slot` aliases onto `Slot` and the
+Cube's announcement to AIV0 released AIV1. It had real support:
+`NotifyEventImpl` / `WaitEventImpl`
+(`impl/basic_api/dav_3510/kernel_operator_sync_impl.h:789`, `:816`) pass a
+mode-4 id straight to `set_intra_block` / `wait_intra_block` with no sub-block
+offset of their own; `GetffstMsg` masks `flagId & 0xf` on the sibling ffts path;
+and the AIV side of the trace prints an id of 16 as `sync_id:0`.
+
+Renumbering both cores into ids 0..7 to "fix" it **deadlocked the kernel**: AIV1
+stalled on `WAIT_INTRA_BLOCK sync_id:2`, its "panel ready", and the Cube on
+`WAIT_INTRA_BLOCK sync_id:6`, its "panel free" from AIV1 — each waiting on a
+flag the peer had addressed into the other sub block. So the id space **is** per
+sub block, in both directions, and §6.2 of the guidelines was right: the
+`+ INTRA_NUM` offset is how a participant names the other sub block's channel,
+and the AIV-side trace value is that id with the sub-block bits resolved. The
+wrong reading survived a library read and a trace read; only a deadlock settled
+it. §6.2c and §6.2d of
+[`MICROROUTINE_DESIGN_GUIDELINES.md`](../MICROROUTINE_DESIGN_GUIDELINES.md)
+record both the finding and the misdiagnosis.
+
+### A latent fault elsewhere in this repository
+
+`kernels/ops/turboquant/turboquant_paged_attention_opt.cpp` cycles three ring
+slots through each of five cross-core ids over eight pages, so each of its ids
+carries up to three announcements. It passes today with its Cube ahead of its
+Vector cores — the position this operator was in. **Not investigated and not
+fixed here**; it is a different operator with its own probe.
 
 ## V2/V3 — CAModel, in one run
 
 Eight chunks over a depth-4 L1 ring and depth-2 UB rings means slot `s` is
-refilled for chunk `s + 4` (L1) and chunk `s + 4` of the owning core's two
+refilled for chunk `s + 4` (L1) and for the owning core's next-but-one chunk
 (UB), so **every buffer-reuse back edge is contended, not merely primed and
-drained**. The depth-boundary run and the past-the-depth run coincide; there is
-no second build parameter.
+drained**.
 
 **Gate 1 — exit code and scalar faults.** Exit code 0. Zero
 `invalid ldst addr`, zero `unrecognize ldst addr`, zero `su_ccu_mpu_err`, zero
@@ -254,8 +426,7 @@ no second build parameter.
 **Gate 2 — canaries.** 1024/1024 guard bytes intact, head and tail, across all
 eight Global Memory buffers. Beyond the guard bands, **24576 cache bytes
 outside the written page still hold the exact `0xDEADBEEF` lane for their
-offset**, and so does every `scaleCache` float outside the eight written runs —
-so a mis-scaled page offset or a stray burst would be caught, not ignored.
+offset**, and so does every `scaleCache` float outside the eight written runs.
 
 **Gate 3 — numerics, per chunk and per token.**
 
@@ -264,235 +435,271 @@ so a mis-scaled page offset or a stray burst would be caught, not ignored.
 | `keyCache`, key-major | 8192/8192 bytes | bit-exact |
 | `valueCache`, channel-major | 8192/8192 bytes | bit-exact |
 | `scaleCache` | 128/128 FP32 | bit-exact, compared as bit patterns |
+| `tables` composition | 65536/65536 entries of `M` | exact |
 
-Bit-exact, not within a tolerance: there is no ULP budget to state, because the
-only rounding in the path is a round-to-nearest-even of an exactly
-representable product. Fixture coverage in the same run: per-chunk max `|Y|`
-427, 681, 824, 1126, 1284, 1492, 2048, 1870 (pairwise distinct); 4 distinct
-scale exponents with 5 of 8 chunks carrying two or more; 16/16 nibble values
-exercised; the INT4 upper clamp taken on 3 of 8 chunks.
+Bit-exact, not within a tolerance. Fixture coverage in the same run is
+unchanged from the first revision, which is the point — the oracle did not
+move: per-chunk max `|Y|` 427, 681, 824, 1126, 1284, 1492, 2048, 1870 (pairwise
+distinct); 4 distinct scale exponents with 5 of 8 chunks carrying two or more;
+16/16 nibble values exercised; the INT4 upper clamp taken on 3 of 8 chunks.
 
-**Gate 4 — event balance.** 86 intra-core `SET_FLAG` / 86 `WAIT_FLAG` across 28
+**Gate 4 — event balance.** 92 intra-core `SET_FLAG` / 92 `WAIT_FLAG` across 27
 `(route, ID)` pairs on three cores, zero residual, event ids 6 and 7 untouched.
-20 cross-core mode-4 sets and 20 waits, every absolute id paired AIV↔AIC, on
-exactly the designed id set `[0, 1, 4, 5, 16, 17, 20, 21]` — AIV0's channel in
-0..15 and AIV1's in 16..31, with AIV1 rebased by `INTRA_NUM` before pairing.
+20 cross-core mode-4 sets and 20 waits over **20 distinct ids** — `[0..9]` on
+AIV0's channel and `[16..25]` on AIV1's — with exactly one set and one wait
+each, so no id carries a second announcement.
 
 ## V4 — trace audit
 
-`scripts/analyze_reshape_trace.py`, wired into `run_modulo3_camodel.sh` under
-its own name branch, exits 0. Six fatal checks: intra-core event balance,
-cross-core pairing on absolute ids, chunk ownership both ways, both Vector
-cores executing and egressing, a Cube that never touches Global Memory, and
-four-engine concurrency.
-
-Measured, all from `core0.{veccore0,veccore1,cubecore0}.instr_popped_log.dump`
-and the matching completion dumps on one CAModel clock:
+`scripts/analyze_reshape_trace.py` exits 0 on seven fatal checks: intra-core
+event balance; cross-core one-set-per-id and per-core id ownership; chunk
+ownership both ways; both Vector cores executing and egressing; a Cube that
+never touches Global Memory; the Cube census; and four-engine concurrency.
 
 ```
-Total tick 20444; model wall clock 69.5 s
-dispatch span   cycles   702..20033  (19331 cycles, 34806 instructions)
-completion span cycles   706..20053  (19347 cycles)
-AIV0 16600 instructions (RVECEX 6039, RVECLD 4270, RVECST 3522, MTE3 19, MTE2 3)
-AIV1 16604 instructions (RVECEX 6039, RVECLD 4270, RVECST 3522, MTE3 19, MTE2 3)
-AIC    807 instructions (SCALAR 403, FIXP 145, MTE1 105, CUBE 91, MTE2 39)
+Total tick 13599; model wall clock 45.1 s
+dispatch span   cycles   671..13261  (12590 cycles, 21973 instructions)
+completion span cycles   675..13281  (12606 cycles)
+AIV0 10225 instructions (RVECEX 4311, RVECLD 2066, RVECST 2048, MTE3 19, MTE2 1)
+AIV1 10229 instructions (RVECEX 4311, RVECLD 2066, RVECST 2048, MTE3 19, MTE2 1)
+AIC   1519 instructions (SCALAR 763, CUBE 547, MTE1 105, FIXP 41, MTE2 39)
 ```
 
-**Chunk ownership.** The Cube announced 4 panels to AIV0 on ids 0..15 and 4 to
-AIV1 on ids 16..31; each core released 6 (2 primed plus one per owned chunk).
-`MMAD x64` on the Cube pipe is exactly 8 chunks × 8 channel groups.
+against the first revision's 20444 ticks, 19331-cycle span, 34806 instructions,
+16600/16604 on the Vector cores and 807 on the Cube. The work moved rather than
+disappearing: **the Vector cores issue 38% fewer instructions and the Cube
+88% more.**
+
+**The Cube census is asserted now, not reported.** `MMAD x512` is exactly
+8 chunks × 8 output groups × 8 source groups, and there are exactly 8
+`FIX_L0C_TO_DST` transfers, one per chunk. A Vector core that still applied part
+of the rotation, or a Fixpipe per channel group, fails the audit rather than
+showing up as a slower run.
 
 **Zero Global Memory workspace, and no UB hop for the page.** 0 Global Memory
-stores anywhere on the AIC, 0 `MOV_UB_TO_L1` moves, and on the MTE2 pipe
-exactly **8 `MOV_OUT_TO_L1_MULTI_ND2NZ` page moves, one per chunk**, plus one
-`MOV_SRC_TO_DST_ALIGNv2` for the rotation table: 9 data moves in all, so a
-16×256 INT8 page crosses into L1 as a single ND→NZ burst rather than a strip
-schedule. Egress is 8 Global Memory stores per Vector core, one packed page and
-one scale slice for each of its four chunks.
+stores anywhere on the AIC, 0 `MOV_UB_TO_L1` moves, and on the MTE2 pipe exactly
+8 `MOV_OUT_TO_L1_MULTI_ND2NZ` page moves plus one `ALIGNv2` for the 16 KiB
+rotation table: 9 data moves in all. The table is one burst, not sixteen,
+because the 16 blocks are a flat blob in every memory they touch.
 
-**Four engines in flight together.** Dispatch ticks place the window:
+**Engine occupancy, and what balanced actually looks like.**
 
-| Stream | CAModel cycles |
-| --- | --- |
-| MTE2 page staging | 1269 … 5378 |
-| Mmad, first of each chunk's group of eight | 2532, 2898, 3484, 4017, 4594, 5063, 5508, 6121 |
-| Fixpipe, first of each chunk's group | 2658, 2861, 3094, 3979, 4550, 4892, 5499, 6082 |
-| AIV0 egress (packed, scale) | 5353/5354, 7176/7177, 13059/13060, 19205/19206 |
-| AIV1 egress | 5589/5590, 7412/7413, 11183/11184, 14559/14560 |
+| engine, busy cycles | this revision | first revision |
+| --- | ---: | ---: |
+| MTE2 | 5274 | 4063 |
+| Cube (CUBE + FIXP + MTE1) | 8885 | 5139 |
+| Vector (both cores) | 11106 | 16007 |
+| MTE3 | 4362 | 3843 |
+| dispatch span | 12590 | 19331 |
+| Cube / Vector | **0.80** | 0.32 |
 
-Four-engine overlap is **581 cycles, widest 5379..5960**. Reading the four
-streams across that window: chunk 7's page burst is the last MTE2 dispatch at
-5378 and is still in flight, the Cube is finishing chunk 5's Mmads and starting
-chunk 6's at 5508, AIV0 is rotating chunk 2 and AIV1 chunk 3 (their next
-egresses are at 7176 and 7412), and MTE3 is carrying chunk 0 off AIV0 at 5353
-and chunk 1 off AIV1 at 5589. That is the four-stage steady state the schedule
-claims, located in cycles rather than inferred from source order. AIV0 and
-AIV1 are
-concurrently in flight for 12859 cycles, widest 703..8168. Engine busy cycles:
-MTE2 4063, Cube 5139, Vector 16007, MTE3 3843. Pairwise overlaps, cycles:
-Cube+Vector 4714, Cube+MTE2 3911, Vector+MTE2 3632, Vector+MTE3 3615,
-Cube+MTE3 739, MTE2+MTE3 607.
+The first revision's report said: "calling this a balanced four-stage pipeline
+would be wrong — three of the four engines spend most of the run idle behind
+the Vector stage." That is no longer true of the Cube, which is busy 71% of the
+span against the Vector cores' 88%. Those two are not quite like for like — the
+Vector figure is the *union* of both cores' busy intervals, so a cycle in which
+either core works counts once — but the ratio moved from 0.32 to 0.80 on the
+same definition, and the cross-core waits say which side now stalls. MTE2 and
+MTE3 remain lightly loaded, at 42% and 35%, which is what a 4 KiB ingress and a
+2 KiB egress per chunk cost.
+
+**Per-chunk cadence.** The Cube now produces a panel every 957–1184 cycles
+(median 1073) and each Vector core consumes one every 1636–2033 (median 1927),
+so the two cores together consume one per ~963 cycles. Producer and consumer are
+within 10% of each other, with the **producer now the slower of the two**: the
+Cube's cross-core wait is 191 accumulated cycles against the Vector cores'
+6495 and 7609. The pipeline is Cube-bound by about 10%, having been Vector-bound
+by 3:1. In the first revision the Cube finished all eight chunks by cycle 6121
+of a 19331-cycle run.
+
+**Four-engine concurrency, and the ceiling on it.** 1133 cycles, widest
+7760..8242, against the first revision's 581. **The brief asked for more than
+2000, and that was not reached.** The trace says why rather than leaving it as a
+shortfall:
+
+| | this revision | first revision |
+| --- | ---: | ---: |
+| MTE2 ∩ MTE3 overlap | 1269 | 607 |
+| four-engine overlap | 1133 | 581 |
+| four-engine as a share of that ceiling | 89% | 96% |
+
+A four-way intersection cannot exceed the overlap of any pair inside it, and the
+binding pair is ingress ∩ egress: MTE2 and MTE3 are each busy about a third of
+the span, at opposite ends of a chunk's life. **Both revisions take almost the
+whole window that pair leaves** — the window itself doubled, 607 → 1269 cycles,
+which is the measurable effect of balancing the pipeline. Getting past 2000
+would need more ingress or egress work per chunk, not a different schedule: no
+rearrangement of four engines widens the overlap of two of them. Issuing the
+MTE2 bursts further ahead, which the depth-4 L1 ring allows, moves the wrong
+way — it makes MTE2 finish earlier and shrinks the window.
 
 ## Profiling — `msprof op simulator`
 
-Two of the three msprof modes do not apply to a CAModel-linked binary, and the
-first one says so:
-
-```
-msprof op   -> [ERROR] Device profiling is not supported on current chip.
-               [INFO]  Use msprof op --help or msprof op simulator --help
-msprof      -> runs the probe to PASS, then
-               [ERROR] Failed to find profiling data, please check that the
-               application executes AI-related business ...   exit 255
-```
-
-The application profiler reads the driver's counters and the CAModel driver
-stub has none. `msprof op simulator` is the mode that does apply:
-
 ```sh
+LD_LIBRARY_PATH=$BUILD/lib:$SIM_LIB_DIR:$ASCEND_HOME_PATH/lib64:... \
 /usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin/msprof op simulator \
-    --application=/tmp/a8-explicit/test_camodel_turboquant_reshape_and_cache_a8 \
-    --output=/tmp/a8-prof/sim \
-    --soc-version=Ascend950PR_9599 \
+    --application=$BUILD/test_camodel_turboquant_reshape_and_cache_a8 \
+    --output=/tmp/a8-prof-v2 --soc-version=Ascend950PR_9599 \
     --aic-metrics=PipeUtilization \
     --kernel-name=turboquant_reshape_and_cache_a8 \
-    --launch-count=1 --timeout=30
+    --launch-count=1 --timeout=180
 ```
 
-Exit 0, `All task success`, 5907 relations extracted from the kernel
-`turboquant_reshape_and_cache_a8_0_mix_aic`, and the probe still printed its
-own PASS underneath. Its core summary:
+`LD_LIBRARY_PATH` is load bearing and is not in the first revision's recipe:
+without it msprof's child exits 127 and the run reports
+`No profiling data matched --kernel-name=...`, which reads like a name mismatch
+rather than a link failure. Exit 0, `All task success`, 4723 relations from
+`turboquant_reshape_and_cache_a8_0_mix_aic`, and the probe printed its own PASS
+underneath.
 
-| core | duration (us) | running (us) | stalled |
-| --- | ---: | ---: | ---: |
-| core0.cubecore0 | 7.10 | 7.05 | 0.05 |
-| core0.veccore0 | 10.75 | 8.93 | 1.82 |
-| core0.veccore1 | 8.17 | 8.17 | 0.00 |
+| core | duration (us) | running (us) | stalled | first revision |
+| --- | ---: | ---: | ---: | --- |
+| core0.cubecore0 | 5.95 | 5.71 | 0.24 | 7.10 / 7.05 / 0.05 |
+| core0.veccore0 | 6.35 | 6.35 | 0.00 | 10.75 / 8.93 / 1.82 |
+| core0.veccore1 | 7.00 | 7.00 | 0.00 | 8.17 / 8.17 / 0.00 |
 
-AIV0 is the critical path, and it is the only core with meaningful stall.
+The critical path falls from 10.75 us to 7.00 us, and the three cores now sit
+within 18% of each other rather than 80%.
 
-The per-instruction CSVs under `simulator/<core>/` carry the detail. `cycles`
-there is issue-to-complete latency accumulated per instruction site, so the
-per-core totals exceed the kernel span and the column ranks hot spots rather
-than measuring occupancy:
+`cycles` below is issue-to-complete latency accumulated per instruction site,
+so the per-core totals exceed the kernel span: the column ranks hot spots, it
+does not measure occupancy.
 
 ```
-core0.cubecore0   696 issues, 64826 accumulated cycles
-  FIXP     43.7%   FIX_L0C_TO_DST  64 x 15790   MOV_SPR_XN 64 x 12538
-  FLOWCTRL 33.6%   WAIT_INTRA_BLOCK 12 calls, 21767 cycles
-  MTE2     10.2%   MOV_OUT_TO_L1_MULTI_ND2NZ 8 x 4735, ALIGNv2 1 x 574
-  SCALAR    6.2%
-  MTE1      3.5%   LOAD_2Dv2 66 x 2272
-  CUBE      2.8%   MMAD 64 x 1792  (28 cycles per Mmad)
+core0.cubecore0   1392 issues, 34351 accumulated cycles   (was 696, 64826)
+  CUBE     50.8%   MMAD 512 x 17458                       (was  2.8%, 64 x 1792)
+  MTE2     18.7%   MOV_OUT_TO_L1_MULTI_ND2NZ 8 x 4752     (was 10.2%)
+  SCALAR   17.8%                                          (was  6.2%)
+  MTE1      7.1%   LOAD_2Dv2 66 x 2440                    (was  3.5%)
+  FIXP      4.9%   FIX_L0C_TO_DST 8 x 1668                (was 43.7%, 64 x 15790
+                                                           + MOV_SPR_XN 64 x 12538)
+  FLOWCTRL  0.6%   WAIT_INTRA_BLOCK 213 cycles            (was 33.6%, 21767)
 
-core0.veccore0  16689 issues, 170437 accumulated cycles
-  RVECLD   28.1%   RV_VLD 4264 x 43900
-  RVECEX   24.4%   RV_PLT 1777 x 10662, RV_VMULS 842 x 6736,
-                   RV_VCVT_I2F 512 x 4096, RV_VMUL 512 x 4096
-  RVECST   23.4%   RV_VST 3235 x 38803
-  PUSHQ     9.8%   VF 61 x 16407
-  SCALAR    7.4%
-  MTE3      2.6%   MOV_SRC_TO_DST_ALIGNv2 9 x 5022
+core0.veccore0  10273 issues, 106896 accumulated cycles   (was 16689, 170437)
+  RVECEX   28.1%   RV_PLT 1329 x 7974, RV_VMULS 778 x 6224 (was 24.4%)
+  RVECST   20.2%   RV_VST 1923 x 21270                     (was 23.4%, 3235 x 38803)
+  RVECLD   20.0%   RV_VLD 2028 x 19789                     (was 28.1%, 4264 x 43900)
+  SCALAR    9.9%
+  PUSHQ     8.8%   VF 39 x 9134                            (was  9.8%, 61 x 16407)
+  FLOWCTRL  7.3%   WAIT_INTRA_BLOCK 4 x 6495               (was ~0)
+  MTE3      4.2%
 ```
 
-core0.veccore1 is the same profile to within 0.4%: 16693 issues and 171068
-cycles against 16689 and 170437, with identical call counts on every vector
-mnemonic. Two findings this report had reached from the dumps, now with
-msprof's own numbers behind them:
+`core0.veccore1` is the same profile to within 1%: 10277 issues and 108025
+cycles, identical call counts on every vector mnemonic, and 8605 cycles of
+`FLOWCTRL` against 7761.
 
-* **the Cube waits on the Vector cores for a third of its attributed cycles.**
-  12 `WAIT_INTRA_BLOCK` calls account for 21767 of 64826 cycles, which is the
-  panel-free back edge and the epilogue drain, averaging 1814 cycles per wait.
-  The Mmads themselves are 1792 cycles in total — the Cube spends twelve times
-  longer waiting for a panel than multiplying.
-* **the Vector cost is register traffic, not arithmetic.** `RV_VLD` plus
-  `RV_VST` is 82703 of 170437 cycles, 48.6%, against 24.4% for the whole
-  execute pipe. A level-2 op over a 4096-element panel is 64 register repeats,
-  and the key-chunk fold ladder's narrow stages waste most of a 64-lane
-  register per repeat.
+**The two acceptance criteria stated as msprof shares.**
 
-`code_exe.csv` is empty, with
-`[WARN] Failed to parse pc to code, maybe kernel missed debug_line
-information`: source-line attribution needs the kernel rebuilt with `-g`. That
-is one more build cycle and has not been done.
+* **`WAIT_INTRA_BLOCK` on `cubecore0`: 33.6% → 0.6%.** Target < 10%, **met**.
+  The same 12 calls that cost 21767 cycles now cost 191 — one of 168 cycles
+  during pipeline fill and eleven of 2 to 4 cycles each. **The Cube does not
+  wait at all any more, and the stall crossed over to the Vector cores**, where
+  `FLOWCTRL` is 7.3–8.0% of attributed cycles: four panel waits costing 6495 on
+  `veccore0` and 7609 on `veccore1`, the largest 2900. Read with the cadence —
+  the Cube produces a panel every 1073 cycles (median) and the two Vector cores
+  together consume one every ~963 — that makes the Cube's 64-Mmad block the
+  pacing item by about 10%. The pipeline went from Vector-bound by 3:1 to
+  **marginally Cube-bound**, which is as balanced as this schedule gets without
+  changing the arithmetic on one side or the other.
+* **`RV_VLD` + `RV_VST` on `veccore0/1`: 48.6% → 38.4%.** Target < 20%,
+  **not met**. The absolute cost halved — 82703 → 41059 cycles, and 7499 → 3951
+  instructions — but the denominator fell by the same kind of factor, so the
+  *share* barely moved. It cannot move much further by rebalancing engines: at
+  2066 loads and 2048 stores per core over four chunks, each remaining Vector
+  op is a full-panel level-2 op costing 64 register loads and 64 stores, and
+  there are eight of them left (cast, `|Y|`, two fold stages, the broadcast
+  multiply, the clamp, and two narrowing casts). There is no arithmetic left to
+  hide the traffic behind. Getting under 20% needs *fewer passes* — fusing the
+  clamp into a saturating INT4 cast, and landing FP32 from the Fixpipe instead
+  of casting INT32 on the Vector side, are the two candidates and neither was
+  attempted here.
 
-### One correction this profiling forces
-
-The V4 section above previously read "18 MTE2 moves in all for the rotation
-table and the eight pages, which is two bursts each". **That was wrong**, and
-it was wrong because `analyze_reshape_trace.py` counted every MTE2 instruction
-whose mnemonic contains `MOV_`. Ten of those 18 are `MOV_SPR_XN`, special
-register writes that configure the next transfer and move no data. The page
-staging is one `MOV_OUT_TO_L1_MULTI_ND2NZ` per chunk and one `ALIGNv2` for the
-table: 9 data moves, not 18, and never "two bursts each". The analyzer now
-counts the ND→NZ converter moves separately and asserts **exactly one per
-chunk**, which is a stronger check than the `>= CHUNKS + 1` it replaced, and
-the corrected check passes on the same traces.
+`code_exe.csv` is still empty, with
+`Failed to parse pc to code, maybe kernel missed debug_line information`:
+source-line attribution needs the kernel rebuilt with `-g`, which is one more
+build cycle and has not been done.
 
 ## Reproducibility
 
-Two independent runs, each from a freshly created build directory because
-CANN's nested ExternalProject mutates its intermediates:
+Two runs from separately created build directories, because CANN's nested
+ExternalProject mutates its intermediates.
 
-| | run 3 | run 4 |
+| | run 1 | run 2 |
 | --- | --- | --- |
 | cache and scale bytes bit-exact | 8192 / 8192 / 128 | 8192 / 8192 / 128 |
 | guard bytes intact | 1024/1024 | 1024/1024 |
 | untouched cache bytes | 24576 | 24576 |
-| intra-core events | 86 sets / 86 waits, 28 pairs | 86 sets / 86 waits, 28 pairs |
-| cross-core flags | 20 / 20, ids 0,1,4,5,16,17,20,21 | 20 / 20, same ids |
-| dispatch span | 19331 cycles | 19331 cycles |
-| four-engine overlap | 581 cycles at 5379..5960 | 581 cycles at 5374..5955 |
-| total tick | 20444 | 20436 |
+| composed table entries matching `M` | 65536 | 65536 |
+| intra-core events | 92 sets / 92 waits, 27 pairs | 92 sets / 92 waits, 27 pairs |
+| cross-core flags | 20 / 20 over 20 ids | 20 / 20 over 20 ids |
+| dispatch span | 12590 cycles | 12590 cycles |
+| four-engine overlap | 1133 cycles, widest 7760..8242 | 1133 cycles, widest 7755..8237 |
+| total tick | 13599 | 13590 |
 
-The cycle counts are identical and the absolute tick origins differ by 5 to 8
-cycles, which is model start-up, not kernel behaviour.
+The cycle counts are identical and the absolute tick origins differ by 5 to 9
+cycles, which is model start-up rather than kernel behaviour. A third execution,
+the one `msprof` drove from run 1's binary, printed the same PASS at total tick
+13628 — 29 ticks of profiler overhead on the same build.
 
 ## What the numbers do *not* say
 
-* **The pipeline is Vector-bound and the four-engine window is narrow because
-  of it.** Vector is busy 16007 of the 19331-cycle dispatch span while MTE2,
-  Cube and MTE3 together account for 13045 and finish all eight chunks by cycle
-  6121. The four stages genuinely overlap, but calling this a balanced
-  four-stage pipeline would be wrong: three of the four engines spend most of
-  the run idle behind the Vector stage.
-* **19331 / 8 is not a throughput figure.** The per-chunk egress intervals
-  measured in the steady state are 5883 and 6146 cycles on AIV0 and 3771 and
-  3376 on AIV1; the whole-run span is fill plus a long Vector tail.
-* **The two Vector cores are not symmetric in time, and this run does not
-  explain why.** They execute identical instruction counts (16600 vs 16604) and
-  identical vector mnemonic histograms over the same mix of two value and two
-  key chunks, yet AIV0's last store is at cycle 19205 and AIV1's at 14559. It is
-  a timing effect, not a work imbalance; the cause is untested.
-* **The cost is in the Vector register traffic.** Per core, `RVECLD` 4270 and
-  `RVECST` 3522 against `RVECEX` 6039: a level-2 op over a 4096-element panel is
-  64 register repeats, and the key-chunk ladder's narrow stages (`mask` 32, 16,
-  8) waste most of a 64-lane register per repeat. Nothing here measures what a
-  wider fold or a fused stage would save.
-* **Nothing here is silicon.** No NPU ran. CAModel ticks are a model, not
-  device time, and the 200 / 200 / 105 AIC / Scheduler / SoC periods the model
-  prints at start-up are its own configuration, not a measurement.
+* **Nothing here is silicon.** No NPU ran. CAModel ticks are a model, not device
+  time, and the 200 / 200 / 105 AIC / Scheduler / SoC periods the model prints at
+  start-up are its own configuration, not a measurement.
+* **The flag mechanism is not characterised.** What was measured is that a
+  reused mode-4 id released its second wait early. Nothing here distinguishes a
+  level bit a wait does not clear from a lost set, an ordering effect inside
+  `wait_intra_block`, or a CAModel artefact. And the unique-id discipline that
+  fixes it does not scale: twelve ids per sub block bounds it to about a dozen
+  cross-core events per core, so a production-length loop must reuse ids and
+  nothing here says what makes that safe.
+* **The eight-times multiply-add cost is paid, not amortised.** This revision is
+  faster because the Vector stage shrank and the Fixpipe count fell by eight,
+  not because the Cube got cheaper: 1024 hardware MMADs against 128. It also
+  spent the headroom it was exploiting — the Cube is now the pacing engine by
+  about 10%, so a further step in this direction makes the pipeline slower, and
+  on a part or a shape where the Cube were already the critical path this
+  refactor would be the wrong way round from the start.
+* **`RV_VLD` + `RV_VST` is still the largest Vector cost**, at 38.4%. The
+  quantiser's remaining work is elementwise over a 16 KiB panel and is memory
+  bound by construction.
+* **The two Vector cores are still not symmetric in time** — 6.35 us against
+  7.00 us on identical instruction counts — and this run explains it no better
+  than the last one did.
 * **One strip, one core block.** `blockDim` is 1 and the 64-core saturation
   claim in the brief is untested: no run here advances the strip base by
   `GetBlockIdx() * tokensPerCore`.
 * **One shape.** `numTokens == blockSize == 16`, `headSize == 256`,
   `numKvHeads == 4`, one page-aligned slot mapping. `numTokens` and
-  `tokensPerCore` reach the device unused.
+  `tokensPerCore` reach the device unused, and `piSigns` now does too — a
+  caller that changes `piSigns` without rebuilding `tables` gets silently wrong
+  results, which is a contract the runner enforces and the kernel cannot.
+* **`msprof` shares and the audit's cycle shares are different measures.**
+  msprof's `cycles` is accumulated issue-to-complete latency per instruction
+  site; the audit's shares come from merged busy intervals, which is occupancy.
+  Comparable across revisions of this kernel, not against each other. The audit
+  also prints a load+store share of 69.0%, on the busy-interval denominator;
+  that is not msprof's 38.4% measured differently, it is a different quantity.
 
 ## Retractions
 
-**One, in this report's own first revision.** It claimed 18 MTE2 moves for the
-page staging, "two bursts each", because the trace analyzer counted
-`MOV_SPR_XN` special-register writes as data movement. `msprof op simulator`
-shows 8 `MOV_OUT_TO_L1_MULTI_ND2NZ` page moves and 1 `ALIGNv2` for the rotation
-table. The analyzer has been corrected and now asserts exactly one ND→NZ page
-move per chunk; see the profiling section above. Nothing else in the report
-depended on the figure, and no numeric result changed.
+**One in this revision, mine.** The chunk 5 and 7 failure was first diagnosed as
+the two Vector cores sharing a four-bit mode-4 flag pool, and the guidelines'
+§6.2 was edited to retract its "ids 0..15 are AIV0's channel and 16..31 are
+AIV1's". That was wrong: renumbering both cores into 0..7 deadlocked the kernel,
+§6.2 was restored, and §6.2d records the misdiagnosis. The real fault — a reused
+flag id — was found by the same trace read once the deadlock had ruled the first
+explanation out.
 
-Beyond that, this is the first revision of this operator and it contradicts no
-earlier claim in this repository. Two claims elsewhere that it *relies* on and
-that held up: section 6.1's retraction (the UB→L1 path exists) is not used here
-because the page never enters the Unified Buffer, and section 6.2a's retraction
-(a mode-4 set runs on the scalar stream and needs an `x_S` drain) was followed
-from the start — every cross-core set in this kernel that means "my pipe work
-is done" is preceded by a `FIX_S` or `V_S` drain.
+**One carried forward from the first revision**, which claimed 18 MTE2 moves for
+the page staging, "two bursts each", because the trace analyzer counted
+`MOV_SPR_XN` special-register writes as data movement. That was corrected to 9
+data moves and the analyzer now asserts exactly one ND→NZ page move per chunk.
+The check still passes here.
+
+Two claims this revision relies on, both of which held: §6.1's retraction (the
+UB→L1 path exists) is not used, because the page never enters the Unified
+Buffer; and §6.2a's retraction (a mode-4 set runs on the scalar stream and needs
+an `x_S` drain) was followed throughout — every cross-core set that means "my
+pipe work is done" is preceded by a `FIX_S` or `V_S` drain.

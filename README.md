@@ -49,12 +49,21 @@ The prefill counterpart in
 [`kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp`](kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp)
 is a **four-stage** `MIX_AIC_1_2` ring over the eight chunks of one 16-token ×
 1024-channel strip: MTE2 stages each raw INT8 page from Global Memory into the
-L1 ring with no Unified Buffer hop, the Cube applies the inner factor of a
-randomised Hadamard as INT8×INT8→INT32 Mmads, both Vector cores apply the sign
-diagonal and the outer butterfly cascade and quantise to INT4, and MTE3 writes
-a 2 KiB packed page plus a 64-byte scale slice per chunk. Eight chunks over a
-depth-4 L1 ring and depth-2 per-core UB rings wrap every ring twice, so one run
-contends every buffer-reuse back edge.
+L1 ring with no Unified Buffer hop, the Cube applies the **whole** randomised
+Hadamard rotation as 64 INT8×INT8→INT32 Mmads per chunk and hands the finished
+panel over in one Fixpipe, both Vector cores only reduce, scale and pack to
+INT4, and MTE3 writes a 2 KiB packed page plus a 64-byte scale slice per chunk.
+Eight chunks over a depth-4 L1 ring and depth-2 per-core UB rings wrap every
+ring twice, so one run contends every buffer-reuse back edge.
+
+The rotation sits entirely on the Cube because the first revision split it —
+Cube inner factor, Vector sign diagonal and butterfly cascade — and measured
+the result: the Cube waited on a Vector core for 33.6% of its attributed cycles
+against 2.8% spent multiplying, while the Vector cost was register traffic
+rather than arithmetic. Folding the outer factor's signs into 16 resident
+32×32 INT8 blocks costs eight times the multiply-adds and buys back four
+full-panel Vector passes and 65 KiB of Unified Buffer; the trade and what it
+measured are in the report.
 
 ```sh
 bash scripts/run_modulo3_camodel.sh micro reshape_and_cache_a8
@@ -65,8 +74,9 @@ bit pattern, so the whole path from INT8 input to packed nibble carries exactly
 one rounding step and the KV cache is checked **bit-exactly against an integer
 oracle for an arbitrary input**, not against a tolerance or a crafted fixture.
 Its Tier-1 probe checks what that comparison cannot — that the dense
-256×256 rotation satisfies `M Mᵀ = 256 I` and that the kernel's butterfly
-cascade reproduces it exactly:
+256×256 rotation satisfies `M Mᵀ = 256 I`, that the oracle's factored form
+reproduces it exactly, and that the 16 resident blocks the Cube multiplies
+compose back to all 65536 entries of it:
 
 ```sh
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \

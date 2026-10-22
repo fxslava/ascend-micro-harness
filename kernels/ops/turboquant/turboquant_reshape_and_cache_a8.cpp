@@ -6,8 +6,10 @@
 // ----------------
 //   * a four-stage ring (MTE2 -> Cube/Fixpipe -> Vector -> MTE3) in which all
 //     four engines plus both Vector cores are in flight together;
-//   * an INT8 x INT8 -> INT32 Cube Hadamard factor driven straight out of a
-//     Global Memory page staged into L1 with no Unified Buffer hop;
+//   * the *whole* randomised Hadamard rotation as INT8 x INT8 -> INT32 Cube
+//     work, driven straight out of a Global Memory page staged into L1 with no
+//     Unified Buffer hop. No part of the orthogonal transform runs on the
+//     Vector cores: no sign diagonal, no butterfly cascade;
 //   * a bit-exact INT4 KV cache: the whole quantisation path is integer and
 //     power-of-two, so the host oracle reproduces every nibble exactly for an
 //     arbitrary INT8 input, not just for a crafted fixture.
@@ -32,35 +34,85 @@
 //   engine        owner        work
 //   ------------  -----------  --------------------------------------------
 //   MTE2          AIC          GM -> L1 page, 4 KiB per chunk, no UB hop
-//   MTE1/M/FIX    AIC          L1 -> L0, 8 INT8 Mmads, 8 Fixpipes -> AIV UB
-//   Vector        AIV0 + AIV1  sign diagonal, H8 butterfly cascade, absmax,
-//                              power-of-two quantisation, INT4 nibble pack
+//   MTE1/M/FIX    AIC          L1 -> L0, 64 INT8 Mmads, ONE Fixpipe -> AIV UB
+//   Vector        AIV0 + AIV1  absmax, power-of-two scale, INT4 nibble pack
 //   MTE3          AIV0 + AIV1  2 KiB packed page + 64 B scale slice -> GM
 //
-// The rotation
-// ------------
-// Per head of kHeadSize channels, with ch = c1 * kGroup + c0:
+// The rotation, and why it is one Cube pass
+// -----------------------------------------
+// Per head of kHeadSize channels the transform is the randomised Hadamard
 //
-//   Y = (H8 (x) I32) . diag(piSigns) . (I8 (x) H32) . x,   normalised by
-//   invSqrtLen = 1 / sqrt(headSize)
+//   Y = M . x,   M = (H8 (x) I32) . diag(piSigns) . (I8 (x) H32)
 //
-// a randomised Hadamard rotation split across the two engine classes:
+// normalised by invSqrtLen = 1 / sqrt(headSize). Writing the channel index as
+// ch = c1 * kGroup + c0, the entries of M are
 //
-//   Cube   the inner factor I8 (x) H32, one Mmad per channel group. H32 is
-//          the order-32 Sylvester sign matrix, H32[i][j] = (-1)^popcount(i&j),
-//          supplied in `tables` as 32x32 INT8 and resident in L0A and L0B.
-//   Vector diag(piSigns) then the outer factor H8 (x) I32 as three radix-2
-//          butterfly stages over c1.
+//   M[c1*32 + c0][g*32 + i] = H8[c1][g] . piSigns[g*32 + c0] . H32[c0][i]      (1)
 //
-// Both factors are exact in INT32 and in FP32: |x| <= 128, the inner factor
-// multiplies the bound by 32 and the outer by 8, so |Y| <= 32768 and every
-// intermediate is an integer below 2^24. The whole rotation is therefore
-// bit-exact against an integer oracle for *any* INT8 input.
+// - one signed entry per (output channel, input channel) pair, because the
+// sign diagonal sits *between* the two factors and is therefore indexed by the
+// intermediate channel (g, c0). M M^T = 256 I exactly; the Tier-1 host probe
+// measures that rather than asserting it.
+//
+// An earlier revision split (1) across the engine classes: the Cube applied
+// the inner factor I8 (x) H32 as one Mmad per channel group, and the Vector
+// cores applied diag(piSigns) and then the outer factor H8 (x) I32 as three
+// radix-2 butterfly stages. That is the cheap factorisation in multiply-adds
+// and the expensive one in wall clock. Measured on this probe
+// (reports/reshape_and_cache_a8.md):
+//
+//   * the Cube spent 33.6% of its attributed cycles in WAIT_INTRA_BLOCK
+//     waiting for a Vector core to release a landing panel, against 2.8% in
+//     MMAD - it waited twelve times longer than it multiplied;
+//   * the Vector cost was register traffic, not arithmetic: RV_VLD + RV_VST
+//     was 48.6% of the Vector cycles against 24.4% for the whole execute pipe,
+//     and the sign multiply plus three butterfly stages are four full-panel
+//     passes of exactly that traffic.
+//
+// So this revision folds all of (1) into the Cube. The contraction is split
+// over the eight source groups g, and the outer factor's sign H8[c1][g] is
+// folded into the *resident operand* rather than applied afterwards: for
+// output group c1 and source group g the Cube multiplies the page's group-g
+// fractal by the 32x32 block
+//
+//   T[s][g][c0][i] = (s ? -1 : +1) . piSigns[g*32 + c0] . H32[c0][i],
+//   s = parity(c1 & g) = (H8[c1][g] < 0)                                      (2)
+//
+// and accumulates the eight products for one c1 into one L0C region. There are
+// only 2 * kGroups = 16 distinct blocks, 16 KiB of INT8, because the dependence
+// on c1 is a single sign; `tables` carries them and they stay resident in both
+// L0A and L0B for the whole kernel. The 8 x 8 = 64 Mmads per chunk cost eight
+// times the multiply-adds of the factored form - that is the price of folding a
+// factor that is diagonal in 32 channels into a GEMM - and the Cube had the
+// headroom: it was idle for two thirds of its attributed cycles.
+//
+// Three consequences, all of them the point:
+//
+//   * the Vector stage loses the sign multiply and the three butterfly stages,
+//     four of its thirteen full-panel passes, and the three ping-pong panels
+//     and two sign panels they needed (65 KiB of Unified Buffer);
+//   * the Cube emits ONE Fixpipe per chunk instead of one per channel group,
+//     because the whole 16 x 256 panel is finished in L0C before anything
+//     leaves it. FIX_L0C_TO_DST plus its MOV_SPR_XN configuration writes were
+//     43.7% of the Cube's attributed cycles at eight per chunk;
+//   * the landing-panel back edge is waited *after* the Mmads rather than
+//     before them, since only the Fixpipe touches Unified Buffer. The Cube's
+//     64 multiplies for chunk j now overlap the Vector core's quantisation of
+//     chunk j - 1 instead of queueing behind it.
+//
+// `piSigns` is consumed by whoever builds `tables` and is not read by the
+// device any more. The runner builds (2) from the same sign function it
+// uploads, and the Tier-1 probe checks that the 16 blocks composed the way the
+// kernel composes them reproduce M entry for entry.
+//
+// Both factors are exact in INT32 and in FP32: each row of M has 256 signed
+// entries and |x| <= 128, so |Y| <= 32768 and every intermediate is an integer
+// below 2^24. The whole rotation is therefore bit-exact against an integer
+// oracle for *any* INT8 input.
 //
 // kGroup is 32 because that is the INT8 K0: the arch-3510 INT8 fractal is
-// 16 x 32, so a 32-point inner factor is exactly one K fractal and needs no
-// zero padding. The outer factor is then order 8 and costs three butterfly
-// stages on the Vector core.
+// 16 x 32, so a 32-point contraction is exactly one K fractal and needs no
+// zero padding, and a 32 x 32 resident block is exactly two L0 fractals.
 //
 // One L1 image, two operand roles
 // -------------------------------
@@ -74,10 +126,19 @@
 //   A operand, NZ(16, 32)  -> C[t][c0out]   for the key chunks, and
 //   B operand, ZN(32, 16)  -> C[c0out][t]   for the value chunks,
 //
-// which is exactly the orientation each cache layout needs. The resident H32
-// is symmetric, and a row-major 32 x 32 INT8 matrix is byte for byte both its
-// own NZ(32, 32) and its own ZN(32, 32) image, so the same 1 KiB of L1 feeds
-// L0A and L0B unchanged.
+// which is exactly the orientation each cache layout needs.
+//
+// The same symmetry covers the resident blocks, which is why one 16 KiB L1
+// image feeds both L0A and L0B unchanged. A row-major 32 x 32 INT8 block reads
+// as its own NZ(32, 32) image and as the ZN(32, 32) image of its transpose, so
+// with W = T[s][g] of (2):
+//
+//   value chunks  A = NZ load of W     -> A[c0][i] = W[c0][i]
+//   key chunks    B = ZN load of W     -> B[i][c0] = W[c0][i]
+//
+// and (1) needs exactly W[c0][i] in both roles. The 16 blocks are a flat
+// 16 KiB blob in GM, in L1, and in each of L0A and L0B: one GM -> L1 copy and
+// one L1 -> L0 copy per operand role, all three byte-for-byte identity.
 //
 // Layout contracts
 // ----------------
@@ -93,6 +154,8 @@
 //              [3:0], odd in [7:4]), signed INT4 in [-8, 7]. This is the
 //              packing `routines/routine_turboquant_dequant4.hpp` unpacks, and
 //              the hardware Cast to int4b_t produces it directly.
+//   tables     kTableBlocks = 16 row-major 32 x 32 INT8 blocks, block s*8 + g
+//              holding T[s][g] of (2). 16384 bytes.
 //
 // Work sharing: one chunk per Vector core, not one token half
 // ----------------------------------------------------------
@@ -106,8 +169,6 @@
 // 16-token chunks, so both cache layouts come out as one 2048-byte burst, and
 // adjacent chunks still sit on different cores, so the two Vector cores are in
 // flight together. Each core then owns two value chunks and two key chunks.
-// The UB budget is unchanged: depth 2 x 16 tokens is the same 32 KiB landing
-// ring as depth 4 x 8 tokens.
 //
 // The quantiser is power-of-two, and that is a verification decision
 // ------------------------------------------------------------------
@@ -144,11 +205,33 @@
 // order it - guidelines section 6.2a, discovered by the eight-page fused
 // attention run.
 //
+// Every cross-core event also gets its own flag id, set once and waited once:
+// a mode-4 flag is not a token a wait consumes, so an id per ring slot lets
+// the second announcement on that id be released by the first. See "cross-core
+// flag ids" below for the trace that forced that.
+//
+// Forward edges:
+//   AIC  intra   MTE2_MTE1     page staged into L1
+//   AIC  intra   MTE1_M        page fractals staged into L0
+//   AIC  intra   M_FIX         the 64 Mmads of a chunk have retired into L0C.
+//                              The factored revision carried this dependency
+//                              on matching unitFlag = 3 between one Mmad and
+//                              its one Fixpipe; 64 accumulating Mmads feeding
+//                              one Fixpipe get an explicit event instead, so
+//                              nothing rests on how the unit flag pairs a
+//                              group of Mmads.
+//   AIC -> AIVk  kFlagProductReady  the landing panel holds this chunk
+//   AIVk intra   V_MTE3        the packed page and its scale slice are ready
+//
 // Back edges, all contended in this run:
 //   AIC  intra   MTE1_MTE2     L1 page slot free, after MTE1 read it
-//   AIC  intra   M_MTE1        L0A/L0B free, after the Mmads
-//   AIC  intra   FIX_M         L0C free, after the Fixpipes
-//   AIVk -> AIC  kFlagPanelFree   landing panel free, after the FP32 cast
+//   AIC  intra   M_MTE1        L0A/L0B page region free, after the Mmads
+//   AIC  intra   FIX_M         L0C free, after the Fixpipe
+//   AIVk -> AIC  kFlagPanelFree   landing panel free, after the FP32 cast.
+//                              A back edge in the marked graph but *not* a
+//                              reused flag id: each release carries its own
+//                              id, so the ring's two slots cost six ids per
+//                              core rather than two.
 //   AIVk intra   MTE3_V        packed page slot free, after the MTE3 burst
 
 #include <cstdint>
@@ -172,6 +255,16 @@ constexpr std::uint32_t kPanel = kTokens * kHeadSize;  // 4096 elements per chun
 constexpr std::uint32_t kPackedBytes = kPanel / 2u;    // 2048 bytes of nibbles
 constexpr std::uint32_t kScaleFloats = kTokens;        // one scale per token
 
+// ------------------------------------------------------- rotation table shape
+// One 32x32 INT8 block per (sign, source group) pair: block s * kGroups + g is
+// T[s][g] of equation (2) in the header. The sign is the only way the outer
+// factor's H8[c1][g] enters, so 16 blocks cover all 64 (output group, source
+// group) pairs of a chunk.
+constexpr std::uint32_t kBlockElems = kGroup * kGroup;          // 1024 INT8
+constexpr std::uint32_t kTableBlocks = 2u * kGroups;            // 16
+constexpr std::uint32_t kTableBytes = kTableBlocks * kBlockElems;  // 16384
+constexpr std::uint32_t kTableRows = kTableBlocks * kGroup;     // 512, as one ND blob
+
 // Ring depths. The L1 ring is the pipeline depth; the per-core UB rings are
 // half of it because each core owns every other chunk.
 constexpr std::uint32_t kStageDepth = 4;
@@ -179,6 +272,8 @@ constexpr std::uint32_t kLandDepth = 2;
 constexpr std::uint32_t kPackDepth = 2;
 
 static_assert(kHeadSize == kGroups * kGroup);
+static_assert(kTableRows * kGroup == kTableBytes,
+              "the table blob must be a whole number of 32-wide rows");
 static_assert(kChunks / 2u == kLandDepth * 2u,
               "each core must wrap its landing ring at least twice");
 
@@ -212,6 +307,20 @@ constexpr std::uint32_t kLandSlot = (C / 2u) % kLandDepth;
 template <std::uint32_t C>
 constexpr std::uint32_t kPackSlot = (C / 2u) % kPackDepth;
 
+// H8[c1][g] = (-1)^popcount(c1 & g), so the block for (c1, g) is the one whose
+// sign flag is that parity. Resolved at compile time, once per Mmad site.
+constexpr std::uint32_t ParityOf(std::uint32_t v)
+{
+    std::uint32_t parity = 0;
+    while (v != 0u) {
+        parity ^= (v & 1u);
+        v >>= 1;
+    }
+    return parity;
+}
+template <std::uint32_t C1, std::uint32_t G>
+constexpr std::uint32_t kSignBlock = ParityOf(C1 & G) * kGroups + G;
+
 // --------------------------------------------------------------- UB arena
 // Rule AKA3003: every operand base 32-byte aligned, one DataBlock of bank skew
 // between live slots, and VECTOR_REG_WIDTH of addressable UB behind the last
@@ -243,34 +352,28 @@ constexpr std::uint32_t kPackSlotBytes =
 constexpr std::uint32_t kUbLandRing = 0u;
 constexpr std::uint32_t kUbLandBytes = kLandDepth * kLandSlotBytes;
 
-// piSigns as delivered, then the two replicated sign panels. A panel is built
-// once, outside the pipeline, because the two cache layouts need the sign
-// vector expanded along different axes:
-//   key   S[t][ch]        = piSigns[ch]           (kHeadSize-periodic)
-//   value S[c1][c0][t]    = piSigns[c1*32 + c0]   (each sign over kTokens lanes)
-constexpr std::uint32_t kUbSigns = NextSlot(kUbLandRing, kUbLandBytes);
-constexpr std::uint32_t kUbSignKey = NextSlot(kUbSigns, kHeadSize * 4u);
-constexpr std::uint32_t kUbSignValue = NextSlot(kUbSignKey, kPanelBytes);
-
 // Working panels. Single buffered: reuse across chunks is a same-pipe Vector
 // dependency, which the Vector queue orders in issue order, not a cross-engine
 // hazard (guidelines section 3.2).
 //   kUbCast   FP32 image of the INT32 landing panel, later the INT32 quantised
 //             panel, which is the same 16 KiB read as 4-byte lanes
-//   kUbWorkA  butterfly stage 1 and 3 destination, then |Y|, then Y * inv
-//   kUbWorkB  butterfly stage 2 destination, and the rotated result Y
-constexpr std::uint32_t kUbCast = NextSlot(kUbSignValue, kPanelBytes);
-constexpr std::uint32_t kUbWorkA = NextSlot(kUbCast, kPanelBytes);
-constexpr std::uint32_t kUbWorkB = NextSlot(kUbWorkA, kPanelBytes);
+//   kUbWork   |Y|, then the value-layout fold in place, then Y * inv
+//
+// The factored revision also needed kUbWorkA/kUbWorkB as butterfly ping-pong
+// panels and kUbSignKey/kUbSignValue as replicated sign panels. All four are
+// gone: the rotation finishes in L0C.
+constexpr std::uint32_t kUbCast = NextSlot(kUbLandRing, kUbLandBytes);
+constexpr std::uint32_t kUbWork = NextSlot(kUbCast, kPanelBytes);
 
 // Row-wise max ladder for the key layout, where the reduction runs along the
-// fast axis and the partials shrink by half each step. The value layout folds
-// in place and needs none of these.
-constexpr std::uint32_t kUbFold128 = NextSlot(kUbWorkB, kPanelBytes);
+// fast axis. Two halving stages at the full 64-lane mask take 256 partials per
+// token down to 64, and two BlockReduceMax passes take 64 down to 8 and 8 down
+// to 1 - a DataBlock at a time, so no stage wastes most of a vector register
+// the way the old mask-32/16/8 stages did. The value layout folds in place and
+// needs none of these.
+constexpr std::uint32_t kUbFold128 = NextSlot(kUbWork, kPanelBytes);
 constexpr std::uint32_t kUbFold64 = NextSlot(kUbFold128, kTokens * 128u * 4u);
-constexpr std::uint32_t kUbFold32 = NextSlot(kUbFold64, kTokens * 64u * 4u);
-constexpr std::uint32_t kUbFold16 = NextSlot(kUbFold32, kTokens * 32u * 4u);
-constexpr std::uint32_t kUbFold8 = NextSlot(kUbFold16, kTokens * 16u * 4u);
+constexpr std::uint32_t kUbFold8 = NextSlot(kUbFold64, kTokens * 64u * 4u);
 
 // FP16 staging for the nibble pack: the hardware Cast to int4b_t takes a
 // 2-byte source. The staged values are exact integers in [-8, 7], so the
@@ -296,12 +399,9 @@ constexpr std::uint32_t kUbInvSeed = NextSlot(kUbExpMask, kScaleFloats * 4u);
 constexpr std::uint32_t kUbPackRing = NextSlot(kUbInvSeed, kScaleFloats * 4u);
 constexpr std::uint32_t kArenaEnd = kUbPackRing + kPackDepth * kPackSlotBytes;
 
-static_assert(kUbLandRing % kBlock == 0u && kUbSigns % kBlock == 0u &&
-                  kUbSignKey % kBlock == 0u && kUbSignValue % kBlock == 0u &&
-                  kUbCast % kBlock == 0u && kUbWorkA % kBlock == 0u &&
-                  kUbWorkB % kBlock == 0u && kUbFold128 % kBlock == 0u &&
-                  kUbFold64 % kBlock == 0u && kUbFold32 % kBlock == 0u &&
-                  kUbFold16 % kBlock == 0u && kUbFold8 % kBlock == 0u &&
+static_assert(kUbLandRing % kBlock == 0u && kUbCast % kBlock == 0u &&
+                  kUbWork % kBlock == 0u && kUbFold128 % kBlock == 0u &&
+                  kUbFold64 % kBlock == 0u && kUbFold8 % kBlock == 0u &&
                   kUbHalf % kBlock == 0u && kUbAbsMax % kBlock == 0u &&
                   kUbExpBits % kBlock == 0u && kUbPow % kBlock == 0u &&
                   kUbInv % kBlock == 0u &&
@@ -330,20 +430,19 @@ template <std::uint32_t Slot>
 constexpr std::uint32_t kScaleBase = kPackBase<Slot> + kPackedBytes;
 
 // --------------------------------------------------------------- L1 arena
-// H32 is page invariant and reaches L1 once. The page ring has one slot per
-// pipeline stage. L1 operands need 32-byte alignment; the 512-byte rule
-// applies to L0A and L0B, and the fractal offsets inside a slot are multiples
-// of 512 from a 32-byte aligned base, which is the layout the fused attention
-// kernel validated.
-constexpr std::uint32_t kL1H = 0u;
-constexpr std::uint32_t kL1HBytes = kGroup * kGroup;  // 1024, INT8
+// The 16 rotation blocks are page invariant and reach L1 once, as one flat
+// 16 KiB blob. The page ring has one slot per pipeline stage. L1 operands need
+// 32-byte alignment; the 512-byte rule applies to L0A and L0B, and the fractal
+// offsets inside a slot are multiples of 512 from a 32-byte aligned base,
+// which is the layout the fused attention kernel validated.
+constexpr std::uint32_t kL1Table = 0u;
 constexpr std::uint32_t kL1PageBytes = kTokens * kHeadSize;  // 4096, INT8
-constexpr std::uint32_t kL1Ring = NextSlot(kL1H, kL1HBytes);
+constexpr std::uint32_t kL1Ring = NextSlot(kL1Table, kTableBytes);
 constexpr std::uint32_t kL1SlotBytes = kL1PageBytes + kBankSkewBytes;
 constexpr std::uint32_t kL1End = kL1Ring + kStageDepth * kL1SlotBytes;
 constexpr std::uint32_t kFractalBytes = kTokens * kGroup;  // 512
 
-static_assert(kL1H % kBlock == 0u && kL1Ring % kBlock == 0u &&
+static_assert(kL1Table % kBlock == 0u && kL1Ring % kBlock == 0u &&
                   kL1SlotBytes % kBlock == 0u,
               "every L1 operand base must be 32-byte aligned");
 static_assert(kL1SlotBytes % 256u != 0u, "L1 slot stride collapses the bank phase");
@@ -355,24 +454,65 @@ template <std::uint32_t Slot>
 constexpr std::uint32_t kL1PageBase = kL1Ring + Slot * kL1SlotBytes;
 
 // --------------------------------------------------------------- L0 arena
-// H32 stays resident in both L0A and L0B: the key chunks take it as the B
-// operand and the value chunks as the A operand, and nothing writes that
-// region after the prologue. The page fractals land behind it.
-constexpr std::uint32_t kL0HElems = kGroup * kGroup;              // 1024 INT8
+// The 16 rotation blocks stay resident in both L0A and L0B: the key chunks
+// take them as the B operand and the value chunks as the A operand, and
+// nothing writes that region after the prologue. The page fractals land behind
+// it. 16 KiB of table plus 4 KiB of page is 20 KiB of the 64 KiB each of L0A
+// and L0B holds on arch35.
+constexpr std::uint32_t kL0TableElems = kTableBytes;              // 16384 INT8
 constexpr std::uint32_t kL0PageElems = kGroups * kFractalBytes;   // 4096 INT8
-constexpr std::uint32_t kL0Elems = kL0HElems + kL0PageElems;
+constexpr std::uint32_t kL0Elems = kL0TableElems + kL0PageElems;
 constexpr std::uint32_t kL0CElems = kGroups * kTokens * kGroup;   // 4096 INT32
-static_assert(kL0HElems % 512u == 0u, "the L0 page region must stay 512-byte aligned");
+static_assert(kL0TableElems % 512u == 0u, "the L0 page region must stay 512-byte aligned");
+static_assert(kBlockElems % 512u == 0u, "every resident block must be 512-byte aligned");
+static_assert(kL0Elems <= 64u * 1024u, "L0A/L0B hold 64 KiB on arch35");
 
 // ------------------------------------------------- cross-core flag ids
-// Mode 4 ids are per sub block: 0..15 belong to AIV0 and 16..31 to AIV1, the
-// split GetIntraFlagId uses. 13, 14 and their +16 images are library reserved.
-template <std::uint32_t Owner, std::uint32_t Slot>
+// Mode 4 ids are per sub block: 0..15 belong to AIV0 and 16..31 to AIV1, which
+// is how a participant names the *other* sub block's channel in both
+// directions. 13, 14 and their +16 images are library reserved.
+//
+// **One id per cross-core event, never reused.** The first revision used one
+// id per ring slot - Owner * 16 + Slot for "panel ready" - so each id carried
+// two announcements over the eight chunks. That is not a token a wait
+// consumes: the trace caught AIV1's *second* wait on its slot-1 id passing
+// 2179 cycles before the announcement it was waiting for, released by the set
+// its *first* wait had supposedly taken, and the panel it then read was 87%
+// the previous occupant of that landing slot. The mechanism is untested -
+// whether the flag is a level bit a wait tests without clearing, or something
+// subtler - so this revision stops depending on it and labels every event
+// uniquely instead. Guidelines section 6.2c.
+//
+// The first revision passed anyway, twice, because its Cube finished all eight
+// chunks by cycle 6121 of a 19331-cycle run: a stale "ready" always pointed at
+// a panel that had in fact been written long before. Balancing the pipeline is
+// what made the bug reachable.
+//
+// Per Vector core, over its four chunks j = Chunk / 2:
+//   productReady  Owner*16 + j            4 ids, j = 0..3, one per chunk
+//   panelFree     Owner*16 + 4 + j        the Cube's wait for chunk j
+//   panelFree     Owner*16 + 4 + j + 2    the AIV's release after chunk j
+// so ids 4 and 5 are the two priming tokens, 6 and 7 the releases the Cube
+// consumes for its last two chunks, and 8 and 9 the releases the epilogue
+// drains. Ten ids per core, every one set exactly once and waited exactly
+// once, all clear of 11..14.
+template <std::uint32_t Chunk>
 constexpr std::uint16_t kFlagProductReady =
-    static_cast<std::uint16_t>(Owner * 16u + Slot);          // 0..1, 16..17 AIC -> AIV
-template <std::uint32_t Owner, std::uint32_t Slot>
+    static_cast<std::uint16_t>(kOwner<Chunk> * 16u + Chunk / 2u);
+template <std::uint32_t Owner, std::uint32_t Index>
 constexpr std::uint16_t kFlagPanelFree =
-    static_cast<std::uint16_t>(Owner * 16u + 4u + Slot);     // 4..5, 20..21 AIV -> AIC
+    static_cast<std::uint16_t>(Owner * 16u + 4u + Index);
+template <std::uint32_t Chunk>
+constexpr std::uint16_t kFlagPanelFreeWait = kFlagPanelFree<kOwner<Chunk>, Chunk / 2u>;
+template <std::uint32_t Chunk>
+constexpr std::uint16_t kFlagPanelFreeSet =
+    kFlagPanelFree<kOwner<Chunk>, Chunk / 2u + kLandDepth>;
+
+static_assert(4u + kChunks / 2u + kLandDepth <= 11u,
+              "every mode-4 flag id must stay below the library's reserved 11");
+static_assert(kFlagPanelFreeSet<0u> == kFlagPanelFreeWait<2u * kLandDepth>,
+              "the release after a chunk must be the token the Cube waits for "
+              "when that landing slot comes round again");
 
 // Intra-core HardEvent ids. 6 and 7 are reserved, so slot ids stay below 4 and
 // the prologue and epilogue use 4.
@@ -381,11 +521,12 @@ constexpr std::int32_t kEvtEpilogue = 4;
 
 // ------------------------------------------------- compile-time column list
 using ChunkSeq = std::make_integer_sequence<std::uint32_t, kChunks>;
+using GroupSeq = std::make_integer_sequence<std::uint32_t, kGroups>;
 
 // =========================================================== AIC: Cube core
 // MTE2 ingress of the raw INT8 page into the L1 ring, then per chunk eight
-// L1 -> L0 fractal loads, eight INT8 Mmads and eight Fixpipes into the owning
-// Vector core's landing panel.
+// L1 -> L0 fractal loads, 64 accumulating INT8 Mmads and one Fixpipe into the
+// owning Vector core's landing panel.
 struct CubeEngine {
     __gm__ const std::int8_t* key;
     __gm__ const std::int8_t* value;
@@ -426,9 +567,9 @@ __aicore__ inline void StagePage(CubeEngine& engine)
     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(evt);
 }
 
-// MTE1 + Cube + Fixpipe for one channel group. Key and value chunks differ
-// only in which operand is the page and in the Fixpipe destination geometry;
-// the arithmetic is the same H32 applied to the group.
+// MTE1 for one channel group. Key and value chunks differ only in which L0
+// buffer the page fractal belongs to, because the page is the A operand of the
+// key chunks and the B operand of the value chunks.
 template <std::uint32_t Chunk, std::uint32_t G>
 __aicore__ inline void GemmGroupLoad(__ca__ std::int8_t* l0a, __cb__ std::int8_t* l0b)
 {
@@ -437,74 +578,95 @@ __aicore__ inline void GemmGroupLoad(__ca__ std::int8_t* l0a, __cb__ std::int8_t
     auto* page = reinterpret_cast<__cbuf__ std::int8_t*>(kL1PageBase<slot> + G * kFractalBytes);
 
     if constexpr (kIsKey<Chunk>) {
-        // A = the page group, NZ(kTokens, kGroup): A[t][c0] = x[t][c1*32 + c0].
+        // A = the page group, NZ(kTokens, kGroup): A[t][i] = x[t][G*32 + i].
         auto src = MakeTensor(MakeMemPtr(page),
                               MakeFrameLayout<NZLayoutPtn, std::int8_t>(kTokens, kGroup));
-        auto dst = MakeTensor(MakeMemPtr(l0a + kL0HElems + G * kFractalBytes),
+        auto dst = MakeTensor(MakeMemPtr(l0a + kL0TableElems + G * kFractalBytes),
                               MakeFrameLayout<NZLayoutPtn, std::int8_t>(kTokens, kGroup));
         Copy(MakeCopy(CopyL12L0A{}), dst, src);
     } else {
-        // B = the page group, ZN(kGroup, kTokens): B[c0][t] = x[t][c1*32 + c0],
+        // B = the page group, ZN(kGroup, kTokens): B[i][t] = x[t][G*32 + i],
         // the same bytes read with the transposed meaning.
         auto src = MakeTensor(MakeMemPtr(page),
                               MakeFrameLayout<ZNLayoutPtn, std::int8_t>(kGroup, kTokens));
-        auto dst = MakeTensor(MakeMemPtr(l0b + kL0HElems + G * kFractalBytes),
+        auto dst = MakeTensor(MakeMemPtr(l0b + kL0TableElems + G * kFractalBytes),
                               MakeFrameLayout<ZNLayoutPtn, std::int8_t>(kGroup, kTokens));
         Copy(MakeCopy(CopyL12L0B{}), dst, src);
     }
 }
 
-template <std::uint32_t Chunk, std::uint32_t G>
-__aicore__ inline void GemmGroupCompute(__ca__ std::int8_t* l0a, __cb__ std::int8_t* l0b,
-                                        __cc__ std::int32_t* l0c)
+// One accumulating Mmad: output channel group C1 takes the contribution of
+// source channel group G through the resident block kSignBlock<C1, G>. G == 0
+// initialises the L0C region and the other seven accumulate into it, so one
+// L0C region ends up holding
+//
+//   sum_G  sum_i  T[s(C1,G)][G][c0][i] . x[t][G*32 + i]
+//
+// which is row C1*32 + c0 of M . x by equation (1). cmatrixInitVal is the
+// compile-time flag that picks "C = A B" over "C += A B"; the Cube pipe is
+// in-order, so nothing else orders the eight accumulations.
+template <std::uint32_t Chunk, std::uint32_t C1, std::uint32_t G>
+__aicore__ inline void GemmBlock(__ca__ std::int8_t* l0a, __cb__ std::int8_t* l0b,
+                                 __cc__ std::int32_t* l0c)
 {
     using namespace AscendC::Te;
-    constexpr std::uint32_t land = kLandSlot<Chunk>;
-    auto* c_ptr = l0c + G * kTokens * kGroup;
+    constexpr std::uint32_t block = kSignBlock<C1, G> * kBlockElems;
+    constexpr bool init = (G == 0u);
+    auto* c_ptr = l0c + C1 * kTokens * kGroup;
 
     if constexpr (kIsKey<Chunk>) {
-        auto a = MakeTensor(MakeMemPtr(l0a + kL0HElems + G * kFractalBytes),
+        auto a = MakeTensor(MakeMemPtr(l0a + kL0TableElems + G * kFractalBytes),
                             MakeFrameLayout<NZLayoutPtn, std::int8_t>(kTokens, kGroup));
-        auto b = MakeTensor(MakeMemPtr(l0b),
+        auto b = MakeTensor(MakeMemPtr(l0b + block),
                             MakeFrameLayout<ZNLayoutPtn, std::int8_t>(kGroup, kGroup));
         auto c = MakeTensor(MakeMemPtr(c_ptr),
                             MakeFrameLayout<NZLayoutPtn, 16>(kTokens, kGroup));
-        MmadParams mp(static_cast<int>(kTokens), static_cast<int>(kGroup),
-                      static_cast<int>(kGroup), 3, true);
+        MmadParams mp(static_cast<std::uint16_t>(kTokens), static_cast<std::uint16_t>(kGroup),
+                      static_cast<std::uint16_t>(kGroup), 0, init);
         Mmad(MakeMmad(MmadOperation{}, MmadTraitDefault{}).with(mp), c, a, b);
-
-        // Key panel is token major, [t][c1][c0], so group G lands as a
-        // kTokens x kGroup block with a kHeadSize element row pitch.
-        auto* ub = reinterpret_cast<__ubuf__ std::int32_t*>(kLandBase<land> +
-                                                            G * kGroup * 4u);
-        auto shape = MakeShape(MakeShape(_1{}, kTokens), MakeShape(_1{}, kGroup));
-        auto stride = MakeStride(MakeStride(_0{}, kHeadSize), MakeStride(_0{}, _1{}));
-        auto y = MakeTensor(MakeMemPtr(ub),
-                            MakePatternLayout<NDExtLayoutPtn,
-                                              LayoutTrait<AscendC::Std::ignore_t, _1>>(shape, stride));
-        FixpipeParams fp;
-        fp.unitFlag = 3;
-        fp.subBlockId = (kOwner<Chunk> == 1u);
-        Copy(MakeCopy(CopyL0C2UB{}).with(fp), y, c);
     } else {
-        auto a = MakeTensor(MakeMemPtr(l0a),
+        auto a = MakeTensor(MakeMemPtr(l0a + block),
                             MakeFrameLayout<NZLayoutPtn, std::int8_t>(kGroup, kGroup));
-        auto b = MakeTensor(MakeMemPtr(l0b + kL0HElems + G * kFractalBytes),
+        auto b = MakeTensor(MakeMemPtr(l0b + kL0TableElems + G * kFractalBytes),
                             MakeFrameLayout<ZNLayoutPtn, std::int8_t>(kGroup, kTokens));
         auto c = MakeTensor(MakeMemPtr(c_ptr),
                             MakeFrameLayout<NZLayoutPtn, 16>(kGroup, kTokens));
-        MmadParams mp(static_cast<int>(kGroup), static_cast<int>(kTokens),
-                      static_cast<int>(kGroup), 3, true);
+        MmadParams mp(static_cast<std::uint16_t>(kGroup), static_cast<std::uint16_t>(kTokens),
+                      static_cast<std::uint16_t>(kGroup), 0, init);
         Mmad(MakeMmad(MmadOperation{}, MmadTraitDefault{}).with(mp), c, a, b);
+    }
+}
 
-        // Value panel is channel major, [c1][c0][t], so group G lands as a
-        // contiguous kGroup x kTokens block.
-        auto* ub = reinterpret_cast<__ubuf__ std::int32_t*>(kLandBase<land> +
-                                                            G * kGroup * kTokens * 4u);
-        auto y = MakeTensor(MakeMemPtr(ub), MakeFrameLayout<NDExtLayoutPtn>(kGroup, kTokens));
-        FixpipeParams fp;
-        fp.unitFlag = 3;
-        fp.subBlockId = (kOwner<Chunk> == 1u);
+// One Fixpipe per chunk. The whole rotation is finished in L0C, so the panel
+// leaves as a single L0C -> UB transfer: NZ(16, 256) -> ND for the token-major
+// key layout and NZ(256, 16) -> ND for the channel-major value layout. The
+// factored revision needed one Fixpipe per channel group, with a strided ND
+// destination for the key chunks, and those eight transfers plus their
+// MOV_SPR_XN configuration writes were the Cube's largest single cost.
+template <std::uint32_t Chunk>
+__aicore__ inline void FixpipeChunk(__cc__ std::int32_t* l0c)
+{
+    using namespace AscendC::Te;
+    constexpr std::uint32_t land = kLandSlot<Chunk>;
+    auto* ub = reinterpret_cast<__ubuf__ std::int32_t*>(kLandBase<land>);
+
+    FixpipeParams fp;
+    // No unit flag: M_FIX carries the L0C dependency explicitly, because a
+    // group of 64 accumulating Mmads feeds this one transfer.
+    fp.unitFlag = 0;
+    fp.subBlockId = (kOwner<Chunk> == 1u);
+
+    if constexpr (kIsKey<Chunk>) {
+        auto c = MakeTensor(MakeMemPtr(l0c),
+                            MakeFrameLayout<NZLayoutPtn, 16>(kTokens, kHeadSize));
+        auto y = MakeTensor(MakeMemPtr(ub),
+                            MakeFrameLayout<NDExtLayoutPtn>(kTokens, kHeadSize));
+        Copy(MakeCopy(CopyL0C2UB{}).with(fp), y, c);
+    } else {
+        auto c = MakeTensor(MakeMemPtr(l0c),
+                            MakeFrameLayout<NZLayoutPtn, 16>(kHeadSize, kTokens));
+        auto y = MakeTensor(MakeMemPtr(ub),
+                            MakeFrameLayout<NDExtLayoutPtn>(kHeadSize, kTokens));
         Copy(MakeCopy(CopyL0C2UB{}).with(fp), y, c);
     }
 }
@@ -516,12 +678,20 @@ __aicore__ inline void GemmGroupLoads(__ca__ std::int8_t* l0a, __cb__ std::int8_
     (GemmGroupLoad<Chunk, Gs>(l0a, l0b), ...);
 }
 
-template <std::uint32_t Chunk, std::uint32_t... Gs>
-__aicore__ inline void GemmGroupComputes(__ca__ std::int8_t* l0a, __cb__ std::int8_t* l0b,
-                                         __cc__ std::int32_t* l0c,
-                                         std::integer_sequence<std::uint32_t, Gs...>)
+template <std::uint32_t Chunk, std::uint32_t C1, std::uint32_t... Gs>
+__aicore__ inline void GemmBlockRow(__ca__ std::int8_t* l0a, __cb__ std::int8_t* l0b,
+                                    __cc__ std::int32_t* l0c,
+                                    std::integer_sequence<std::uint32_t, Gs...>)
 {
-    (GemmGroupCompute<Chunk, Gs>(l0a, l0b, l0c), ...);
+    (GemmBlock<Chunk, C1, Gs>(l0a, l0b, l0c), ...);
+}
+
+template <std::uint32_t Chunk, std::uint32_t... C1s>
+__aicore__ inline void GemmBlockRows(__ca__ std::int8_t* l0a, __cb__ std::int8_t* l0b,
+                                     __cc__ std::int32_t* l0c,
+                                     std::integer_sequence<std::uint32_t, C1s...>)
+{
+    (GemmBlockRow<Chunk, C1s>(l0a, l0b, l0c, GroupSeq{}), ...);
 }
 
 template <std::uint32_t Chunk>
@@ -529,9 +699,6 @@ __aicore__ inline void GemmChunk(__ca__ std::int8_t* l0a, __cb__ std::int8_t* l0
                                  __cc__ std::int32_t* l0c)
 {
     constexpr std::uint32_t slot = kL1Slot<Chunk>;
-    constexpr std::uint32_t land = kLandSlot<Chunk>;
-    constexpr std::uint32_t owner = kOwner<Chunk>;
-    using GroupSeq = std::make_integer_sequence<std::uint32_t, kGroups>;
 
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(static_cast<std::int32_t>(slot));
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEvtL0);
@@ -543,20 +710,27 @@ __aicore__ inline void GemmChunk(__ca__ std::int8_t* l0a, __cb__ std::int8_t* l0
 
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtL0);
     AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(kEvtL0);
-    // The owning Vector core must have consumed the previous occupant of this
-    // landing panel before Fixpipe overwrites it.
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<owner, land>);
     AscendC::SetMMRowMajor();
-    GemmGroupComputes<Chunk>(l0a, l0b, l0c, GroupSeq{});
+    GemmBlockRows<Chunk>(l0a, l0b, l0c, GroupSeq{});
     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(kEvtL0);
+    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(kEvtL0);
+
+    // The landing panel is waited here rather than before the Mmads: only the
+    // Fixpipe writes Unified Buffer, so the 64 multiplies for this chunk run
+    // while the owning Vector core is still finishing the previous one. A
+    // cross-core wait stalls the scalar stream, so everything issued *after*
+    // it is behind the flag and everything before it is not.
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFreeWait<Chunk>);
+    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(kEvtL0);
+    FixpipeChunk<Chunk>(l0c);
     AscendC::SetFlag<AscendC::HardEvent::FIX_M>(kEvtL0);
 
     // A mode-4 set runs on the scalar stream, so drain the Fixpipe into it
-    // first; without this the announcement overtakes the eight Fixpipes it
-    // reports (guidelines section 6.2a).
+    // first; without this the announcement overtakes the transfer it reports
+    // (guidelines section 6.2a).
     AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtL0);
     AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtL0);
-    AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagProductReady<owner, land>);
+    AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagProductReady<Chunk>);
 }
 
 // Column j of the schedule: MTE2 stages chunk j while the Cube multiplies
@@ -591,29 +765,34 @@ __aicore__ inline void run_cube_core(__gm__ const std::int8_t* key,
 
     CubeEngine engine{key, value, num_kv_heads * head_size, head_size};
 
-    // H32 reaches L1 once as a plain 1 KiB ND copy. A row-major symmetric
-    // 32x32 INT8 matrix is byte for byte both its NZ(32,32) and its ZN(32,32)
-    // image, so the same bytes feed L0A for the value chunks and L0B for the
-    // key chunks with no second staging path.
-    auto* l1_h = reinterpret_cast<__cbuf__ std::int8_t*>(kL1H);
-    auto h_src = MakeTensor(MakeMemPtr(reinterpret_cast<__gm__ std::int8_t*>(
+    // The 16 rotation blocks reach L1 once as a plain 16 KiB ND copy, and each
+    // of L0A and L0B takes the same bytes once. All three copies are identity:
+    // a flat row-major blob of kTableRows x kGroup INT8 is byte for byte its
+    // own NZ(kTableRows, kGroup) image and its own ZN(kGroup, kTableRows)
+    // image, because both have a single fractal along the 32-wide axis. Inside
+    // the blob, block b at offset b * 1024 then reads as NZ(32, 32) from L0A
+    // and as ZN(32, 32) from L0B, which are the two operand roles equation (1)
+    // needs.
+    auto* l1_table = reinterpret_cast<__cbuf__ std::int8_t*>(kL1Table);
+    auto t_src = MakeTensor(MakeMemPtr(reinterpret_cast<__gm__ std::int8_t*>(
                                 const_cast<__gm__ std::int32_t*>(tables))),
-                            MakeFrameLayout<NDExtLayoutPtn>(kGroup, kGroup));
-    auto h_dst = MakeTensor(MakeMemPtr(l1_h), MakeFrameLayout<NDExtLayoutPtn>(kGroup, kGroup));
-    Copy(MakeCopy(CopyGM2L1{}), h_dst, h_src);
+                            MakeFrameLayout<NDExtLayoutPtn>(kTableRows, kGroup));
+    auto t_dst = MakeTensor(MakeMemPtr(l1_table),
+                            MakeFrameLayout<NDExtLayoutPtn>(kTableRows, kGroup));
+    Copy(MakeCopy(CopyGM2L1{}), t_dst, t_src);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtEpilogue);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtEpilogue);
 
-    auto ha_src = MakeTensor(MakeMemPtr(l1_h),
-                             MakeFrameLayout<NZLayoutPtn, std::int8_t>(kGroup, kGroup));
-    auto ha_dst = MakeTensor(MakeMemPtr(l0_a),
-                             MakeFrameLayout<NZLayoutPtn, std::int8_t>(kGroup, kGroup));
-    Copy(MakeCopy(CopyL12L0A{}), ha_dst, ha_src);
-    auto hb_src = MakeTensor(MakeMemPtr(l1_h),
-                             MakeFrameLayout<ZNLayoutPtn, std::int8_t>(kGroup, kGroup));
-    auto hb_dst = MakeTensor(MakeMemPtr(l0_b),
-                             MakeFrameLayout<ZNLayoutPtn, std::int8_t>(kGroup, kGroup));
-    Copy(MakeCopy(CopyL12L0B{}), hb_dst, hb_src);
+    auto ta_src = MakeTensor(MakeMemPtr(l1_table),
+                             MakeFrameLayout<NZLayoutPtn, std::int8_t>(kTableRows, kGroup));
+    auto ta_dst = MakeTensor(MakeMemPtr(l0_a),
+                             MakeFrameLayout<NZLayoutPtn, std::int8_t>(kTableRows, kGroup));
+    Copy(MakeCopy(CopyL12L0A{}), ta_dst, ta_src);
+    auto tb_src = MakeTensor(MakeMemPtr(l1_table),
+                             MakeFrameLayout<ZNLayoutPtn, std::int8_t>(kGroup, kTableRows));
+    auto tb_dst = MakeTensor(MakeMemPtr(l0_b),
+                             MakeFrameLayout<ZNLayoutPtn, std::int8_t>(kGroup, kTableRows));
+    Copy(MakeCopy(CopyL12L0B{}), tb_dst, tb_src);
     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtEpilogue);
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtEpilogue);
 
@@ -631,22 +810,24 @@ __aicore__ inline void run_cube_core(__gm__ const std::int8_t* key,
 
     // Drain every primed token and every panel-free token the Vector cores
     // handed back, so no event bit and no intra-block flag leaks into the next
-    // launch. These waits also retire the last Fixpipes before the kernel ends.
+    // launch. These waits also retire the last Fixpipe before the kernel ends.
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(1);
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(2);
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(3);
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEvtL0);
     AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(kEvtL0);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<0u, 0u>);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<0u, 1u>);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<1u, 0u>);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<1u, 1u>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<0u, kChunks / 2u>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<0u, kChunks / 2u + 1u>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<1u, kChunks / 2u>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<1u, kChunks / 2u + 1u>);
 }
 
 // ======================================================= AIV: Vector cores
 // Both cores run this body; the chunk list is filtered by owner, so each core
-// handles two value chunks and two key chunks and nothing else.
+// handles two value chunks and two key chunks and nothing else. The rotation
+// arrives finished, so the stage is absmax, a power-of-two scale, and the INT4
+// pack - nothing else.
 struct VectorEngine {
     AscendC::GlobalTensor<std::int8_t> key_cache;
     AscendC::GlobalTensor<std::int8_t> value_cache;
@@ -667,73 +848,9 @@ __aicore__ inline AscendC::LocalTensor<T> View(std::uint32_t base, std::uint32_t
     return AscendC::LocalTensor<T>(kUb, base, count);
 }
 
-// --- butterfly: value layout -------------------------------------------------
-// The panel is [c1][c0][t], so a radix-2 stage over c1 at distance d pairs two
-// contiguous halves of each 2*d*kGroup*kTokens element period: sums into the
-// low half, differences into the high half. Three stages with d = 4, 2, 1
-// compose to H8 with no index permutation, because stage d transforms exactly
-// bit log2(d) of the c1 index.
-template <std::uint32_t Period, std::uint32_t... Ps>
-__aicore__ inline void ValueStageEmit(const AscendC::LocalTensor<float>& dst,
-                                      const AscendC::LocalTensor<float>& src,
-                                      std::integer_sequence<std::uint32_t, Ps...>)
-{
-    constexpr std::int32_t half = static_cast<std::int32_t>(Period / 2u);
-    ((AscendC::Add(dst[Ps * Period], src[Ps * Period], src[Ps * Period + Period / 2u], half),
-      AscendC::Sub(dst[Ps * Period + Period / 2u], src[Ps * Period],
-                   src[Ps * Period + Period / 2u], half)),
-     ...);
-}
-
-template <std::uint32_t Period>
-__aicore__ inline void ValueButterflyStage(const AscendC::LocalTensor<float>& dst,
-                                           const AscendC::LocalTensor<float>& src)
-{
-    static_assert(kPanel % Period == 0u, "the butterfly period must tile the panel");
-    ValueStageEmit<Period>(dst, src,
-                           std::make_integer_sequence<std::uint32_t, kPanel / Period>{});
-}
-
-// --- butterfly: key layout ---------------------------------------------------
-// The panel is [t][c1][c0], so a stage over c1 at distance d pairs elements
-// d*kGroup apart inside each token row. One level-0 call covers every token at
-// once when the pairing period tiles the panel uniformly; the widest stage,
-// whose period is a whole token row, needs two calls because a repeat covers
-// at most one vector register of 64 FP32 lanes.
-template <std::uint32_t Period, std::uint32_t... Cs>
-__aicore__ inline void KeyStageEmit(const AscendC::LocalTensor<float>& dst,
-                                    const AscendC::LocalTensor<float>& src,
-                                    std::integer_sequence<std::uint32_t, Cs...>)
-{
-    constexpr std::uint32_t half = Period / 2u;
-    constexpr std::int32_t mask = static_cast<std::int32_t>(half > 64u ? 64u : half);
-    constexpr std::uint8_t repeats = static_cast<std::uint8_t>(kPanel / Period);
-    AscendC::BinaryRepeatParams rp;
-    rp.dstBlkStride = 1;
-    rp.src0BlkStride = 1;
-    rp.src1BlkStride = 1;
-    rp.dstRepStride = static_cast<std::uint8_t>(Period / kLanesPerBlock);
-    rp.src0RepStride = rp.dstRepStride;
-    rp.src1RepStride = rp.dstRepStride;
-    ((AscendC::Add<float>(dst[Cs * mask], src[Cs * mask], src[half + Cs * mask],
-                          mask, repeats, rp),
-      AscendC::Sub<float>(dst[half + Cs * mask], src[Cs * mask], src[half + Cs * mask],
-                          mask, repeats, rp)),
-     ...);
-}
-
-template <std::uint32_t Period>
-__aicore__ inline void KeyButterflyStage(const AscendC::LocalTensor<float>& dst,
-                                         const AscendC::LocalTensor<float>& src)
-{
-    constexpr std::uint32_t half = Period / 2u;
-    constexpr std::uint32_t mask = half > 64u ? 64u : half;
-    static_assert(Period / kLanesPerBlock <= 255u, "repeat stride is a uint8 block count");
-    KeyStageEmit<Period>(dst, src, std::make_integer_sequence<std::uint32_t, half / mask>{});
-}
-
 // Row-wise max ladder for the key layout: fold N partials per token down to
 // N/2, from a SrcPitch-strided source into a DstPitch-strided destination.
+// Both uses run at the full 64-lane mask.
 template <std::uint32_t N, std::uint32_t SrcPitch, std::uint32_t DstPitch,
           std::uint32_t... Cs>
 __aicore__ inline void KeyFoldEmit(const AscendC::LocalTensor<float>& dst,
@@ -760,6 +877,7 @@ __aicore__ inline void KeyFold(const AscendC::LocalTensor<float>& dst,
 {
     constexpr std::uint32_t half = N / 2u;
     constexpr std::uint32_t mask = half > 64u ? 64u : half;
+    static_assert(mask == 64u, "both key folds must run at the full vector mask");
     static_assert(DstPitch >= kLanesPerBlock, "a fold destination pitch is a block count");
     KeyFoldEmit<N, SrcPitch, DstPitch>(
         dst, src, std::make_integer_sequence<std::uint32_t, half / mask>{});
@@ -793,93 +911,59 @@ __aicore__ inline void KeyQuantiseEmit(const AscendC::LocalTensor<float>& dst,
      ...);
 }
 
-// Repeated doubling of a kHeadSize-element prefix up to the whole panel. Muls
-// by 1.0f is an exact FP32 copy, including for signed zeros, and stays on the
-// Vector pipe, so no cross-pipe edge is needed between the steps.
-constexpr std::uint32_t kTokensLog2 = 4;  // kTokens == 1 << kTokensLog2
-static_assert((1u << kTokensLog2) == kTokens, "the doubling ladder must reach kPanel");
-
-template <std::uint32_t... Steps>
-__aicore__ inline void DoubleEmit(const AscendC::LocalTensor<float>& buf,
-                                  std::integer_sequence<std::uint32_t, Steps...>)
-{
-    ((AscendC::PipeBarrier<PIPE_V>(),
-      AscendC::Muls(buf[kHeadSize << Steps], buf, 1.0f,
-                    static_cast<std::int32_t>(kHeadSize << Steps))),
-     ...);
-}
-
 // --- the Vector stage --------------------------------------------------------
 template <std::uint32_t Chunk>
 __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
 {
     constexpr std::uint32_t land = kLandSlot<Chunk>;
     constexpr std::uint32_t pack = kPackSlot<Chunk>;
-    constexpr std::uint32_t owner = kOwner<Chunk>;
     constexpr std::int32_t pack_evt = static_cast<std::int32_t>(pack);
     constexpr std::int32_t all = static_cast<std::int32_t>(kPanel);
 
     auto landing = View<std::int32_t>(kLandBase<land>, kPanel);
     auto cast = View<float>(kUbCast, kPanel);
-    auto work_a = View<float>(kUbWorkA, kPanel);
-    auto work_b = View<float>(kUbWorkB, kPanel);
-    auto signs = View<float>(kIsKey<Chunk> ? kUbSignKey : kUbSignValue, kPanel);
+    auto work = View<float>(kUbWork, kPanel);
 
-    AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagProductReady<owner, land>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagProductReady<Chunk>);
     // Fixpipe lands INT32: L0C INT32 -> UB FP32 is not a supported Fixpipe
     // conversion on this part, the pairs are (FP32, FP32) and (INT32, INT32),
     // so the cast is one contiguous Vector op here. Exact: every value is an
-    // integer below 2^24.
+    // integer below 2^24. This is the whole rotation, already applied.
     AscendC::Cast(cast, landing, AscendC::RoundMode::CAST_NONE, kPanel);
     // The landing panel is dead from here on, so release it before the rest of
     // the stage runs and let the Cube refill it immediately. The drain makes
     // the scalar-stream set wait for the Vector queue to retire the cast.
     AscendC::SetFlag<AscendC::HardEvent::V_S>(pack_evt);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(pack_evt);
-    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFree<owner, land>);
-
-    // diag(piSigns) between the two Hadamard factors.
-    AscendC::Mul(work_a, cast, signs, all);
-
-    // The outer factor, three radix-2 stages, ping-ponging A -> B -> A -> B.
-    if constexpr (kIsKey<Chunk>) {
-        KeyButterflyStage<kGroup * 8u>(work_b, work_a);
-        KeyButterflyStage<kGroup * 4u>(work_a, work_b);
-        KeyButterflyStage<kGroup * 2u>(work_b, work_a);
-    } else {
-        ValueButterflyStage<kTokens * kGroup * 8u>(work_b, work_a);
-        ValueButterflyStage<kTokens * kGroup * 4u>(work_a, work_b);
-        ValueButterflyStage<kTokens * kGroup * 2u>(work_b, work_a);
-    }
+    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFreeSet<Chunk>);
 
     // Row-wise absolute maximum, one value per token, left contiguous so the
     // scale slice is a single 64-byte MTE3 burst.
     auto abs_max = View<float>(kUbAbsMax, kScaleFloats);
     auto one = View<float>(kUbOne, kScaleFloats);
-    AscendC::Abs(work_a, work_b, all);
+    AscendC::Abs(work, cast, all);
     if constexpr (kIsKey<Chunk>) {
         auto f128 = View<float>(kUbFold128, kTokens * 128u);
         auto f64 = View<float>(kUbFold64, kTokens * 64u);
-        auto f32 = View<float>(kUbFold32, kTokens * 32u);
-        auto f16 = View<float>(kUbFold16, kTokens * 16u);
         auto f8 = View<float>(kUbFold8, kTokens * 8u);
-        KeyFold<256u, 256u, 128u>(f128, work_a);
+        KeyFold<256u, 256u, 128u>(f128, work);
         KeyFold<128u, 128u, 64u>(f64, f128);
-        KeyFold<64u, 64u, 32u>(f32, f64);
-        KeyFold<32u, 32u, 16u>(f16, f32);
-        KeyFold<16u, 16u, 8u>(f8, f16);
-        // Eight lanes per token remain, one whole DataBlock each, and
-        // BlockReduceMax writes one result per block contiguously.
+        // 64 partials per token remain, eight DataBlocks each, and
+        // BlockReduceMax writes one result per block contiguously: 64 -> 8 at
+        // one repeat per token, then 8 -> 1 over the two registers that holds.
+        AscendC::BlockReduceMax<float>(f8, f64, static_cast<std::uint8_t>(kTokens), 64,
+                                       1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::BlockReduceMax<float>(abs_max, f8, 2, 64, 1, 1, 8);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Max(abs_max, abs_max, one, static_cast<std::int32_t>(kScaleFloats));
     } else {
-        ValueFoldEmit(work_a, std::make_integer_sequence<std::uint32_t, 8u>{});
+        ValueFoldEmit(work, std::make_integer_sequence<std::uint32_t, 8u>{});
         AscendC::PipeBarrier<PIPE_V>();
         // Floor at 1.0 and copy out of the fold buffer in one op: every value
         // is an integer, so 1.0 is the smallest non-zero magnitude and an
         // all-zero token gets scale 2^-2 rather than a division by zero.
-        AscendC::Max(abs_max, work_a, one, static_cast<std::int32_t>(kScaleFloats));
+        AscendC::Max(abs_max, work, one, static_cast<std::int32_t>(kScaleFloats));
     }
 
     // Power-of-two scale, by integer arithmetic on the FP32 bit pattern. A
@@ -928,7 +1012,7 @@ __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
         bc.src1RepStride = 1;
         bc.dstRepStride = static_cast<std::uint8_t>(kHeadSize / kLanesPerBlock);
         bc.src0RepStride = bc.dstRepStride;
-        KeyQuantiseEmit(work_a, work_b, inv_bcast, bc,
+        KeyQuantiseEmit(work, cast, inv_bcast, bc,
                         std::make_integer_sequence<std::uint32_t, kHeadSize / 64u>{});
     } else {
         // Four copies of the 16-token block fill one vector register, and the
@@ -944,7 +1028,7 @@ __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
         AscendC::PipeBarrier<PIPE_V>();
         bc.src1BlkStride = 1;
         bc.src1RepStride = 0;
-        AscendC::Mul<float>(work_a, work_b, inv_rep, 64,
+        AscendC::Mul<float>(work, cast, inv_rep, 64,
                             static_cast<std::uint8_t>(kPanel / 64u), bc);
     }
 
@@ -953,9 +1037,9 @@ __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
     // only rounding in the whole path, and it rounds an exactly representable
     // product, so the host oracle reproduces it in integer arithmetic.
     AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Mins(work_a, work_a, 7.0f, all);
+    AscendC::Mins(work, work, 7.0f, all);
     AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Cast(quant, work_a, AscendC::RoundMode::CAST_RINT, kPanel);
+    AscendC::Cast(quant, work, AscendC::RoundMode::CAST_RINT, kPanel);
 
     // The packed slot and its scale slice are one ring slot, so one back edge
     // covers both: its previous occupant is still being read by MTE3 until now.
@@ -997,8 +1081,8 @@ __aicore__ inline void StoreChunk(VectorEngine& engine)
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pack_evt);
 }
 
-// Column j of the schedule on Vector core k: the rotation of chunk j - 2 and
-// the egress of chunk j - 3, each only if core k owns that chunk. Both are
+// Column j of the schedule on Vector core k: the quantisation of chunk j - 2
+// and the egress of chunk j - 3, each only if core k owns that chunk. Both are
 // emitted at compile time, so a core's instruction stream contains only its
 // own chunks and no predicate.
 template <std::uint32_t Column, std::uint32_t Core>
@@ -1026,7 +1110,6 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
                                        __gm__ std::int8_t* value_cache,
                                        __gm__ float* scale_cache,
                                        __gm__ const std::int32_t* slot_mapping,
-                                       __gm__ const float* pi_signs,
                                        std::uint32_t num_kv_heads,
                                        std::uint32_t head_size,
                                        std::uint32_t block_size,
@@ -1051,15 +1134,12 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
     engine.head_scale = block_size;
     engine.inv_sqrt_len = inv_sqrt_len;
 
-    // ---- prologue: constants and the two replicated sign panels ----------
-    auto raw_signs = View<float>(kUbSigns, kHeadSize);
-    AscendC::GlobalTensor<float> gm_signs;
-    gm_signs.SetGlobalBuffer(const_cast<__gm__ float*>(pi_signs));
-    AscendC::DataCopy(raw_signs, gm_signs, kHeadSize);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtEpilogue);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtEpilogue);
-
-    // Immediate-sourced constants never read UB and carry no tensor hazard.
+    // ---- prologue: the quantiser's three immediate constants --------------
+    // The factored revision also built two replicated sign panels here, from a
+    // Global Memory read of piSigns. The signs are in the Cube's resident
+    // blocks now, so the Vector prologue reads no Global Memory at all and
+    // every constant below is immediate sourced, which carries no tensor
+    // hazard.
     AscendC::Duplicate(View<float>(kUbOne, kScaleFloats), 1.0f,
                        static_cast<std::int32_t>(kScaleFloats));
     AscendC::Duplicate(View<std::int32_t>(kUbExpMask, kScaleFloats),
@@ -1068,21 +1148,6 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
     AscendC::Duplicate(View<std::int32_t>(kUbInvSeed, kScaleFloats),
                        static_cast<std::int32_t>(0x7F000000),
                        static_cast<std::int32_t>(kScaleFloats));
-
-    // Key panel: the sign vector repeated once per token. Muls by 1.0f is an
-    // exact FP32 copy, including for signed zeros, and stays on the Vector pipe.
-    auto sign_key = View<float>(kUbSignKey, kPanel);
-    AscendC::Muls(sign_key, raw_signs, 1.0f, static_cast<std::int32_t>(kHeadSize));
-    DoubleEmit(sign_key, std::make_integer_sequence<std::uint32_t, kTokensLog2>{});
-
-    // Value panel: each sign over kTokens adjacent lanes, which is two
-    // DataBlocks. A Brcb repeat splats eight source elements into eight blocks,
-    // so two interleaved passes with a two-block destination stride fill it.
-    auto sign_value = View<float>(kUbSignValue, kPanel);
-    AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Brcb(sign_value, raw_signs, static_cast<std::uint8_t>(kHeadSize / 8u), {2, 16});
-    AscendC::Brcb(sign_value[kLanesPerBlock], raw_signs,
-                  static_cast<std::uint8_t>(kHeadSize / 8u), {2, 16});
     AscendC::PipeBarrier<PIPE_V>();
 
     // Feedback cycle priming: both packed page slots start free, and both
@@ -1119,12 +1184,11 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_a8(
     __gm__ std::int32_t* __restrict__ slotMapping,
     __gm__ float* __restrict__ piSigns,
     __gm__ std::int32_t* __restrict__ tables,
-    // Unqualified uint32_t, not std::uint32_t: CANN generates
-    // aclrtlaunch_triple_chevrons_func.h by copying this parameter list
-    // verbatim into a header that has no using-declaration for std, so a
-    // qualified scalar type breaks the host leg of the build while the device
-    // legs compile cleanly. Pointer parameters are rewritten to void* and are
-    // unaffected.
+    // Unqualified uint32_t, not std::uint32_t: CANN copies this parameter list
+    // verbatim into aclrtlaunch_triple_chevrons_func.h, which has no
+    // using-declaration for std, so a qualified scalar type breaks the host leg
+    // of the build while the device legs compile cleanly. Pointer parameters
+    // are rewritten to void* and are unaffected.
     uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
     uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore,
     float invSqrtLen)
@@ -1136,16 +1200,22 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_a8(
     // match kTokens. The remaining scalars drive the physical cache addressing.
     (void)numTokens;
     (void)tokensPerCore;
+    // piSigns is folded into `tables` by whoever builds it -- the sign diagonal
+    // sits between the two Hadamard factors, so it is a property of the
+    // resident rotation blocks (header equation (2)) and not of a Vector-side
+    // multiply any more. The argument stays in the published signature; the
+    // device does not read it.
+    (void)piSigns;
     // The only role dispatch in the kernel, outside every pipeline stage.
     if ASCEND_IS_AIC {
         turboquant_a8::run_cube_core(key, value, tables, numKvHeads, headSize);
     } else if (AscendC::GetSubBlockIdx() == 0) {
         turboquant_a8::run_vector_core<0u>(keyCache, valueCache, scaleCache, slotMapping,
-                                           piSigns, numKvHeads, headSize, blockSize,
+                                           numKvHeads, headSize, blockSize,
                                            numBlocks, invSqrtLen);
     } else {
         turboquant_a8::run_vector_core<1u>(keyCache, valueCache, scaleCache, slotMapping,
-                                           piSigns, numKvHeads, headSize, blockSize,
+                                           numKvHeads, headSize, blockSize,
                                            numBlocks, invSqrtLen);
     }
 }

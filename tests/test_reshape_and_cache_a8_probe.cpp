@@ -2,21 +2,30 @@
 //
 // The CAModel runner next door already compares the device output to the
 // factored oracle bit for bit, so repeating that here would prove nothing. This
-// probe checks the three things that comparison *cannot* see, because they are
-// properties of the oracle itself rather than of the device:
+// probe checks the four things that comparison *cannot* see directly, because
+// they are properties of the oracle and of the device's operand rather than of
+// the device's output:
 //
 //   1. the transform really is an orthogonal rotation. The explicit 256x256
 //      matrix M = (H8 (x) I32) . diag(piSigns) . (I8 (x) H32) satisfies
 //      M M^T = headSize * I exactly, which is what makes
 //      invSqrtLen = 1/sqrt(headSize) the right normalisation and what makes
 //      "randomised Hadamard" a claim rather than a label;
-//   2. the factored oracle - inner Hadamard, sign diagonal, three butterfly
+//   2. the factored oracle - inner Hadamard, sign diagonal, three radix-2
 //      stages over the channel group index - equals a dense application of M,
-//      in exact integers. A butterfly cascade in the wrong order, or a stage
-//      that transforms the wrong bit of the group index, still composes to
-//      *some* orthogonal map and would agree with a device that made the same
-//      mistake; it would not agree with M;
-//   3. the INT4 nibble packing round-trips through the unpacking contract the
+//      in exact integers. The oracle is written that way because it is the
+//      cheap way to apply M on a host; a cascade in the wrong order, or a
+//      stage that transforms the wrong bit of the group index, still composes
+//      to *some* orthogonal map, and it would not agree with M;
+//   3. the 16 resident 32x32 rotation blocks the kernel multiplies by -
+//      T[s][g] = (-1)^s . diag(piSigns[g*32 ..]) . H32, selected per output
+//      group by s = parity(c1 & g) - compose to M entry for entry. That is the
+//      device's whole arithmetic contract since the rotation moved onto the
+//      Cube: the Vector cores no longer apply any part of M, so a wrong sign
+//      index or a transposed block is the one error class that would survive
+//      every structural check in the CAModel audit and surface only as wrong
+//      nibbles;
+//   4. the INT4 nibble packing round-trips through the unpacking contract the
 //      dequantisation leaf implements (two nibbles per byte, low nibble first,
 //      signed INT4 in [-8, 7]), and the power-of-two quantiser stays inside
 //      that range with the error bound its scale implies.
@@ -48,6 +57,8 @@ constexpr int kPanel = kTokens * kHeadSize;
 constexpr int kPackedBytes = kPanel / 2;
 constexpr int kBlockSize = kTokens;
 constexpr float kInvSqrtLen = 1.0f / 16.0f;
+constexpr int kBlockElems = kGroup * kGroup;  // one resident 32x32 INT8 block
+constexpr int kTableBlocks = 2 * kGroups;     // one per (sign, source group)
 
 int parity(unsigned v)
 {
@@ -92,8 +103,9 @@ long long rint_even_shift(long long y, int shift)
 }
 
 // The runner's factored oracle, verbatim in structure: inner Hadamard per
-// channel group, then the sign diagonal, then the outer factor expressed the
-// way the kernel runs it - three radix-2 stages over the group index.
+// channel group, then the sign diagonal, then the outer factor as three
+// radix-2 stages over the group index. This is how the *oracle* applies M; the
+// device applies it as 64 block GEMMs instead, which check 3 covers.
 void factored(const int* x, long long* y)
 {
     static long long z[kPanel];
@@ -208,7 +220,39 @@ int main()
         ASSERT_CANARY_INTACT(factored_out);
         ASSERT_CANARY_INTACT(dense_out);
 
-        // ---- 3. quantiser range and nibble round trip --------------------
+        // ---- 3. the Cube's resident blocks compose to M ------------------
+        // Build `tables` exactly as the runner uploads it, then compose it the
+        // way the kernel does - output group c1 takes source group g through
+        // block parity(c1 & g) * kGroups + g - and compare against M. This is
+        // the device's arithmetic in its entirety: 64 of these 32x32 blocks per
+        // chunk, accumulated eight at a time into one L0C region.
+        GuardedBuffer<std::int8_t> tables(kTableBlocks * kBlockElems);
+        for (int s = 0; s < 2; ++s)
+            for (int g = 0; g < kGroups; ++g)
+                for (int c0 = 0; c0 < kGroup; ++c0)
+                    for (int i = 0; i < kGroup; ++i)
+                        tables[(s * kGroups + g) * kBlockElems + c0 * kGroup + i] =
+                            static_cast<std::int8_t>((s ? -1 : 1) *
+                                                     pi_sign(g * kGroup + c0) *
+                                                     hadamard(c0, i));
+        int composed = 0;
+        for (int c1 = 0; c1 < kGroups; ++c1)
+            for (int g = 0; g < kGroups; ++g) {
+                const int block = parity(static_cast<unsigned>(c1 & g)) * kGroups + g;
+                for (int c0 = 0; c0 < kGroup; ++c0)
+                    for (int i = 0; i < kGroup; ++i) {
+                        require(tables[block * kBlockElems + c0 * kGroup + i] ==
+                                    matrix[(c1 * kGroup + c0) * kHeadSize + g * kGroup + i],
+                                "a resident rotation block disagrees with the dense "
+                                "matrix M");
+                        ++composed;
+                    }
+            }
+        require(composed == kHeadSize * kHeadSize,
+                "the block composition did not cover every entry of M");
+        ASSERT_CANARY_INTACT(tables);
+
+        // ---- 4. quantiser range and nibble round trip --------------------
         // Reuse the last variant's rotation, quantise it the way the kernel
         // does, pack it the way the kernel does, and unpack it the way
         // routine_turboquant_dequant4.hpp does.
@@ -288,6 +332,10 @@ int main()
         std::printf("  factorisation: %d values over 6 input patterns identical to a "
                     "dense apply, largest |Y| %lld (bound 32768)\n",
                     cases, largest);
+        std::printf("  rotation blocks: %d x %dx%d INT8 (%d B) compose to %d/%d "
+                    "entries of M\n",
+                    kTableBlocks, kGroup, kGroup, kTableBlocks * kBlockElems, composed,
+                    kHeadSize * kHeadSize);
         std::printf("  quantiser: %d nibbles inside [-8, 7], %d round-tripped through "
                     "the dequant4 packing, worst relative error %.4f\n",
                     nibbles, round_tripped, worst_relative);

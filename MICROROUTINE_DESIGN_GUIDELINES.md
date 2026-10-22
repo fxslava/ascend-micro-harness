@@ -654,6 +654,13 @@ barrier is two waits, one id from each half. Keep clear of the library's
 reserved ids (`SYNC_AIC_AIV_FLAG` 13, `SYNC_AIV_ONLY_ALL` 14, and their +16
 images).
 
+This is load bearing in **both** directions, and §6.2c records the run that
+showed it: renumbering AIV1's channel into 0..15 — on the mistaken reading
+that the id is a four-bit field in one pool shared by the block — deadlocks the
+kernel, with the Cube stuck on its own "panel free" wait and AIV1 stuck on its
+"panel ready" wait. The `+ INTRA_NUM` offset is how the peer's sub block is
+named, not a convention.
+
 In the trace an AIV prints `sync_id` **relative to its own half** while the AIC
 prints the absolute id, so AIV1's raw id 16 appears as `sync_id:0` on
 `core0.veccore1` and `sync_id:16` on `core0.cubecore0`. Rebase before counting,
@@ -728,6 +735,71 @@ checked per sync id across both core dumps, not per core.
 Note that `CrossCoreSetFlag` calls issued back to back by one core have **no
 guaranteed order** between different flagIds. Separate them with a wait if the
 order matters.
+
+### 6.2c A reused mode-4 flag id is not a reliable token
+
+A mode-4 flag is **not** a counting semaphore you can cycle an id through. The
+reshape-and-cache operator measured a stale announcement releasing a wait: with
+`kFlagProductReady = Owner * INTRA_NUM + Slot` — two slots, so each id carries
+*two* announcements over the run — AIV1's second wait on its slot-1 id did not
+block.
+
+| event | CAModel cycle |
+| --- | ---: |
+| Cube's chunk-3 `SET_INTRA_BLOCK sync_id:17` (panel ready, slot 1) | 6840 |
+| AIV1 consumes it, reads slot 1 for chunk 3 | 7282 |
+| AIV1 reaches its chunk-7 wait on the same id | 8988 |
+| AIV1 starts reading slot 1 for chunk 7 | 10502 |
+| Cube's chunk-7 Fixpipe **completes** | 11165 |
+| Cube's chunk-7 `SET_INTRA_BLOCK sync_id:17` | 11167 |
+
+The chunk-7 wait was released 2179 cycles before the announcement it was
+waiting for, by the set from 6840 that the chunk-3 wait had supposedly
+consumed. The resulting page was 87% identical to the page the slot had held
+for chunk 3. **The mechanism was not isolated** — whether the flag is a level
+bit that a wait tests without clearing, or something subtler, is untested here;
+what is measured is that the *second* wait on a reused id passed early.
+
+The fix that holds under either reading is to **label every cross-core event
+uniquely**: one flag id per announcement and one per release, each set exactly
+once and waited exactly once in the whole kernel, rather than an id per ring
+slot. Twelve ids per sub block are available (0..10 and 15), which bounds this
+discipline to short schedules — a production-length loop has to reuse ids, and
+nothing here establishes what makes that safe.
+
+**Why it had never shown.** Set and wait counts balance under a reused id, so
+no token-leak audit and no per-id pairing check fails. And a pipeline in which
+one engine runs far ahead never consumes a stale token: the factored revision
+of that operator had its Cube finish all eight chunks by cycle 6121 of a
+19331-cycle run, so every panel was ready long before a Vector core looked at
+it. **Balancing the pipeline is what exposed it** — the kernel had been passing
+twice, reproducibly, with every gate green. Two consequences:
+
+* a cross-core edge audit should check that no flag id carries more than one
+  set, not just that sets and waits balance;
+* `kernels/ops/turboquant/turboquant_paged_attention_opt.cpp` cycles three
+  slots through each of five ids over eight pages, so each of its cross-core
+  ids carries up to three announcements. It passes today with its Cube ahead of
+  its Vector cores, which is the same position the reshape operator was in.
+  Not investigated here.
+
+### 6.2d The id space really is per sub block
+
+The run that produced §6.2c's table was first misdiagnosed as the two Vector
+cores sharing one four-bit flag pool, on the strength of
+`NotifyEventImpl` / `WaitEventImpl`
+(`impl/basic_api/dav_3510/kernel_operator_sync_impl.h:789`, `:816`) passing the
+id straight to `set_intra_block` / `wait_intra_block` with no sub-block offset
+of their own, plus `GetffstMsg`'s `flagId & 0xf` on the sibling ffts path and
+the AIV trace printing an id of 16 as `sync_id:0`. **That reading is wrong**,
+and renumbering the two cores into 0..7 to "fix" it deadlocked the kernel:
+AIV1 stalled on `WAIT_INTRA_BLOCK sync_id:2` (its "panel ready") and the Cube
+on `WAIT_INTRA_BLOCK sync_id:6` (its "panel free" from AIV1), each waiting on a
+flag the peer had addressed into the other sub block. §6.2's `+ INTRA_NUM` is
+how a participant names the *other* sub block's channel, in both directions,
+and the AIV-side trace value is that id with the sub-block bits already
+resolved. Recorded because the wrong reading survived a library read and a
+trace read, and only a deadlock settled it.
 
 ### 6.3 Establish numerics before concurrency
 

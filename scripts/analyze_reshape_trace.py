@@ -13,16 +13,17 @@ chunks and whose Cube page staging never touches the Unified Buffer, so the
 flag graph and the engine census are different and reusing that script would
 either pass vacuously or fail for the wrong reason.
 
-Six checks, each fatal:
+Seven checks, each fatal:
 
   1. intra-core SET_FLAG / WAIT_FLAG balance per core and per
      (pipe, trigger pipe, flag id), so no HardEvent token leaks, and event ids
      6 and 7 left alone;
-  2. cross-core SET_INTRA_BLOCK / WAIT_INTRA_BLOCK pairing per absolute flag
-     id. An AIV reports sync_id inside its own sub-block half while the AIC
-     reports the absolute id, so AIV1 ids are rebased by INTRA_NUM before
-     pairing -- that rebasing is itself the evidence that the sub-block id
-     convention holds;
+  2. cross-core SET_INTRA_BLOCK / WAIT_INTRA_BLOCK pairing per flag id, and
+     -- the check that matters -- that no id carries more than one set in
+     the whole run. A reused mode-4 id is not a token a wait consumes: this
+     operator measured a second wait on one id passing 2179 cycles before the
+     announcement it was waiting for. Set and wait counts balance under reuse,
+     so counting alone passes vacuously;
   3. chunk ownership: the Cube announced CHUNKS panels, half to each Vector
      core, and waited one panel-free flag per chunk from each half plus the two
      priming tokens, so neither Vector core was outrun and neither was skipped;
@@ -31,11 +32,17 @@ Six checks, each fatal:
   5. the Cube staged every page from Global Memory into L1 without a Unified
      Buffer hop: zero Global Memory stores anywhere on the AIC and at least one
      MTE2 move per page plus the rotation table;
-  6. four-engine concurrency: MTE2, Cube, Vector and MTE3 in flight at the same
+  6. the Cube census matches the design: CHUNKS * GROUPS * GROUPS Mmads, one
+     per (output group, source group) pair, and exactly one L0C -> UB Fixpipe
+     per chunk. The whole rotation is Cube work now, so a Vector core that
+     still applied part of it, or a Fixpipe per channel group, would show here
+     rather than only in the numbers;
+  7. four-engine concurrency: MTE2, Cube, Vector and MTE3 in flight at the same
      time, which is what the four-stage schedule claims and what a serialised
      implementation would fail.
 
-Then it reports per-chunk cadence, cycle spans and merged engine overlap.
+Then it reports per-chunk cadence, cycle spans, merged engine overlap, and the
+Vector register-traffic split that motivated moving the rotation onto the Cube.
 Ticks come from one CAModel clock in all three dumps, so the intervals are
 directly comparable.
 """
@@ -51,20 +58,31 @@ LINE = re.compile(
 FLAG = re.compile(r"PIPE:(\w+), TRIGGER PIPE:(\w+), FLAG ID:(0x[0-9a-f]+|\d+)")
 SYNC = re.compile(r"(SET|WAIT)_INTRA_BLOCK\s+PIPE:(\w+).*?sync_id:(\d+)")
 
-# AscendC::INTRA_NUM: a mode-4 flag id space of 16 per sub block.
+# AscendC::INTRA_NUM: a mode-4 flag id space of 16 per sub block, with ids
+# 11..14 library reserved inside each half.
 INTRA_NUM = 16
+RESERVED_FLAG_IDS = {11, 12, 13, 14, 27, 28, 29, 30}
 
 # turboquant_a8 geometry.
 CHUNKS = 8          # four value heads then four key heads
-GROUPS = 8          # Mmads per chunk, one per 32-channel group
+GROUPS = 8          # 32-channel groups per head
+# The Cube applies the whole rotation: one Mmad per (output group, source
+# group) pair, eight of them accumulating into each output group's L0C region,
+# and then one Fixpipe for the finished panel.
+MMADS_PER_CHUNK = GROUPS * GROUPS
+FIXPIPES_PER_CHUNK = 1
 LAND_DEPTH = 2      # landing panels per Vector core
 STAGE_DEPTH = 4     # L1 page ring depth, so four columns of pipeline fill
 PER_CORE = CHUNKS // 2
 
-# Flag ids, from the kernel: product-ready is Owner*16 + slot and panel-free is
-# Owner*16 + 4 + slot.
-PRODUCT_READY = {0, 1, INTRA_NUM, INTRA_NUM + 1}
-PANEL_FREE = {4, 5, INTRA_NUM + 4, INTRA_NUM + 5}
+# Flag ids, from the kernel: one id per cross-core event, never reused. Per
+# Vector core, over its PER_CORE chunks j, product-ready is Owner*16 + j, and
+# panel-free is Owner*16 + 4 + j for the Cube's wait and
+# Owner*16 + 4 + j + LAND_DEPTH for the AIV's release.
+PRODUCT_READY = {core * 16 + j for core in (0, 1) for j in range(PER_CORE)}
+PANEL_FREE = {core * 16 + 4 + i
+              for core in (0, 1) for i in range(PER_CORE + LAND_DEPTH)}
+FLAG_OWNER = {flag: flag // 16 for flag in PRODUCT_READY | PANEL_FREE}
 
 VECTOR_PIPES = {"RVECEX", "RVECST", "RVECLD", "RVECSU", "RVECLP", "VEC"}
 CUBE_PIPES = {"CUBE", "FIXP", "MTE1", "MTE2"}
@@ -125,8 +143,14 @@ def hard_event_balance(name, records):
     return sets
 
 
-def cross_core(records, rebase):
-    """{(kind, absolute flag id): count} for one core."""
+def cross_core(records, rebase=0):
+    """{(kind, absolute flag id): count} for one core.
+
+    An AIV prints sync_id with the sub-block bits already resolved while the
+    AIC prints the id as written, so AIV1's ids are rebased by INTRA_NUM. That
+    the id space is genuinely per sub block was settled by a deadlock, not by
+    reading the library: guidelines section 6.2d.
+    """
     out = Counter()
     for _, (_, _, operation) in records.items():
         sync = SYNC.search(operation)
@@ -185,10 +209,38 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
         "AIC": hard_event_balance("AIC", c_in),
     }
 
-    # ---- 2. cross-core pairing on absolute flag ids -------------------
-    aiv = cross_core(v0_in, 0) + cross_core(v1_in, INTRA_NUM)
+    # ---- 2. cross-core pairing, and no flag shared by both cores ------
+    per_core_flags = {0: cross_core(v0_in, 0), 1: cross_core(v1_in, INTRA_NUM)}
+    aiv = per_core_flags[0] + per_core_flags[1]
     aic = cross_core(c_in, 0)
     ids = {flag for _, flag in list(aiv) + list(aic)}
+    # The check that matters. A reused mode-4 id is not a token a wait
+    # consumes: this operator measured a second wait on one id passing 2179
+    # cycles before the announcement it was waiting for, released by the set
+    # the first wait had supposedly taken (guidelines section 6.2c). Set and
+    # wait counts balance under reuse, so counting cannot see it. The invariant
+    # is that no id carries more than one set in the whole run.
+    for flag in sorted(ids):
+        sets = aiv[("SET", flag)] + aic[("SET", flag)]
+        waits = aiv[("WAIT", flag)] + aic[("WAIT", flag)]
+        if sets != 1 or waits != 1:
+            raise SystemExit(
+                f"mode-4 flag {flag} carries {sets} sets and {waits} waits: "
+                f"every cross-core event needs its own id, because a reused id "
+                f"releases its second wait early"
+            )
+        users = sorted(core for core in (0, 1)
+                       if any(k[1] == flag for k in per_core_flags[core]))
+        if users and FLAG_OWNER.get(flag) != users[0]:
+            raise SystemExit(
+                f"mode-4 flag {flag} is used by AIV{users[0]}, expected "
+                f"AIV{FLAG_OWNER.get(flag)}"
+            )
+    if ids & RESERVED_FLAG_IDS:
+        raise SystemExit(
+            f"mode-4 flag ids {sorted(ids & RESERVED_FLAG_IDS)} are reserved by "
+            f"the library's own SyncAll handshake"
+        )
     for flag in sorted(ids):
         if aiv[("SET", flag)] != aic[("WAIT", flag)] or \
            aic[("SET", flag)] != aiv[("WAIT", flag)]:
@@ -209,20 +261,19 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
 
     # ---- 3. chunk ownership, both ways --------------------------------
     # The Cube announces one panel per chunk and the owning Vector core hands
-    # that panel back, so each half of the id space must carry exactly
-    # PER_CORE product-ready flags and LAND_DEPTH + PER_CORE panel-free flags
-    # (the extra two are the priming tokens, drained by the Cube epilogue).
+    # that panel back, so each core's own ids must carry exactly PER_CORE
+    # product-ready flags and LAND_DEPTH + PER_CORE panel-free flags (the extra
+    # two are the priming tokens, drained by the Cube epilogue).
     announced = {
-        0: sum(v for k, v in aic.items()
-               if k[0] == "SET" and k[1] in PRODUCT_READY and k[1] < INTRA_NUM),
-        1: sum(v for k, v in aic.items()
-               if k[0] == "SET" and k[1] in PRODUCT_READY and k[1] >= INTRA_NUM),
+        core: sum(v for k, v in aic.items()
+                  if k[0] == "SET" and k[1] in PRODUCT_READY
+                  and FLAG_OWNER.get(k[1]) == core)
+        for core in (0, 1)
     }
     released = {
-        0: sum(v for k, v in aiv.items()
-               if k[0] == "SET" and k[1] in PANEL_FREE and k[1] < INTRA_NUM),
-        1: sum(v for k, v in aiv.items()
-               if k[0] == "SET" and k[1] in PANEL_FREE and k[1] >= INTRA_NUM),
+        core: sum(v for k, v in per_core_flags[core].items()
+                  if k[0] == "SET" and k[1] in PANEL_FREE)
+        for core in (0, 1)
     }
     for core in (0, 1):
         if announced[core] != PER_CORE:
@@ -294,11 +345,11 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
     pairs = sum(len(c) for c in per_core_events.values())
     print(f"intra-core HardEvents: {total_events} sets / {total_events} waits "
           f"across {pairs} (route, ID) pairs on 3 cores; zero residual")
-    print(f"cross-core mode-4 flags: {cross_sets} sets / {cross_waits} waits, "
-          f"every absolute id paired AIV<->AIC, ids "
-          f"{sorted(ids)}")
+    print(f"cross-core mode-4 flags: {cross_sets} sets / {cross_waits} waits "
+          f"over {len(ids)} ids, exactly one set and one wait each, so no id "
+          f"carries a second announcement: {sorted(ids)}")
     print(f"chunk ownership: the Cube announced {announced[0]} panels to AIV0 "
-          f"(ids 0..15) and {announced[1]} to AIV1 (ids 16..31); the cores "
+          f"and {announced[1]} to AIV1 on disjoint flag ids; the cores "
           f"released {released[0]} and {released[1]} panels "
           f"({LAND_DEPTH} primed each)")
     for name in ("AIV0", "AIV1", "AIC"):
@@ -312,20 +363,36 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
           f"UB->L1 moves, so every page reached L1 from Global Memory in one "
           f"burst with no Unified Buffer hop")
 
-    # ---- per-chunk cadence --------------------------------------------
+    # ---- 6. the Cube census matches the design ------------------------
     cube_ops = Counter(op.split()[0] for _, (_, pipe, op) in c_in.items()
                        if pipe == "CUBE" and "_FLAG" not in op)
-    mmad_ops = [op for op, n in cube_ops.items() if n == CHUNKS * GROUPS]
+    mmad_ops = [op for op, n in cube_ops.items() if n == CHUNKS * MMADS_PER_CHUNK]
     if not mmad_ops:
-        mmad_ops = [op for op, _ in cube_ops.most_common(1)]
+        raise SystemExit(
+            f"no CUBE-pipe mnemonic appears exactly {CHUNKS * MMADS_PER_CHUNK} "
+            f"times ({CHUNKS} chunks x {MMADS_PER_CHUNK} Mmads, one per output "
+            f"group and source group pair); saw {dict(cube_ops)}"
+        )
     mmad = dispatch_ticks(
         c_in, lambda p, o: p == "CUBE" and o.split()[0] in mmad_ops)
     fixpipe = dispatch_ticks(c_in, lambda p, o: "FIX_L0C_TO_DST" in o)
+    if len(fixpipe) != CHUNKS * FIXPIPES_PER_CHUNK:
+        raise SystemExit(
+            f"the Cube issued {len(fixpipe)} L0C -> UB transfers, expected "
+            f"{CHUNKS * FIXPIPES_PER_CHUNK}: the whole rotated panel leaves L0C "
+            f"in one Fixpipe per chunk"
+        )
+    print(f"rotation on the Cube: {len(mmad)} Mmads ({CHUNKS} chunks x {GROUPS} "
+          f"output groups x {GROUPS} source groups) and {len(fixpipe)} L0C->UB "
+          f"transfers, one per chunk, so no part of the rotation runs on a "
+          f"Vector core")
+
+    # ---- per-chunk cadence --------------------------------------------
     print("per-chunk cadence. CUBE-pipe mnemonics: " +
           ", ".join(f"{op} x{n}" for op, n in cube_ops.most_common()))
     streams = [
-        ("Mmad dispatch (per chunk)", mmad[::GROUPS] if mmad else [], None),
-        ("Fixpipe dispatch (per chunk)", fixpipe[::GROUPS] if fixpipe else [], None),
+        ("Mmad dispatch (per chunk)", mmad[::MMADS_PER_CHUNK] if mmad else [], None),
+        ("Fixpipe dispatch (per chunk)", fixpipe[::FIXPIPES_PER_CHUNK], CHUNKS),
         ("AIV0 egress", dispatch_ticks(
             v0_in, lambda p, o: p == "MTE3" and "Dst:OUT" in o)[::2], None),
         ("AIV1 egress", dispatch_ticks(
@@ -377,7 +444,29 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
         print(f"  overlap {left:<6} + {right:<6}: "
               f"{sum(b - a for a, b in common):>5} cycles ({detail})")
 
-    # ---- 6. four-engine concurrency -----------------------------------
+    # ---- Vector register traffic --------------------------------------
+    # The factored revision's cost was register traffic, not arithmetic:
+    # msprof put RV_VLD + RV_VST at 48.6% of the Vector cycles against 24.4%
+    # for the whole execute pipe. msprof's denominator is accumulated
+    # issue-to-complete latency per instruction site; this is the same question
+    # asked of merged busy intervals, so the ratios are comparable across
+    # revisions of this kernel but not against msprof's percentages.
+    print("Vector register traffic (merged busy cycles, load+store vs execute):")
+    for name, records, complete in (("AIV0", v0_in, v0_out), ("AIV1", v1_in, v1_out)):
+        parts = {}
+        for pipe in ("RVECLD", "RVECST", "RVECEX"):
+            spans = busy(records, complete, lambda p, _o, want=pipe: p == want)
+            parts[pipe] = sum(b - a for a, b in spans)
+        traffic = parts["RVECLD"] + parts["RVECST"]
+        total = traffic + parts["RVECEX"]
+        counts = Counter(p for _, (_, p, _) in records.items())
+        share = f"{100.0 * traffic / total:.1f}%" if total else "n/a"
+        print(f"  {name}: RVECLD {parts['RVECLD']} ({counts['RVECLD']} instr), "
+              f"RVECST {parts['RVECST']} ({counts['RVECST']}), "
+              f"RVECEX {parts['RVECEX']} ({counts['RVECEX']}); "
+              f"load+store {share} of load+store+execute")
+
+    # ---- 7. four-engine concurrency -----------------------------------
     four = classes["Cube"]
     for name in ("Vector", "MTE2", "MTE3"):
         four = intersect(four, classes[name])
