@@ -263,11 +263,23 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
             f"the Cube wrote Global Memory {aic_stores} times: the page "
             f"staging is not a pure GM -> L1 path"
         )
-    aic_mte2 = sum(1 for _, (_, p, o) in c_in.items()
-                   if p == "MTE2" and "MOV_" in o)
-    if aic_mte2 < CHUNKS + 1:
+    # MOV_SPR_XN on the MTE2 pipe is a special-register write that configures
+    # the next transfer, not a transfer, so counting every "MOV_" overstates
+    # the data movement. The page copies are the ND -> NZ converter moves, and
+    # there must be exactly one per chunk: the whole point of the layout is
+    # that a 16 x 256 INT8 page is one burst, not a strip schedule.
+    aic_pages = sum(1 for _, (_, p, o) in c_in.items()
+                    if p == "MTE2" and "MOV_OUT_TO_L1" in o)
+    aic_mte2_data = sum(1 for _, (_, p, o) in c_in.items()
+                        if p == "MTE2" and "MOV_" in o and "MOV_SPR" not in o)
+    if aic_pages != CHUNKS:
         raise SystemExit(
-            f"the Cube issued {aic_mte2} MTE2 moves, expected at least "
+            f"the Cube issued {aic_pages} GM -> L1 page moves, expected exactly "
+            f"{CHUNKS}, one ND -> NZ burst per chunk"
+        )
+    if aic_mte2_data != CHUNKS + 1:
+        raise SystemExit(
+            f"the Cube issued {aic_mte2_data} MTE2 data moves, expected "
             f"{CHUNKS + 1}: {CHUNKS} pages and the rotation table"
         )
     ub_moves = sum(1 for _, (_, _, o) in c_in.items() if "MOV_UB_TO_L1" in o)
@@ -295,8 +307,10 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
         print(f"  {name}: {total} instructions ({detail})")
     print(f"egress: AIV0 {stores['AIV0']} GM stores, AIV1 {stores['AIV1']} GM "
           f"stores, AIC {aic_stores}")
-    print(f"page staging: {aic_mte2} MTE2 moves on the Cube, {ub_moves} UB->L1 "
-          f"moves, so every page reached L1 from Global Memory directly")
+    print(f"page staging: {aic_pages} GM->L1 ND->NZ page moves and "
+          f"{aic_mte2_data} MTE2 data moves in all on the Cube, {ub_moves} "
+          f"UB->L1 moves, so every page reached L1 from Global Memory in one "
+          f"burst with no Unified Buffer hop")
 
     # ---- per-chunk cadence --------------------------------------------
     cube_ops = Counter(op.split()[0] for _, (_, pipe, op) in c_in.items()

@@ -303,11 +303,12 @@ AIV1 on ids 16..31; each core released 6 (2 primed plus one per owned chunk).
 `MMAD x64` on the Cube pipe is exactly 8 chunks × 8 channel groups.
 
 **Zero Global Memory workspace, and no UB hop for the page.** 0 Global Memory
-stores anywhere on the AIC, 0 `MOV_UB_TO_L1` moves, and 18 MTE2 moves in all
-for the rotation table and the eight pages, which is two bursts each — so every
-page reached L1 straight from Global Memory. Egress is 8 Global Memory stores
-per Vector core, one packed page and one scale slice for each of its four
-chunks.
+stores anywhere on the AIC, 0 `MOV_UB_TO_L1` moves, and on the MTE2 pipe
+exactly **8 `MOV_OUT_TO_L1_MULTI_ND2NZ` page moves, one per chunk**, plus one
+`MOV_SRC_TO_DST_ALIGNv2` for the rotation table: 9 data moves in all, so a
+16×256 INT8 page crosses into L1 as a single ND→NZ burst rather than a strip
+schedule. Egress is 8 Global Memory stores per Vector core, one packed page and
+one scale slice for each of its four chunks.
 
 **Four engines in flight together.** Dispatch ticks place the window:
 
@@ -331,6 +332,102 @@ concurrently in flight for 12859 cycles, widest 703..8168. Engine busy cycles:
 MTE2 4063, Cube 5139, Vector 16007, MTE3 3843. Pairwise overlaps, cycles:
 Cube+Vector 4714, Cube+MTE2 3911, Vector+MTE2 3632, Vector+MTE3 3615,
 Cube+MTE3 739, MTE2+MTE3 607.
+
+## Profiling — `msprof op simulator`
+
+Two of the three msprof modes do not apply to a CAModel-linked binary, and the
+first one says so:
+
+```
+msprof op   -> [ERROR] Device profiling is not supported on current chip.
+               [INFO]  Use msprof op --help or msprof op simulator --help
+msprof      -> runs the probe to PASS, then
+               [ERROR] Failed to find profiling data, please check that the
+               application executes AI-related business ...   exit 255
+```
+
+The application profiler reads the driver's counters and the CAModel driver
+stub has none. `msprof op simulator` is the mode that does apply:
+
+```sh
+/usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin/msprof op simulator \
+    --application=/tmp/a8-explicit/test_camodel_turboquant_reshape_and_cache_a8 \
+    --output=/tmp/a8-prof/sim \
+    --soc-version=Ascend950PR_9599 \
+    --aic-metrics=PipeUtilization \
+    --kernel-name=turboquant_reshape_and_cache_a8 \
+    --launch-count=1 --timeout=30
+```
+
+Exit 0, `All task success`, 5907 relations extracted from the kernel
+`turboquant_reshape_and_cache_a8_0_mix_aic`, and the probe still printed its
+own PASS underneath. Its core summary:
+
+| core | duration (us) | running (us) | stalled |
+| --- | ---: | ---: | ---: |
+| core0.cubecore0 | 7.10 | 7.05 | 0.05 |
+| core0.veccore0 | 10.75 | 8.93 | 1.82 |
+| core0.veccore1 | 8.17 | 8.17 | 0.00 |
+
+AIV0 is the critical path, and it is the only core with meaningful stall.
+
+The per-instruction CSVs under `simulator/<core>/` carry the detail. `cycles`
+there is issue-to-complete latency accumulated per instruction site, so the
+per-core totals exceed the kernel span and the column ranks hot spots rather
+than measuring occupancy:
+
+```
+core0.cubecore0   696 issues, 64826 accumulated cycles
+  FIXP     43.7%   FIX_L0C_TO_DST  64 x 15790   MOV_SPR_XN 64 x 12538
+  FLOWCTRL 33.6%   WAIT_INTRA_BLOCK 12 calls, 21767 cycles
+  MTE2     10.2%   MOV_OUT_TO_L1_MULTI_ND2NZ 8 x 4735, ALIGNv2 1 x 574
+  SCALAR    6.2%
+  MTE1      3.5%   LOAD_2Dv2 66 x 2272
+  CUBE      2.8%   MMAD 64 x 1792  (28 cycles per Mmad)
+
+core0.veccore0  16689 issues, 170437 accumulated cycles
+  RVECLD   28.1%   RV_VLD 4264 x 43900
+  RVECEX   24.4%   RV_PLT 1777 x 10662, RV_VMULS 842 x 6736,
+                   RV_VCVT_I2F 512 x 4096, RV_VMUL 512 x 4096
+  RVECST   23.4%   RV_VST 3235 x 38803
+  PUSHQ     9.8%   VF 61 x 16407
+  SCALAR    7.4%
+  MTE3      2.6%   MOV_SRC_TO_DST_ALIGNv2 9 x 5022
+```
+
+core0.veccore1 is the same profile to within 0.4%: 16693 issues and 171068
+cycles against 16689 and 170437, with identical call counts on every vector
+mnemonic. Two findings this report had reached from the dumps, now with
+msprof's own numbers behind them:
+
+* **the Cube waits on the Vector cores for a third of its attributed cycles.**
+  12 `WAIT_INTRA_BLOCK` calls account for 21767 of 64826 cycles, which is the
+  panel-free back edge and the epilogue drain, averaging 1814 cycles per wait.
+  The Mmads themselves are 1792 cycles in total — the Cube spends twelve times
+  longer waiting for a panel than multiplying.
+* **the Vector cost is register traffic, not arithmetic.** `RV_VLD` plus
+  `RV_VST` is 82703 of 170437 cycles, 48.6%, against 24.4% for the whole
+  execute pipe. A level-2 op over a 4096-element panel is 64 register repeats,
+  and the key-chunk fold ladder's narrow stages waste most of a 64-lane
+  register per repeat.
+
+`code_exe.csv` is empty, with
+`[WARN] Failed to parse pc to code, maybe kernel missed debug_line
+information`: source-line attribution needs the kernel rebuilt with `-g`. That
+is one more build cycle and has not been done.
+
+### One correction this profiling forces
+
+The V4 section above previously read "18 MTE2 moves in all for the rotation
+table and the eight pages, which is two bursts each". **That was wrong**, and
+it was wrong because `analyze_reshape_trace.py` counted every MTE2 instruction
+whose mnemonic contains `MOV_`. Ten of those 18 are `MOV_SPR_XN`, special
+register writes that configure the next transfer and move no data. The page
+staging is one `MOV_OUT_TO_L1_MULTI_ND2NZ` per chunk and one `ALIGNv2` for the
+table: 9 data moves, not 18, and never "two bursts each". The analyzer now
+counts the ND→NZ converter moves separately and asserts **exactly one per
+chunk**, which is a stronger check than the `>= CHUNKS + 1` it replaced, and
+the corrected check passes on the same traces.
 
 ## Reproducibility
 
@@ -384,7 +481,15 @@ cycles, which is model start-up, not kernel behaviour.
 
 ## Retractions
 
-None. This is the first revision of this operator, and it contradicts no
+**One, in this report's own first revision.** It claimed 18 MTE2 moves for the
+page staging, "two bursts each", because the trace analyzer counted
+`MOV_SPR_XN` special-register writes as data movement. `msprof op simulator`
+shows 8 `MOV_OUT_TO_L1_MULTI_ND2NZ` page moves and 1 `ALIGNv2` for the rotation
+table. The analyzer has been corrected and now asserts exactly one ND→NZ page
+move per chunk; see the profiling section above. Nothing else in the report
+depended on the figure, and no numeric result changed.
+
+Beyond that, this is the first revision of this operator and it contradicts no
 earlier claim in this repository. Two claims elsewhere that it *relies* on and
 that held up: section 6.1's retraction (the UB→L1 path exists) is not used here
 because the page never enters the Unified Buffer, and section 6.2a's retraction
