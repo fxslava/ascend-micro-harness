@@ -6,6 +6,13 @@ AIV, and the two-tier verification methodology — are in
 [`MICROROUTINE_DESIGN_GUIDELINES.md`](MICROROUTINE_DESIGN_GUIDELINES.md).
 Read it before adding a routine.
 
+[`SKELETON_KERNEL_WORKFLOW.md`](SKELETON_KERNEL_WORKFLOW.md) is the procedure
+that enforces those rules: where a new kernel goes, how to wire its build and
+launch ABI, and the five verification stages with the gate each one must pass
+— compile-time invariants, Tier-1 host model, CAModel at the ring depth,
+CAModel past the ring depth for steady state, and the trace audit. Each stage
+catches a class the previous one is blind to, which is why none is optional.
+
 The three-stage modulo synchronization probe is documented in
 [`reports/modulo3_deadlock_probe.md`](reports/modulo3_deadlock_probe.md). Run it
 under WSL/CAModel with `bash scripts/run_modulo3_camodel.sh`.

@@ -7,6 +7,8 @@ description: Create or revise diagnostic Ascend C kernel skeletons in the ascend
 
 Work in `C:\Ascend\ascend-micro-harness`. A skeleton proves a specific launch, memory, or scheduling property with the smallest useful device operations. It is not evidence that omitted production arithmetic is correct or fast.
 
+Follow `SKELETON_KERNEL_WORKFLOW.md` for the end-to-end procedure and the five verification stages (V0 compile-time, V1 Tier-1 host, V2 CAModel at the ring depth, V3 CAModel past the ring depth for steady state, V4 trace audit, V5 report). `MICROROUTINE_DESIGN_GUIDELINES.md` holds the rules those stages enforce. The sections below summarise the same ground; where they differ, the two documents in the repository are current.
+
 ## Choose the artifact
 
 - Put a named diagnostic kernel in `kernels/skeleton/<kernel_name>.cpp`. Match the exported `extern "C" __global__ __aicore__` symbol and CANN host launcher to that name. See `kernels/skeleton/turboquant_reshape_and_cache.cpp` for the existing three-stage example.
