@@ -155,6 +155,26 @@ Therefore the header exposes the endpoint conversion explicitly and hardware
 or CAModel validation against the installed CANN version remains necessary.
 The proof report must not be described as that hardware validation.
 
+### CAModel integration counterexample (Ascend950PR_9599, CANN 9.2.0-beta.2)
+
+An attempted integration of the generated four-color mapping into
+`turboquant_reshape_and_cache_a8.cpp` built in Release mode and completed the
+16-token CAModel fixture with bit-exact caches and intact guards. Its
+instruction trace nevertheless refuted the required consuming-wait premise:
+on AIV1, READY channel 16 was set by AIC at cycle 4906, waited at 4916,
+**waited again at 7589**, and only set for the second chunk at 8621. The
+second wait therefore passed 1032 cycles before its matching notification.
+The old `analyze_reshape_trace.py` correctly rejected repeated IDs after the
+apparently successful numerical run. The attempted kernel integration was
+reverted; the existing one-ID-per-event schedule remains in place.
+
+The abstract proof in `safe_pipeline_proof.json` remains valid under its
+explicit consuming-latch semantics, but it is **not a hardware refinement
+proof** for this CAModel configuration. Reusing READY/FREE IDs in a production
+kernel requires an independently verified clear operation or another
+generation-aware handshake. Passing numerical output on one simulator run
+does not establish that property.
+
 ## Negative controls
 
 Every normal run checks missing FIX_S, missing V_S, missing FREE_ACK waits,

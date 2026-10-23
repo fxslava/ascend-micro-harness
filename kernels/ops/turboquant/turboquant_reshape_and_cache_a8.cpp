@@ -514,10 +514,10 @@ static_assert(kFlagPanelFreeSet<0u> == kFlagPanelFreeWait<2u * kLandDepth>,
               "the release after a chunk must be the token the Cube waits for "
               "when that landing slot comes round again");
 
-// Intra-core HardEvent ids. 6 and 7 are reserved, so slot ids stay below 4 and
-// the prologue and epilogue use 4.
+// Intra-core HardEvent ids. The table-copy barriers finish before slot 0 is
+// primed, so their route-local ID 0 cannot collide with the ring's slot 0.
 constexpr std::int32_t kEvtL0 = 0;
-constexpr std::int32_t kEvtEpilogue = 4;
+constexpr std::int32_t kEvtEpilogue = 0;
 
 // ------------------------------------------------- compile-time column list
 using ChunkSeq = std::make_integer_sequence<std::uint32_t, kChunks>;
