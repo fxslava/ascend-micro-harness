@@ -98,8 +98,21 @@ endfunction()
 
 add_micro_camodel_probe(dequant4)
 add_micro_camodel_probe(cube_matmul)
+add_micro_camodel_probe(wta_fixpipe)
+add_executable(test_wta_convergence_probe tests/test_wta_convergence_probe.cpp)
+target_compile_options(test_wta_convergence_probe PRIVATE -Wall -Wextra -Werror)
 add_micro_camodel_probe(normalize_store)
 add_micro_camodel_probe(online_softmax)
+
+# AIV-only inverse-CDF int4x2 quantization. The tile count is a build
+# parameter: 4 is the depth-2 ring boundary (V2), 8 wraps every slot twice
+# (V3).
+add_executable(test_icdf_quantize_probe tests/test_icdf_quantize_probe.cpp)
+target_compile_options(test_icdf_quantize_probe PRIVATE -Wall -Wextra -Werror)
+add_micro_camodel_probe(icdf_quantize)
+add_micro_camodel_probe(icdf_quantize_8tiles
+    kernels/camodel/icdf_quantize.cpp
+    ICDF_QUANT_TILES=8)
 
 # The fused operator's page count is a build parameter, so one kernel source
 # serves both probes: the three-page depth boundary that established the
