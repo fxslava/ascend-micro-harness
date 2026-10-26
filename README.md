@@ -5,7 +5,13 @@
 `tests/cpu/` contains host-only oracle probes; `tests/camodel/` contains CANN
 simulator runners; `tests/npu/validation/` and `tests/npu/bench/` contain physical
 NPU tests. The NPU build uses CANN 9.2, `RUN_MODE=npu`, Ascend950PR_9599 and
-BiSheng through `ascendc_library`. From PowerShell, compile both NPU targets:
+BiSheng through `ascendc_library`.
+
+The BF16 comparison kernel is vendored under
+[`kernels/ops/turboquant/baseline/`](kernels/ops/turboquant/baseline/); building
+does not require a separate `vllm-ascend` checkout.
+
+From PowerShell, compile both NPU targets:
 
 ```powershell
 & .\scripts\build_turboquant_npu.ps1

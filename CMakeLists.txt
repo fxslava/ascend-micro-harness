@@ -149,13 +149,8 @@ if(RUN_MODE STREQUAL "npu")
     list(APPEND CANN_SYSTEM_OPTIONS
         "-isystem${ASCEND_HOME_PATH}/x86_64-linux/${path}")
   endforeach()
-  set(VLLM_ASCEND_ROOT "/mnt/c/Ascend/vllm-ascend" CACHE PATH
-      "vllm-ascend checkout containing the BF16 baseline")
-  set(BASELINE_SOURCE
-      "${VLLM_ASCEND_ROOT}/csrc/attention/turboquant/op_kernel/turboquant_paged_attention.cpp")
-  if(NOT EXISTS "${BASELINE_SOURCE}")
-    message(FATAL_ERROR "BF16 baseline source not found: ${BASELINE_SOURCE}")
-  endif()
+  set(BASELINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/baseline")
+  set(BASELINE_SOURCE "${BASELINE_DIR}/turboquant_paged_attention.cpp")
   ascendc_library(turboquant_a8_npu SHARED
       kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp)
   ascendc_compile_definitions(turboquant_a8_npu PRIVATE ASCEND_MICRO_CANN_LAUNCH)
@@ -177,7 +172,7 @@ if(RUN_MODE STREQUAL "npu")
   add_executable(bench_turboquant_a8_vs_bf16
       tests/npu/bench/bench_turboquant_a8_vs_bf16.cpp)
   target_include_directories(bench_turboquant_a8_vs_bf16 PRIVATE
-      "${ASCEND_HOME_PATH}/include" "${VLLM_ASCEND_ROOT}/csrc/kernels")
+      "${ASCEND_HOME_PATH}/include" "${BASELINE_DIR}")
   target_link_libraries(bench_turboquant_a8_vs_bf16 PRIVATE
       turboquant_a8_npu turboquant_bf16_baseline_npu ascendcl)
   target_compile_options(bench_turboquant_a8_vs_bf16 PRIVATE -Wall -Wextra -Werror)
