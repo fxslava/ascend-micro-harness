@@ -2,7 +2,7 @@
 
 // Fixture and oracle for the inverse-CDF int4x2 quantization probes.
 //
-// Shared by tests/test_icdf_quantize_probe.cpp (Tier 1) and
+// Shared by tests/cpu/test_icdf_quantize_probe.cpp (Tier 1) and
 // tests/camodel/test_camodel_icdf_quantize.cpp (Tier 2) so both check against
 // the same bytes.
 //
@@ -26,7 +26,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "../routines/routine_vector_icdf_quantize.hpp"
+#include "../../routines/routine_vector_icdf_quantize.hpp"
 
 namespace icdf {
 

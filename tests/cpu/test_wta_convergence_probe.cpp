@@ -2,7 +2,7 @@
 #include <functional>
 #include <iostream>
 #include "wta_reference.hpp"
-#include "../routines/routine_cube_wta_fixpipe.hpp"
+#include "../../routines/routine_cube_wta_fixpipe.hpp"
 
 using namespace wta_test;
 

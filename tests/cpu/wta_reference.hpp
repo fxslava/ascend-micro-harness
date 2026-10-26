@@ -4,7 +4,7 @@
 #include <array>
 #include <cmath>
 #include <random>
-#include "../include/sim_micro_testbed.hpp"
+#include "../../include/sim_micro_testbed.hpp"
 
 namespace wta_test {
 using namespace ascend_micro::sim;

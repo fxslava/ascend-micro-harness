@@ -16,9 +16,8 @@
 //
 // What it deliberately omits
 // --------------------------
-//   * multi-core tiling. blockDim is 1. The 64-core form is the same kernel
-//     with the strip base advanced by GetBlockIdx() * tokensPerCore; nothing
-//     here measures it.
+//   * ragged multi-core tiling. Each block owns one aligned 16-token strip;
+//     the launcher uses numTokens / tokensPerCore blocks.
 //   * ragged shapes. numTokens == blockSize == 16, headSize == 256 and
 //     numKvHeads == 4 are compile-time constants (kTokens, kHeadSize,
 //     kHeads); the scalar arguments drive the physical cache addressing only.
@@ -1195,11 +1194,14 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_a8(
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     AscendC::InitSocState();
-    // This revision specialises the strip shape at compile time, so numTokens
-    // and tokensPerCore carry no device-side work; the runner asserts that they
-    // match kTokens. The remaining scalars drive the physical cache addressing.
+    // The pipeline is specialised to one 16-token strip per physical AI Core.
+    // Input and metadata bases advance together, while cache addresses come
+    // from the strip's first slot.
     (void)numTokens;
-    (void)tokensPerCore;
+    const uint32_t strip = AscendC::GetBlockIdx() * tokensPerCore;
+    key += strip * numKvHeads * headSize;
+    value += strip * numKvHeads * headSize;
+    slotMapping += strip;
     // piSigns is folded into `tables` by whoever builds it -- the sign diagonal
     // sits between the two Hadamard factors, so it is a property of the
     // resident rotation blocks (header equation (2)) and not of a Vector-side
@@ -1239,7 +1241,7 @@ extern "C" void launch_turboquant_reshape_and_cache_a8(
     std::uint32_t head_size, std::uint32_t block_size, std::uint32_t num_blocks,
     std::uint32_t tokens_per_core, float inv_sqrt_len)
 {
-    turboquant_reshape_and_cache_a8<<<1, nullptr, stream>>>(
+    turboquant_reshape_and_cache_a8<<<num_tokens / tokens_per_core, nullptr, stream>>>(
         const_cast<std::int8_t*>(key), const_cast<std::int8_t*>(value), key_cache,
         value_cache, scale_cache, const_cast<std::int32_t*>(slot_mapping),
         const_cast<float*>(pi_signs), const_cast<std::int32_t*>(tables), num_tokens,

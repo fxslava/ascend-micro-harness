@@ -20,7 +20,7 @@ see [the bug the rebalancing exposed](#the-bug-the-rebalancing-exposed-a-reused-
 Sources:
 [`kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp`](../kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp),
 [`tests/camodel/test_camodel_turboquant_reshape_and_cache_a8.cpp`](../tests/camodel/test_camodel_turboquant_reshape_and_cache_a8.cpp),
-[`tests/test_reshape_and_cache_a8_probe.cpp`](../tests/test_reshape_and_cache_a8_probe.cpp),
+[`tests/cpu/test_reshape_and_cache_a8_probe.cpp`](../tests/cpu/test_reshape_and_cache_a8_probe.cpp),
 [`scripts/analyze_reshape_trace.py`](../scripts/analyze_reshape_trace.py).
 
 ## Commands
@@ -37,7 +37,7 @@ The Tier-1 host probe:
 
 ```sh
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
-    tests/test_reshape_and_cache_a8_probe.cpp \
+    tests/cpu/test_reshape_and_cache_a8_probe.cpp \
     -o bin/test_reshape_and_cache_a8_probe
 bin/test_reshape_and_cache_a8_probe
 ```
@@ -259,7 +259,7 @@ in which both operand roles stay resident at once.
 
 ## V1 — host model
 
-`tests/test_reshape_and_cache_a8_probe.cpp`, 12.5 ms:
+`tests/cpu/test_reshape_and_cache_a8_probe.cpp`, 12.5 ms:
 
 ```
 PASS reshape_and_cache_a8 host probe in 12459.627 us

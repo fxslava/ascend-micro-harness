@@ -212,7 +212,7 @@ guard integrity is not inferred from those GM guards.
 Run from the repository in WSL with the specified CANN installation:
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/test_wta_convergence_probe.cpp \
+g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/cpu/test_wta_convergence_probe.cpp \
     -o /tmp/test_wta_convergence_probe
 /tmp/test_wta_convergence_probe
 /tmp/test_wta_convergence_probe --require-one-hot  # expected exit 1

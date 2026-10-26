@@ -4,13 +4,13 @@
 // fixture, then checks every packed output byte against the double oracle,
 // per tile (not just end-of-run), plus GM guard bands head and tail.
 //
-// The Tier 1 sensitivity analysis (tests/test_icdf_quantize_probe.cpp) bounds
+// The Tier 1 sensitivity analysis (tests/cpu/test_icdf_quantize_probe.cpp) bounds
 // the hardware deviation of the chain below the fixture's 1/16 boundary
 // margin, so this check runs with zero tolerance: every byte must match.
 // ICDF_QUANT_TILES is a build parameter (4 = ring-depth boundary, 8 = wraps
 // the depth-2 ring twice for V3).
 
-#include "../icdf_fixture.hpp"
+#include "../cpu/icdf_fixture.hpp"
 #include "camodel_common.hpp"
 
 #include <cstdint>

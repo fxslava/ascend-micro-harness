@@ -447,7 +447,7 @@ scores.
 
 ### Tier 1 — host discrete-event queue model (sub-millisecond)
 
-`tests/test_pipeline_deadlock_probe.cpp` runs a `QueueModel` that schedules
+`tests/cpu/test_pipeline_deadlock_probe.cpp` runs a `QueueModel` that schedules
 MTE2/Vector/MTE3 as independent queues over one-bit event tokens. It proves
 *structural* properties and nothing else:
 
@@ -456,7 +456,7 @@ MTE2/Vector/MTE3 as independent queues over one-bit event tokens. It proves
 - no double-`SetFlag` on a live event bit,
 - guard-band integrity of the mock buffers.
 
-The per-routine host probes (`tests/test_*_probe.cpp`) add a bit-exact scalar
+The per-routine host probes (`tests/cpu/test_*_probe.cpp`) add a bit-exact scalar
 oracle over `include/sim_micro_testbed.hpp` guarded buffers. Latest run:
 
 | Tier-1 probe | Result | Host time |

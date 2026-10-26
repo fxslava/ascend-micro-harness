@@ -40,7 +40,7 @@ if [[ "${mode}" != "run-only" && "${mode}" != "profile-only" ]]; then
     if [[ "${mode}" != "micro" ]]; then
         mkdir -p "${repo_dir}/bin"
         g++ -std=c++17 -O2 -Wall -Wextra -Werror -I"${repo_dir}/include" \
-            "${repo_dir}/tests/test_pipeline_deadlock_probe.cpp" \
+            "${repo_dir}/tests/cpu/test_pipeline_deadlock_probe.cpp" \
             -o "${repo_dir}/bin/test_pipeline_deadlock_probe"
         "${repo_dir}/bin/test_pipeline_deadlock_probe" \
             "${repo_dir}/bin/pipeline_queue_trace.csv"

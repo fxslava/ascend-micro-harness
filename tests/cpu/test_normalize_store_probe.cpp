@@ -4,8 +4,8 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "../include/sim_micro_testbed.hpp"
-#include "../routines/routine_vector_normalize_store.hpp"
+#include "../../include/sim_micro_testbed.hpp"
+#include "../../routines/routine_vector_normalize_store.hpp"
 
 using ascend_micro::sim::GuardedBuffer;
 using ascend_micro::sim::assert_aligned;

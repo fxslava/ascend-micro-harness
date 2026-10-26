@@ -1,5 +1,5 @@
 #include "camodel_common.hpp"
-#include "../wta_reference.hpp"
+#include "../cpu/wta_reference.hpp"
 #include <cstdlib>
 
 #define DECL(N, S) extern "C" void launch_wta_##N##S(void*, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int32_t*);

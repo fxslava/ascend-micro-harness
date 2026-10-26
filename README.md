@@ -1,5 +1,34 @@
 # Ascend 950PR 16×16 Cube Hadamard probe
 
+## Test domains and NPU TurboQuant harness
+
+`tests/cpu/` contains host-only oracle probes; `tests/camodel/` contains CANN
+simulator runners; `tests/npu/validation/` and `tests/npu/bench/` contain physical
+NPU tests. The NPU build uses CANN 9.2, `RUN_MODE=npu`, Ascend950PR_9599 and
+BiSheng through `ascendc_library`. From PowerShell, compile both NPU targets:
+
+```powershell
+& .\scripts\build_turboquant_npu.ps1
+```
+
+The script creates a fresh WSL ext4 build directory and prints its path.
+Compilation does not require an attached NPU. On a machine with a 950PR and
+working AscendCL device access, run the printed validation binary first, then
+the benchmark binary:
+
+```powershell
+wsl -- /tmp/ascend-turboquant-npu-XXXXXX/test_turboquant_a8_validation
+wsl -- /tmp/ascend-turboquant-npu-XXXXXX/bench_turboquant_a8_vs_bf16
+```
+
+Validation checks one 16-token strip and 512/1024-token contexts. Each strip
+uses one physical AI Core; all packed key and value nibbles and FP32 scale bits
+are compared with an independent integer Hadamard oracle. The benchmark uses
+50 warmups and 500 device-event samples per kernel in both warm and 128 MiB
+SDMA cache-pressure modes. The dummy copy does not guarantee full L2 invalidation.
+A8 and BF16 use different input precision and quantizers;
+the speedup is a wall-time comparison for the same 1024-token geometry.
+
 Micro-routine development rules — the zero-scalar-compute invariant, UB
 alignment and bank invariants (AKA3003), RAW/WAR hazard management inside the
 AIV, and the two-tier verification methodology — are in
@@ -80,7 +109,7 @@ compose back to all 65536 entries of it:
 
 ```sh
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
-    tests/test_reshape_and_cache_a8_probe.cpp \
+    tests/cpu/test_reshape_and_cache_a8_probe.cpp \
     -o bin/test_reshape_and_cache_a8_probe
 bin/test_reshape_and_cache_a8_probe
 ```
@@ -119,7 +148,7 @@ operation modeled by this leaf.
 ```sh
 mkdir -p bin
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
-    tests/test_hadamard16_probe.cpp -o bin/test_hadamard16_probe
+    tests/cpu/test_hadamard16_probe.cpp -o bin/test_hadamard16_probe
 bin/test_hadamard16_probe
 ```
 

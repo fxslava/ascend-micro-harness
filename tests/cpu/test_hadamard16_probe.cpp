@@ -4,7 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "../include/sim_micro_testbed.hpp"
+#include "../../include/sim_micro_testbed.hpp"
 
 using ascend_micro::OutflowMode;
 using ascend_micro::cube_hadamard16;

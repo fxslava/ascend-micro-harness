@@ -32,7 +32,7 @@
 //
 // Build and run:
 //   g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude
-//       tests/test_reshape_and_cache_a8_probe.cpp
+//       tests/cpu/test_reshape_and_cache_a8_probe.cpp
 //       -o bin/test_reshape_and_cache_a8_probe
 //   bin/test_reshape_and_cache_a8_probe
 

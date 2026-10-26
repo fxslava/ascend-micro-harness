@@ -8,8 +8,8 @@
 #include <stdexcept>
 #include <string>
 
-#include "../include/sim_micro_testbed.hpp"
-#include "../kernels/skeleton/turboquant_reshape_and_cache.cpp"
+#include "../../include/sim_micro_testbed.hpp"
+#include "../../kernels/skeleton/turboquant_reshape_and_cache.cpp"
 
 namespace probe = ascend_micro::modulo3;
 using ascend_micro::sim::GuardedBuffer;

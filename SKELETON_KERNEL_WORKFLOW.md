@@ -40,7 +40,7 @@ A claim you cannot name is a claim no verification stage can check.
 | Pipeline skeleton | `kernels/skeleton/<name>.cpp` | diagnostic, lightweight stage work |
 | Production operator | `kernels/ops/<family>/<name>.cpp` | the real fused thing |
 | CAModel runner | `tests/camodel/test_camodel_<name>.cpp` | ACL host, guarded buffers, oracle |
-| Tier-1 host probe | `tests/test_<name>_probe.cpp` | mock engines + scalar oracle |
+| Tier-1 host probe | `tests/cpu/test_<name>_probe.cpp` | mock engines + scalar oracle |
 
 Canonical examples to copy from: `kernels/skeleton/turboquant_reshape_and_cache.cpp`
 (marked-graph ring), `kernels/ops/turboquant/turboquant_paged_attention_opt.cpp`
@@ -157,12 +157,12 @@ build.
 
 Two separate things, both on the host:
 
-**(a) The discrete-event queue model** — `tests/test_pipeline_deadlock_probe.cpp`
+**(a) The discrete-event queue model** — `tests/cpu/test_pipeline_deadlock_probe.cpp`
 schedules MTE2 / Vector / MTE3 as independent queues over one-bit tokens and
 proves *structural* properties only: deadlock freedom, token-balance
 liveness, no double-`SetFlag` on a live bit, mock guard bands.
 
-**(b) A bit-exact scalar oracle** — `tests/test_<name>_probe.cpp` over
+**(b) A bit-exact scalar oracle** — `tests/cpu/test_<name>_probe.cpp` over
 `include/sim_micro_testbed.hpp`: `GuardedBuffer<T>` with 64-byte
 `0xDEADBEEF` canaries, `assert_aligned`, `require`, `float_bits`,
 `float_to_half_rne`, `float_to_bfloat16_rne`, `ASSERT_CANARY_INTACT`.
@@ -171,7 +171,7 @@ liveness, no double-`SetFlag` on a live bit, mock guard bands.
 bash scripts/run_modulo3_camodel.sh          # queue model + the modulo3 CAModel probe
 # or just the host leg:
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
-    tests/test_<name>_probe.cpp -o bin/test_<name>_probe && bin/test_<name>_probe
+    tests/cpu/test_<name>_probe.cpp -o bin/test_<name>_probe && bin/test_<name>_probe
 ```
 
 **Gate:** 0 deadlocks, sets == waits per `(route, ID)`, 0 residual tokens, all

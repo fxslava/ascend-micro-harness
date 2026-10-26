@@ -6,8 +6,8 @@
 #include <limits>
 #include <stdexcept>
 
-#include "../include/sim_micro_testbed.hpp"
-#include "../routines/routine_vector_online_softmax.hpp"
+#include "../../include/sim_micro_testbed.hpp"
+#include "../../routines/routine_vector_online_softmax.hpp"
 
 using ascend_micro::sim::GuardedBuffer;
 using ascend_micro::sim::assert_aligned;
