@@ -13,10 +13,10 @@ if [[ "${1:-all}" != "run-only" ]]; then
         echo "Use a fresh WTA_BUILD_DIR: CANN preprocessing mutates its object files; use run-only for an existing build." >&2
         exit 2
     fi
-    cmake -S "${repo}" -B "${build}" -DRUN_MODE=sim -DSOC_VERSION=Ascend950PR_9599 \
+    cmake -S "${repo}" -B "${build}" -DSOC_VERSION=Ascend950PR_9599 \
         -DASCEND_HOME_PATH="${toolkit}"
     cmake --build "${build}" --target test_camodel_wta_fixpipe test_wta_convergence_probe -j4
-    "${build}/test_wta_convergence_probe" | tee "${build}/tier1.log"
+    "${build}/lib/test_wta_convergence_probe" | tee "${build}/tier1.log"
 fi
 for sign in ${WTA_SIGNS:-1 0}; do
     for steps in ${WTA_STEPS:-1 2 3 4 5 6 7 8}; do
@@ -25,7 +25,7 @@ for sign in ${WTA_SIGNS:-1 0}; do
             mkdir -p "${dir}"
             (
                 cd "${dir}"
-                if ! timeout "${WTA_TIMEOUT:-60s}" "${build}/test_camodel_wta_fixpipe" \
+                if ! timeout "${WTA_TIMEOUT:-60s}" "${build}/lib/test_camodel_wta_fixpipe" \
                     "${steps}" "${sign}" 13 "${margin}" > run.log 2>&1; then
                     cat run.log >&2
                     exit 1

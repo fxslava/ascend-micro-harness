@@ -4,12 +4,23 @@
 
 `tests/cpu/` contains host-only oracle probes; `tests/camodel/` contains CANN
 simulator runners; `tests/npu/validation/` and `tests/npu/bench/` contain physical
-NPU tests. The NPU build uses CANN 9.2, `RUN_MODE=npu`, Ascend950PR_9599 and
-BiSheng through `ascendc_library`.
+NPU tests. One CANN 9.2 build includes both CAModel and NPU targets for
+Ascend950PR_9599, using BiSheng through `ascendc_library`.
 
 The BF16 comparison kernel is vendored under
 [`kernels/ops/turboquant/baseline/`](kernels/ops/turboquant/baseline/); building
 does not require a separate `vllm-ascend` checkout.
+
+From WSL with the CANN environment loaded, a default build compiles every
+CAModel and NPU target together:
+
+```sh
+cmake -S . -B /tmp/ascend-micro-all -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/ascend-micro-all -j4
+```
+
+Executables and their kernel shared libraries are placed together in
+`/tmp/ascend-micro-all/lib`.
 
 From PowerShell, compile both NPU targets:
 
@@ -23,8 +34,8 @@ working AscendCL device access, run the printed validation binary first, then
 the benchmark binary:
 
 ```powershell
-wsl -- /tmp/ascend-turboquant-npu-XXXXXX/test_turboquant_a8_validation
-wsl -- /tmp/ascend-turboquant-npu-XXXXXX/bench_turboquant_a8_vs_bf16
+wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/test_turboquant_a8_validation
+wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/bench_turboquant_a8_vs_bf16
 ```
 
 Validation checks one 16-token strip and 512/1024-token contexts. Each strip
@@ -63,12 +74,12 @@ puts five leaves in one `MIX_AIC_1_2` three-stage modulo pipeline over a ring
 of key pages, driving one Cube core and **both** Vector cores, with mode-4
 double-handshake flags and zero Global Memory workspace — the dequantised key
 page goes straight from Vector UB into Cube L1 over the dav-3510 MTE3 channel
-(`routines/routine_cv_transfer_ub_to_l1.hpp`). Its page count is a build
-parameter, so there are two probes over one kernel source:
+(`routines/routine_cv_transfer_ub_to_l1.hpp`). Its page count is a runtime
+option of one probe over one kernel source:
 
 ```sh
-bash scripts/run_modulo3_camodel.sh micro fused_attention_8tiles   # steady state
-bash scripts/run_modulo3_camodel.sh micro fused_attention_3tiles   # depth boundary
+bash scripts/run_modulo3_camodel.sh micro fused_attention 8   # steady state
+bash scripts/run_modulo3_camodel.sh micro fused_attention 3   # depth boundary
 ```
 
 Three pages never wrap the depth-3 ring, so that run measures a pipeline fill

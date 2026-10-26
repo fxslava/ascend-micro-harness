@@ -19,11 +19,11 @@ if [[ "${1:-all}" != "run-only" ]]; then
         echo "Use a fresh ICDF_BUILD_DIR: CANN preprocessing mutates its object files; use run-only for an existing build." >&2
         exit 2
     fi
-    cmake -S "${repo}" -B "${build}" -DRUN_MODE=sim -DSOC_VERSION=Ascend950PR_9599 \
+    cmake -S "${repo}" -B "${build}" -DSOC_VERSION=Ascend950PR_9599 \
         -DASCEND_HOME_PATH="${toolkit}"
     cmake --build "${build}" --target test_icdf_quantize_probe \
         test_camodel_icdf_quantize -j4
-    "${build}/test_icdf_quantize_probe" | tee "${build}/tier1.log"
+    "${build}/lib/test_icdf_quantize_probe" | tee "${build}/tier1.log"
 fi
 
 for tiles in 4 8; do
@@ -31,7 +31,7 @@ for tiles in 4 8; do
     mkdir -p "${dir}"
     (
         cd "${dir}"
-        if ! timeout "${ICDF_TIMEOUT:-180s}" "${build}/test_camodel_icdf_quantize" --tiles "${tiles}" > run.log 2>&1; then
+        if ! timeout "${ICDF_TIMEOUT:-180s}" "${build}/lib/test_camodel_icdf_quantize" --tiles "${tiles}" > run.log 2>&1; then
             cat run.log >&2
             exit 1
         fi

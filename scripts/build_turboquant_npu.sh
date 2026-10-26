@@ -14,9 +14,9 @@ source "${toolkit}/set_env.sh"
 set -u
 export ASCEND_HOME_PATH="${toolkit}"
 cmake -S "${repo}" -B "${build}" -G "Unix Makefiles" \
-    -DCMAKE_BUILD_TYPE=Release -DRUN_MODE=npu -DSOC_VERSION=Ascend950PR_9599 \
+    -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION=Ascend950PR_9599 \
     -DASCEND_HOME_PATH="${toolkit}"
 cmake --build "${build}" --target turboquant_npu_all -j 4
 echo "NPU binaries built at: ${build}"
-echo "Hardware only: ${build}/test_turboquant_a8_validation"
-echo "Hardware only: ${build}/bench_turboquant_a8_vs_bf16"
+echo "Hardware only: ${build}/lib/test_turboquant_a8_validation"
+echo "Hardware only: ${build}/lib/bench_turboquant_a8_vs_bf16"

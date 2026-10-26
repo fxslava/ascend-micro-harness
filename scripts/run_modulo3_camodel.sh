@@ -48,7 +48,7 @@ if [[ "${mode}" != "run-only" && "${mode}" != "profile-only" ]]; then
     fi
 
     cmake -S "${repo_dir}" -B "${build_dir}" -G "Unix Makefiles" \
-        -DCMAKE_BUILD_TYPE=Release -DRUN_MODE=sim -DSOC_VERSION="${soc}" \
+        -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION="${soc}" \
         -DASCEND_HOME_PATH="${toolkit}"
     if [[ "${mode}" == "micro" ]]; then
         cmake --build "${build_dir}" --target "test_camodel_${micro_name}" -j 4
@@ -63,10 +63,10 @@ fi
 cd "${build_dir}"
 if [[ "${mode}" == "micro" ]]; then
     if [[ "${micro_name}" == "fused_attention" ]]; then
-        timeout "${run_timeout}" "./test_camodel_${micro_name}" --tiles "${micro_tiles}" \
+        timeout "${run_timeout}" "./lib/test_camodel_${micro_name}" --tiles "${micro_tiles}" \
             2>&1 | tee "camodel_${micro_name}_run.log"
     else
-        timeout "${run_timeout}" "./test_camodel_${micro_name}" 2>&1 | tee "camodel_${micro_name}_run.log"
+        timeout "${run_timeout}" "./lib/test_camodel_${micro_name}" 2>&1 | tee "camodel_${micro_name}_run.log"
     fi
     if grep -Eiq '\[(error|fatal)\]|invalid ldst addr|unrecognize ldst addr' "camodel_${micro_name}_run.log"; then
         echo "CAModel reported execution errors" >&2
@@ -110,7 +110,7 @@ if [[ "${mode}" == "micro" ]]; then
             | tee "camodel_${micro_name}_event_summary.txt"
     fi
 else
-    timeout "${run_timeout}" ./test_pipeline_deadlock_probe_camodel | tee camodel_run.log
+    timeout "${run_timeout}" ./lib/test_pipeline_deadlock_probe_camodel | tee camodel_run.log
     python3 "${repo_dir}/scripts/analyze_modulo3_trace.py" \
         core0.veccore0.instr_popped_log.dump \
         core0.veccore0.instr_log.dump | tee camodel_trace_summary.txt
