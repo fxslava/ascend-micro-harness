@@ -66,20 +66,25 @@ struct Baseline {
     tq_npu::Buffer key, value, key_cache, value_cache, scale_cache, slots, signs, tables;
     explicit Baseline(const tq_npu::Fixture& f)
         : key(f.key.size() * 2), value(f.value.size() * 2),
-          key_cache(f.key_expected.size()), value_cache(f.value_expected.size()),
-          scale_cache(f.scales_expected.size() * sizeof(float)),
+          key_cache(f.shape.cache_bytes()), value_cache(f.shape.cache_bytes()),
+          scale_cache(f.shape.scale_floats() * sizeof(float)),
           slots(f.slots.size() * sizeof(std::int32_t)),
           signs(f.signs.size() * sizeof(float)), tables(2320 * sizeof(std::int32_t)) {
         key.upload(to_bfloat16(f.key)); value.upload(to_bfloat16(f.value));
         slots.upload(f.slots); signs.upload(f.signs); tables.upload(baseline_tables());
     }
     void launch(aclrtStream stream, const tq_npu::Fixture& f) {
+        // The baseline is an AIV-only kernel, so its blockDim is one strip per
+        // Vector core and its raw GetBlockIdx() is already the strip index.
         vllm_ascend::turboquant_reshape_and_cache_impl(
-            vllm_ascend::AscendType::BF16, stream, f.tokens / tq_npu::kBlockSize,
+            vllm_ascend::AscendType::BF16, stream,
+            static_cast<std::uint32_t>(f.strips()),
             key.ptr, value.ptr, key_cache.ptr, value_cache.ptr, scale_cache.ptr,
-            slots.ptr, signs.ptr, tables.ptr, f.tokens, tq_npu::kHeads,
-            tq_npu::kHeadSize, tq_npu::kBlockSize, f.blocks,
-            tq_npu::kBlockSize, tq_npu::kInvSqrtLen);
+            slots.ptr, signs.ptr, tables.ptr,
+            static_cast<std::uint32_t>(f.shape.num_tokens), tq_npu::kHeads,
+            tq_npu::kHeadSize, tq_npu::kBlockSize,
+            static_cast<std::uint32_t>(f.shape.num_blocks),
+            tq_npu::kBlockSize, f.shape.inv_sqrt_len());
     }
 };
 struct Events {
@@ -141,11 +146,21 @@ int main() {
         tq_npu::Buffer eviction_src(kEvictionBytes), eviction_dst(kEvictionBytes);
         tq_npu::check(aclrtMemset(eviction_src.ptr, eviction_src.bytes, 0xA5,
                                   eviction_src.bytes), "initialize eviction buffer");
-        const double a8_bytes = 2.0 * f.key.size() + 2.0 * f.key_expected.size() +
-                                f.scales_expected.size() * sizeof(float);
-        const double bf16_bytes = 4.0 * f.key.size() + 2.0 * f.key_expected.size() +
-                                  f.scales_expected.size() * sizeof(float);
-        std::printf("1024 tokens, 64 blocks, 64 AI Cores, 50 warmups, 500 device-event runs\n");
+        // Bytes actually moved, not bytes allocated: the cache is deliberately
+        // larger than the written pages (numBlocks is 2 * strips + 2, so a
+        // stray page offset has somewhere to land where the validation harness
+        // catches it), and counting the unwritten pages would halve both
+        // throughput figures.
+        const double written_cache =
+            static_cast<double>(f.strips()) * f.shape.page_bytes();
+        const double written_scales =
+            static_cast<double>(tq_oracle::kPlanes) * f.strips() * tq_npu::kHeads *
+            tq_npu::kBlockSize * sizeof(float);
+        const double a8_bytes = 2.0 * f.key.size() + 2.0 * written_cache + written_scales;
+        const double bf16_bytes = 4.0 * f.key.size() + 2.0 * written_cache + written_scales;
+        std::printf("%d tokens, %d strips over %d physical pages, 50 warmups, "
+                    "500 device-event runs\n",
+                    f.shape.num_tokens, f.strips(), f.shape.num_blocks);
         for (bool evict : {false, true}) {
             const char* mode = evict ? "pressure" : "warm";
             const Stats sa = measure(session.stream, [&] { a8.launch(session.stream, f); },

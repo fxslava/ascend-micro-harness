@@ -241,6 +241,19 @@
 #include "kernel_operator.h"
 #endif
 
+// Verification-only, and absent from every build that does not ask for it.
+// ASCEND_MICRO_SPARSE_SAMPLING is set on the CAModel probe's kernel library
+// and on its runner, never on the physical-device library, so a production
+// build of this file contains no sampling predicate, no extra branch and no
+// reference to anything under tests/. The header is shared rather than
+// duplicated here because the harness has to agree, block for block, about
+// which blocks execute: if it disagreed, the pages it expects to be canary and
+// the pages the device leaves canary would differ, and the failure would say
+// nothing about the kernel.
+#if defined(ASCEND_MICRO_SPARSE_SAMPLING)
+#include "../../../tests/common/turboquant_sampling.hpp"
+#endif
+
 namespace turboquant_a8 {
 
 // ------------------------------------------------------------ strip geometry
@@ -1197,8 +1210,43 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_a8(
     // The pipeline is specialised to one 16-token strip per physical AI Core.
     // Input and metadata bases advance together, while cache addresses come
     // from the strip's first slot.
+    // GetBlockIdx() is NOT the grid block index on a Vector core of a MIX
+    // launch. CANN 9.2 dav_3510 (GetBlockIdxImpl in
+    // asc/impl/basic_api/dav_3510/kernel_operator_sys_var_impl.h) returns
+    //
+    //   AIC:  get_block_idx()
+    //   AIV:  get_block_idx() * get_subblockdim() + get_subblockid()
+    //
+    // and the API reference says the same: at a 1:2 AIC:AIV ratio the AIC
+    // range is [0, numBlocks) and the AIV range is [0, 2 * numBlocks). Taken
+    // raw, the two Vector cores of block b therefore addressed strips 2b and
+    // 2b + 1 while their Cube read strip b: only AIV0 of block 0 agreed with
+    // its own Cube, every other core wrote another strip's page, and above
+    // numBlocks / 2 the page index left the cache entirely. Dividing by
+    // GetSubBlockNum() -- 1 on the AIC, the sub-block count on an AIV -- is
+    // the one expression both roles agree on, and it is what the vendored
+    // baseline's MixBlockIdx() has always done.
+    //
+    // At blockDim 1 the quotient is 0 either way, which is why eight chunks of
+    // one strip passed on CAModel and on silicon while 32 strips did not.
+    const uint32_t block = static_cast<uint32_t>(AscendC::GetBlockIdx() /
+                                                 AscendC::GetSubBlockNum());
+#if defined(ASCEND_MICRO_SPARSE_SAMPLING)
+    // Sparse boundary sampling, CAModel builds only. The skip is taken before
+    // anything is read, written, primed or announced, so a skipped block leaves
+    // no state at all: no HardEvent token, no mode-4 flag, no Global Memory
+    // write. That is also what makes it deadlock-free in a MIX launch -- the
+    // predicate is a function of the grid block index and of two host scalars,
+    // so a block's Cube and both of its Vector cores always reach the same
+    // decision, and a skipping group sets no flag its peers would wait on.
+    if (!tq_sampling::is_sampled(static_cast<int>(block),
+                                 static_cast<int>(numTokens / tokensPerCore))) {
+        return;
+    }
+#else
     (void)numTokens;
-    const uint32_t strip = AscendC::GetBlockIdx() * tokensPerCore;
+#endif
+    const uint32_t strip = block * tokensPerCore;
     key += strip * numKvHeads * headSize;
     value += strip * numKvHeads * headSize;
     slotMapping += strip;

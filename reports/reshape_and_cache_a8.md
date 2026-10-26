@@ -12,7 +12,7 @@ see [the bug the rebalancing exposed](#the-bug-the-rebalancing-exposed-a-reused-
 | Field | Value |
 | --- | --- |
 | What it proves | a four-stage ring with MTE2, Cube/Fixpipe, both Vector cores and MTE3 in flight together; the *complete* orthogonal rotation as INT8×INT8→INT32 Cube work fed straight from Global Memory into L1 with no Unified Buffer hop; a KV cache whose every nibble and every scale is reproduced bit for bit by an integer host oracle |
-| What it omits | multi-core tiling (`blockDim` is 1), ragged shapes, a non-page-aligned slot mapping, silicon |
+| What it omits | ragged shapes, a non-page-aligned slot mapping, silicon. Multi-core tiling is **no longer** omitted — see [the third revision](#third-revision-the-multi-block-block-index-and-one-golden-oracle) |
 | Target | `Ascend950PR_9599` CAModel, `__NPU_ARCH__ == 3510`, CANN 9.2.0-beta.2, `dav-3510` |
 | Kernel type | `KERNEL_TYPE_MIX_AIC_1_2`, `#error` on `__MIX_CORE_AIC_RATION__ == 1` |
 | Grid | 8 chunks (4 value heads then 4 key heads) over a depth-4 L1 page ring and depth-2 per-core UB rings, so **every ring wraps twice in one run** |
@@ -669,7 +669,8 @@ the one `msprof` drove from run 1's binary, printed the same PASS at total tick
   than the last one did.
 * **One strip, one core block.** `blockDim` is 1 and the 64-core saturation
   claim in the brief is untested: no run here advances the strip base by
-  `GetBlockIdx() * tokensPerCore`.
+  `GetBlockIdx() * tokensPerCore`. *Lifted in the third revision below, which
+  also found that the untested expression was wrong.*
 * **One shape.** `numTokens == blockSize == 16`, `headSize == 256`,
   `numKvHeads == 4`, one page-aligned slot mapping. `numTokens` and
   `tokensPerCore` reach the device unused, and `piSigns` now does too — a
@@ -681,6 +682,243 @@ the one `msprof` drove from run 1's binary, printed the same PASS at total tick
   Comparable across revisions of this kernel, not against each other. The audit
   also prints a load+store share of 69.0%, on the busy-interval denominator;
   that is not msprof's 38.4% measured differently, it is a different quantity.
+
+## Third revision: the multi-block block index, and one golden oracle
+
+The second revision's own limitation list said the quiet part out loud — *"no
+run here advances the strip base by `GetBlockIdx() * tokensPerCore`"* — and
+that untested expression was wrong. On a physical device at 512 tokens the
+kernel produced one partially-correct page out of 32.
+
+### Root cause
+
+`AscendC::GetBlockIdx()` is not the grid block index on a Vector core of a MIX
+launch. CANN 9.2's `dav_3510` implementation
+(`asc/impl/basic_api/dav_3510/kernel_operator_sys_var_impl.h`,
+`GetBlockIdxImpl`) returns
+
+```text
+AIC:  get_block_idx()
+AIV:  get_block_idx() * get_subblockdim() + get_subblockid()
+```
+
+and the API reference agrees — `GetBlockIdx.md`, Return Value: at a 1:2
+AIC:AIV ratio the AIC range is `[0, numBlocks)` and the AIV range is
+`[0, 2 * numBlocks)`. So the two Vector cores of block *b* addressed strips
+*2b* and *2b+1* while their Cube read strip *b*:
+
+- only AIV0 of block 0 agreed with its own Cube, and it owns just the even
+  chunks — value heads 0 and 2, key heads 0 and 2, `8192` cache bytes and
+  `64` scales out of a 512-token total of `528384` comparisons;
+- every other Vector core wrote a page belonging to another strip;
+- every core with an AIV index at or above `numBlocks` computed a page past
+  the end of the cache and wrote there, and read `slotMapping` past its end
+  to do it. The old harness sized the cache to exactly the written pages and
+  filled nothing with a canary, so those writes landed in other allocations
+  silently.
+
+At `blockDim == 1` the quotient is 0 either way, which is exactly why the
+second revision's eight-chunk single-strip runs passed, twice, on CAModel and
+on silicon. The repo's own vendored baseline had the fix all along, in
+`baseline/common/turboquant_common.h`: `MixBlockIdx()` divides by
+`GetSubBlockNum()`, which is 1 on the AIC and the sub-block count on an AIV.
+The kernel now does the same.
+
+### One golden oracle
+
+There were three implementations of the rotation and the quantiser: one in the
+CAModel runner, one in the device harness, one in the Tier-1 host probe. They
+agreed by inspection, which is not a property anything checks. All three now
+consume `tests/common/turboquant_oracle.hpp`, which owns the primitives, the
+activation fixture, the slot mapping, the resident-table construction, the
+reference caches and a fixture self-audit. Two deliberate exceptions:
+
+- the Tier-1 probe keeps its own `factored()` — a radix-2 butterfly cascade —
+  because its check 2 is only meaningful if two structurally different
+  applications of *M* agree in value while differing in form;
+- each harness maps the kernel's chunk numbering (value heads first, then key
+  heads) to `(plane, head)` itself. That numbering belongs to the kernel's
+  schedule, not to the golden model.
+
+The probe now also composes **the very table blob the runners upload** against
+the *M* it has just proved orthogonal, rather than against a local rebuild of
+it: 65536/65536 entries.
+
+### The harness changes that make a multi-page run able to fail
+
+The old device fixture used `slots[t] = t` with `numBlocks = tokens /
+blockSize`. That is degenerate three ways, and each is now fixed in the shared
+oracle:
+
+| old | new | what it buys |
+| --- | --- | --- |
+| page index == grid block index | strip *s* owns page *2s+1* | a kernel that takes its page from `GetBlockIdx()` instead of `slotMapping[0]` now fails |
+| `numBlocks == strips` | `numBlocks == 2 * strips + 2` | a stray page offset lands on a canary page instead of a neighbour's correct one |
+| outputs uninitialised | `0xAA` (device) / `0xDEADBEEF` (CAModel) pre-fill | "never written" and "written wrong" are different diagnoses |
+| one aggregate mismatch count | per-page verdicts, plus a scan for *whose* data is on a wrong page | a block-index error is named, not just counted |
+
+### What was actually run
+
+No NPU on this host, so the CAModel is the gate. `--slices N` collapses the
+grid: the obligation is that strip *t*'s addressing is a function of *t* alone,
+uniform in *t*, with state carried only through the per-core L1 and UB rings.
+
+```text
+scripts/run_reshape_a8_camodel.sh          # strips 1, 2, 3
+```
+
+| strips | tokens | verdict | total tick | model wall |
+| --- | --- | --- | --- | --- |
+| 1 | 16 | PASS | 13093 | 45.7 s |
+| 2 | 32 | PASS | 13205 | 53.9 s |
+| 3 | 48 | PASS | 13321 | 61.3 s |
+| **32** | **512** | **PASS** | 13353 | 245 s |
+
+32 strips is the shape the device run failed on. All 32 blocks executed and
+every byte matched: `262144/262144` key bytes, `262144/262144` value bytes and
+`4096/4096` FP32 scales — the same 528384 comparisons that previously reported
+512342 mismatches, now exact — with the 34 pages no block wrote still holding
+their canary and all 1024 guard bytes intact.
+
+Bit-exact in every case: all key bytes, all value bytes, all FP32 scales, and
+every byte and scale float on the pages no strip owns still carrying its
+canary. The fixture audit holds at each grid — 16/16 nibbles exercised, range
+exactly `[-8, 7]`, the INT4 upper clamp taken, four distinct scale exponents,
+and per-strip chunk maxima and packed pages pairwise distinct.
+
+The tick count is flat in the strip count (+112 per strip) because the model
+has 32 AI Cores, each with 2 Vector cores, so the strips dispatch
+concurrently; the ~8 s of wall clock per strip is simulator cost, not
+simulated time. **Concurrent multi-block dispatch is therefore what these runs
+verify.**
+
+### The control: does the gate catch the bug?
+
+A pass means nothing if the gate cannot fail. A copy of the tree with the
+pre-fix expression restored, built and run at **2 strips**:
+
+```text
+control kernel line:
+  (void)block; const uint32_t strip = static_cast<uint32_t>(AscendC::GetBlockIdx()) * tokensPerCore;
+control exit code: 1
+FAIL turboquant_reshape_and_cache_a8 (2 slices): keyCache byte on a page no strip owns was overwritten
+```
+
+Two strips is enough, and the failure is reported as a canary violation on an
+unowned page — the diagnostic the fragmented mapping and the spare pages were
+added to produce. The working tree was not modified: the control builds from a
+copy under `/tmp`.
+
+### Build gates
+
+Both target sets build clean with `-std=c++17 -Wall -Wextra -Werror`:
+`scripts/build_turboquant_npu.sh` produces `test_turboquant_a8_validation` and
+`bench_turboquant_a8_vs_bf16` (compile-only — there is no device here), and the
+Tier-1 probe builds and passes with the documented one-liner. A host
+`g++ -fsyntax-only` pass over the four test translation units is the fast
+pre-gate; it catches harness breakage in seconds instead of after a CANN build.
+
+### Compile-time sparse boundary sampling
+
+A full 64-strip run is ~550 s of model wall clock and the strips are
+independent, so most of it re-proves one thing. With
+`ASCEND_MICRO_SPARSE_SAMPLING` — set on the CAModel probe's kernel library and
+its runner, and on nothing else, so the physical-device library contains no
+sampling predicate at all — only part of each wave executes:
+
+| per 32-block wave | indices | what it is for |
+| --- | --- | --- |
+| first `kSampleEdge` = 4 | 0-3 | the wave's cold start |
+| `kSampleCenter` = 4 at the midpoint | 14-17 | the steady-state interior step |
+| last `kSampleEdge` = 4 | 28-31 | the wave's tail, and the highest block indices |
+
+24 of 64 blocks, 12 of 32. Every other block returns from the kernel entry
+before it reads, writes, primes or announces anything, so it leaves no
+HardEvent token, no mode-4 flag and no Global Memory write; the runner then
+*requires* its page to still hold the canary, which is what makes a skipped
+block's silence checkable rather than assumed. The predicate
+(`tests/common/turboquant_sampling.hpp`) is a function of the grid block index
+and of `numTokens / tokensPerCore`, so a block's Cube and both its Vector
+cores always reach the same decision — an inconsistent predicate would
+deadlock rather than misreport — and the sample set is pinned by
+`static_assert` so a change to the constants that silently drops an end or the
+interior fails the build.
+
+The interior cluster is the half of this that earns its place. The boundary
+blocks are contiguous, so only the unowned even pages separate the pages they
+write; a center block is surrounded by *skipped* blocks, so the odd pages on
+either side of its page belong to strips that never ran. A burst that overran
+its 2 KiB — a mis-scaled offset, an interconnect or L2 write-combining effect —
+therefore has a canary to land on. The runner asserts that every written page
+has an unwritten page on both sides and reports the count.
+
+Measured on the same shape and the same source: 32 strips in **118 s** sampled
+(12 blocks) against **245 s** full (32 blocks), both PASS and bit-exact over
+the blocks that ran.
+
+### Open: a grid wider than the AI Core count hangs
+
+**This is unresolved, and it is not caused by the fix or by sampling.**
+
+At 64 strips the model spins: 25 min of CPU at 143% with no output after
+`Model Start Time`, against ~200-240 s expected. A `wait_intra_block` that
+never resolves looks exactly like this, because the model spins the flag wait
+rather than parking. 33 strips, where exactly one core takes a second block,
+showed the same signature before the run was stopped.
+
+What is established:
+
+| core reuse | skipped blocks | verdict |
+| --- | --- | --- |
+| no (32 blocks, 32 cores) | no | PASS |
+| no (32 blocks, 32 cores) | yes, 20 of 32 | PASS |
+| yes (64 blocks) | yes, 40 of 64 | spins |
+| yes (33 blocks) | yes, 20 of 33 | no verdict before it was stopped |
+
+So skipping alone is harmless and 32 concurrent blocks are fine — which also
+establishes that mode-4 scope is per core group rather than per device. The new
+variable is a physical core executing a second block inside one launch, which
+had never happened before: this kernel had only ever run at `blockDim` 1, and
+32 blocks on 32 cores is one block each.
+
+Flag residue does not explain it. Per block every mode-4 id is set exactly once
+and waited exactly once, so a counting semaphore and a test-and-clear level bit
+both leave zero, and a level bit that a wait does *not* clear would leave every
+id set — which makes the second block's waits pass immediately and produces
+wrong data, not a spin. That points at the dispatch of a MIX grid wider than
+the core count rather than at the kernel's flag accounting, but the isolating
+run (33 strips with sampling compiled out, which has core reuse and no skipped
+blocks) was stopped before it finished, so the cause is **not** isolated and
+nothing here should be read as naming one.
+
+The architectural answer, independent of the cause, is a persistent grid-stride
+kernel: launch `min(strips, cores)` blocks and have each core loop
+`for (s = block; s < total; s += GetBlockNum())` with the resident tables
+hoisted out of the loop and an explicit drain at each iteration boundary. Then
+the grid never exceeds the core count, and successive strips on one core are
+sequential iterations whose flag accounting the kernel controls. Note for
+whoever writes it: `GetBlockIdx()` must be divided by `GetSubBlockNum()` and
+`GetBlockNum()` must **not** be — `GetBlockNum.md` says its return value is
+`numBlocks` on both roles, so dividing it would give a stride of 32 on the Cube
+and 16 on its Vector cores, and the two roles would disagree about the
+iteration count. That is a deadlock, not a wrong answer.
+
+Until that lands, **the 1024-token shape is unvalidated here**, and on silicon
+it is suspect for the same reason if the part has 32 or fewer AI Cores.
+
+### What this revision still does not claim
+
+- **Nothing about silicon.** Every result above is "executes on the
+  cycle-accurate model and matches the audited golden". The device run that
+  started this is not repeated here, because the device is not here.
+- **Nothing about performance at scale.** The strips are independent and the
+  tick count is flat, so there is no new timing claim; the 64-core saturation
+  question in the brief remains open and belongs to hardware.
+- **Nothing above a grid of 32.** See the open item above: 64 strips spins, and
+  the cause is not isolated.
+- **Shapes are unchanged.** `blockSize == tokensPerCore == 16`,
+  `headSize == 256`, `numKvHeads == 4`, one strip per page, no ragged tail.
+  `numTokens` still reaches the device unused.
 
 ## Retractions
 

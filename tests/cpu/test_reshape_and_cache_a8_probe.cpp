@@ -38,6 +38,8 @@
 
 #include "sim_micro_testbed.hpp"
 
+#include "../common/turboquant_oracle.hpp"
+
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -49,28 +51,39 @@ namespace {
 using ascend_micro::sim::GuardedBuffer;
 using ascend_micro::sim::require;
 
+// The primitives, the resident-table construction and the round-half-to-even
+// shift come from the shared oracle, so this probe checks the objects the two
+// device runners actually use rather than a copy of them that could drift.
+// `factored()` below is deliberately NOT shared: it is a second, structurally
+// different application of M -- a radix-2 butterfly cascade over the channel
+// group index -- and check 2 is only meaningful because the two disagree in
+// form while agreeing in value.
+using tq_oracle::hadamard;
+using tq_oracle::parity;
+using tq_oracle::pi_sign;
+using tq_oracle::rint_even_shift;
+
 constexpr int kTokens = 16;
 constexpr int kHeadSize = 256;
-constexpr int kGroup = 32;
+constexpr int kGroup = tq_oracle::kGroup;
 constexpr int kGroups = kHeadSize / kGroup;
 constexpr int kPanel = kTokens * kHeadSize;
 constexpr int kPackedBytes = kPanel / 2;
 constexpr int kBlockSize = kTokens;
-constexpr float kInvSqrtLen = 1.0f / 16.0f;
 constexpr int kBlockElems = kGroup * kGroup;  // one resident 32x32 INT8 block
 constexpr int kTableBlocks = 2 * kGroups;     // one per (sign, source group)
 
-int parity(unsigned v)
+tq_oracle::Shape probe_shape()
 {
-    int p = 0;
-    while (v) {
-        p ^= static_cast<int>(v & 1u);
-        v >>= 1;
-    }
-    return p;
+    tq_oracle::Shape shape;
+    shape.num_tokens = kTokens;
+    shape.num_kv_heads = 1;
+    shape.head_size = kHeadSize;
+    shape.block_size = kBlockSize;
+    shape.num_blocks = 1;
+    return shape;
 }
-int hadamard(int i, int j) { return parity(static_cast<unsigned>(i & j)) ? -1 : 1; }
-int pi_sign(int ch) { return ((ch * ch + 3 * ch + 1) % 7 < 3) ? -1 : 1; }
+const float kInvSqrtLen = probe_shape().inv_sqrt_len();
 
 // The device transform, written as one dense matrix. Row ch_out, column ch_in.
 //
@@ -87,19 +100,6 @@ int dense_entry(int ch_out, int ch_in)
     const int c1_in = ch_in / kGroup, c0_in = ch_in % kGroup;
     const int mid = c1_in * kGroup + c0_out;
     return hadamard(c1_out, c1_in) * pi_sign(mid) * hadamard(c0_out, c0_in);
-}
-
-long long rint_even_shift(long long y, int shift)
-{
-    if (shift <= 0) return y << (-shift);
-    const long long den = 1LL << shift;
-    long long q = y / den;
-    const long long rem = y % den;
-    if (rem == 0) return q;
-    const long long twice = 2 * (rem < 0 ? -rem : rem);
-    const bool away = (twice > den) || (twice == den && (q % 2 != 0));
-    if (away) q += (y >= 0 ? 1 : -1);
-    return q;
 }
 
 // The runner's factored oracle, verbatim in structure: inner Hadamard per
@@ -139,15 +139,7 @@ void factored(const int* x, long long* y)
     for (int i = 0; i < kPanel; ++i) y[i] = a[i];
 }
 
-unsigned mix(unsigned h)
-{
-    h ^= h >> 16;
-    h *= 0x7feb352du;
-    h ^= h >> 15;
-    h *= 0x846ca68bu;
-    h ^= h >> 16;
-    return h;
-}
+unsigned mix(unsigned h) { return tq_oracle::mix(h); }
 
 }  // namespace
 
@@ -221,20 +213,21 @@ int main()
         ASSERT_CANARY_INTACT(dense_out);
 
         // ---- 3. the Cube's resident blocks compose to M ------------------
-        // Build `tables` exactly as the runner uploads it, then compose it the
-        // way the kernel does - output group c1 takes source group g through
-        // block parity(c1 & g) * kGroups + g - and compare against M. This is
-        // the device's arithmetic in its entirety: 64 of these 32x32 blocks per
-        // chunk, accumulated eight at a time into one L0C region.
+        // `tables` here is the very blob the runners upload -- produced by
+        // tq_oracle::build_tables, not rebuilt locally -- composed the way the
+        // kernel composes it: output group c1 takes source group g through
+        // block parity(c1 & g) * kGroups + g. That is the device's arithmetic
+        // in its entirety: 64 of these 32x32 blocks per chunk, accumulated
+        // eight at a time into one L0C region. Comparing it against the M this
+        // probe has just proved orthogonal is what the runners' own check 0b
+        // cannot do.
+        const std::vector<std::int8_t> table_blob = tq_oracle::build_tables(probe_shape());
+        require(table_blob.size() ==
+                    static_cast<std::size_t>(kTableBlocks) * kBlockElems,
+                "the shared oracle's table blob is not 16 blocks of 32x32 INT8");
         GuardedBuffer<std::int8_t> tables(kTableBlocks * kBlockElems);
-        for (int s = 0; s < 2; ++s)
-            for (int g = 0; g < kGroups; ++g)
-                for (int c0 = 0; c0 < kGroup; ++c0)
-                    for (int i = 0; i < kGroup; ++i)
-                        tables[(s * kGroups + g) * kBlockElems + c0 * kGroup + i] =
-                            static_cast<std::int8_t>((s ? -1 : 1) *
-                                                     pi_sign(g * kGroup + c0) *
-                                                     hadamard(c0, i));
+        for (std::size_t i = 0; i < table_blob.size(); ++i)
+            tables[static_cast<int>(i)] = table_blob[i];
         int composed = 0;
         for (int c1 = 0; c1 < kGroups; ++c1)
             for (int g = 0; g < kGroups; ++g) {
