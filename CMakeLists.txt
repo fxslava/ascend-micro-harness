@@ -48,27 +48,22 @@ set_target_properties(test_pipeline_deadlock_probe_camodel PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 
-# add_micro_camodel_probe(<name> [<kernel_basename>|<kernel_path>] [<define>...])
+# add_micro_camodel_probe(<name> [<kernel_basename>|<kernel_path>])
 # Builds target test_camodel_<name> from tests/camodel/test_camodel_<name>.cpp
 # against kernels/camodel/<kernel_basename>.cpp, defaulting to <name>. A second
 # argument containing a slash is taken as a repository-relative source path
 # instead, which is how the production operator under kernels/ops is built.
-# Any further arguments are NAME=VALUE compile definitions for the device
-# kernel and the runner.
-#
 # `-forward-options-to-host-compiler` takes exactly one option here, and the
-# definitions go through ascendc_compile_definitions instead. CANN's legacy
+# launch definition goes through ascendc_compile_definitions. CANN's legacy
 # ascendc_compile_options stores everything after that marker in the target's
 # HOST_COMPILE_OPTIONS property and hands it to a nested ExternalProject as a
 # single `-DASCENDC_HOST_COMPILE_OPTIONS=<property>` configure argument: a
 # property with two elements loses one of them, and when the one it loses is
 # ASCEND_MICRO_CANN_LAUNCH the host leg compiles an empty translation unit and
 # `launch_camodel_fused_attention` silently disappears from the shared library.
-# ascendc_compile_definitions reaches every device leg with the whole list,
-# which is where the page count is needed.
+# ascendc_compile_definitions reaches every device leg.
 function(add_micro_camodel_probe name)
   set(kernel_src "kernels/camodel/${name}.cpp")
-  set(extra_defs "")
   if(ARGC GREATER 1)
     if(ARGV1 MATCHES "/")
       set(kernel_src "${ARGV1}")
@@ -76,18 +71,12 @@ function(add_micro_camodel_probe name)
       set(kernel_src "kernels/camodel/${ARGV1}.cpp")
     endif()
   endif()
-  if(ARGC GREATER 2)
-    list(SUBLIST ARGV 2 -1 extra_defs)
-  endif()
   ascendc_library(camodel_${name}_kernel SHARED ${kernel_src})
   ascendc_compile_definitions(camodel_${name}_kernel PRIVATE
-      ASCEND_MICRO_CANN_LAUNCH ${extra_defs})
+      ASCEND_MICRO_CANN_LAUNCH)
   ascendc_compile_options(camodel_${name}_kernel PRIVATE
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
   add_executable(test_camodel_${name} tests/camodel/test_camodel_${name}.cpp)
-  if(extra_defs)
-    target_compile_definitions(test_camodel_${name} PRIVATE ${extra_defs})
-  endif()
   target_include_directories(test_camodel_${name} PRIVATE "${ASCEND_HOME_PATH}/include")
   target_link_libraries(test_camodel_${name} PRIVATE camodel_${name}_kernel ascendcl
       "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
@@ -105,26 +94,13 @@ target_compile_options(test_wta_convergence_probe PRIVATE -Wall -Wextra -Werror)
 add_micro_camodel_probe(normalize_store)
 add_micro_camodel_probe(online_softmax)
 
-# AIV-only inverse-CDF int4x2 quantization. The tile count is a build
-# parameter: 4 is the depth-2 ring boundary (V2), 8 wraps every slot twice
-# (V3).
+# AIV-only inverse-CDF int4x2 quantization; --tiles selects the runtime count.
 add_executable(test_icdf_quantize_probe tests/cpu/test_icdf_quantize_probe.cpp)
 target_compile_options(test_icdf_quantize_probe PRIVATE -Wall -Wextra -Werror)
 add_micro_camodel_probe(icdf_quantize)
-add_micro_camodel_probe(icdf_quantize_8tiles
-    kernels/camodel/icdf_quantize.cpp
-    ICDF_QUANT_TILES=8)
-
-# The fused operator's page count is a build parameter, so one kernel source
-# serves both probes: the three-page depth boundary that established the
-# numerics, and the eight-page run that wraps the depth-3 ring twice.
-add_micro_camodel_probe(fused_attention_3tiles
-    kernels/ops/turboquant/turboquant_paged_attention_opt.cpp
-    FUSED_ATTENTION_TILES=3)
-
-add_micro_camodel_probe(fused_attention_8tiles
-    kernels/ops/turboquant/turboquant_paged_attention_opt.cpp
-    FUSED_ATTENTION_TILES=8)
+# The fused operator uses the same runtime tile selection for its page count.
+add_micro_camodel_probe(fused_attention
+    kernels/ops/turboquant/turboquant_paged_attention_opt.cpp)
 
 # The prefill reshape-and-cache operator. Its grid is fixed by the strip shape
 # -- eight chunks of one 16-token page -- so there is no build parameter: the

@@ -25,8 +25,8 @@
 // fixture), and multi-core distribution. Grid is one AIV by construction.
 //
 // Target: Ascend 950PR_9599 (dav-3510, __NPU_ARCH__ 3510), CANN 9.2.0-beta.2,
-// CAModel RUN_MODE=sim. ICDF_QUANT_TILES selects the grid; 4 is the depth-2
-// ring boundary, >= 2x that wraps every slot (V3).
+// CAModel RUN_MODE=sim. The runtime tile count is 4 at the depth-2 ring
+// boundary; 8 wraps every slot twice (V3).
 
 #if defined(__CCE_AICORE__)
 #include "kernel_operator.h"
@@ -75,12 +75,6 @@ static_assert(kArenaEnd + kVecReg <= kUbWindow, "UB arena leaves no read pad");
 static_assert(kTileBytes % kBlock == 0 && kTileOutBytes % kBlock == 0,
               "DMA lengths must be 32-byte aligned");
 
-#ifndef ICDF_QUANT_TILES
-#define ICDF_QUANT_TILES 4
-#endif
-constexpr std::uint32_t kTiles = ICDF_QUANT_TILES;
-static_assert(kTiles >= 2, "V2 needs at least the ring depth (2)");
-
 // Event ids, static code 0..5 (6/7 reserved). One id per route with a single
 // token in flight: consumption is FIFO per route, which is sound for ordered
 // ring reuse (the set produced after tile t proves reads/stores through t are
@@ -94,7 +88,9 @@ constexpr std::int32_t kEvtDrain = 4;     // MTE3_S: final outflow retired
 }  // namespace
 
 template <class Input>
-__aicore__ inline void run_icdf_quantize(__gm__ Input* gm_in, __gm__ std::uint8_t* gm_out)
+__aicore__ inline void run_icdf_quantize(__gm__ Input* gm_in,
+                                         __gm__ std::uint8_t* gm_out,
+                                         std::uint32_t tiles)
 {
     constexpr auto ub = AscendC::TPosition::VECCALC;
     AscendC::LocalTensor<Input> in0{ub, kIn0, kTileElems};
@@ -116,7 +112,7 @@ __aicore__ inline void run_icdf_quantize(__gm__ Input* gm_in, __gm__ std::uint8_
     // launches.
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtInFree);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kEvtOutFree);
-    for (std::uint32_t t = 0; t < kTiles; ++t) {
+    for (std::uint32_t t = 0; t < tiles; ++t) {
         const std::uint32_t slot = t & 1u;
         // MTE2: refill this slot only once the vector pipe finished reading
         // its previous contents (WAR back edge; waits stall the MTE2 queue).
@@ -146,32 +142,32 @@ __aicore__ inline void run_icdf_quantize(__gm__ Input* gm_in, __gm__ std::uint8_
 }
 
 extern "C" __global__ __aicore__ void camodel_icdf_quantize_fp16(
-    __gm__ half* in, __gm__ std::uint8_t* out)
+    __gm__ half* in, __gm__ std::uint8_t* out, uint32_t tiles)
 {
     AscendC::InitSocState();
-    run_icdf_quantize<half>(in, out);
+    run_icdf_quantize<half>(in, out, tiles);
 }
 extern "C" __global__ __aicore__ void camodel_icdf_quantize_bf16(
-    __gm__ bfloat16_t* in, __gm__ std::uint8_t* out)
+    __gm__ bfloat16_t* in, __gm__ std::uint8_t* out, uint32_t tiles)
 {
     AscendC::InitSocState();
-    run_icdf_quantize<bfloat16_t>(in, out);
+    run_icdf_quantize<bfloat16_t>(in, out, tiles);
 }
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 extern "C" __global__ __aicore__ void camodel_icdf_quantize_fp16(
-    __gm__ half*, __gm__ std::uint8_t*);
+    __gm__ half*, __gm__ std::uint8_t*, uint32_t);
 extern "C" __global__ __aicore__ void camodel_icdf_quantize_bf16(
-    __gm__ bfloat16_t*, __gm__ std::uint8_t*);
+    __gm__ bfloat16_t*, __gm__ std::uint8_t*, uint32_t);
 extern "C" void launch_camodel_icdf_quantize_fp16(void* stream, std::uint16_t* in,
-                                                  std::uint8_t* out)
+                                                  std::uint8_t* out, std::uint32_t tiles)
 {
     camodel_icdf_quantize_fp16<<<1, nullptr, stream>>>(
-        reinterpret_cast<half*>(in), out);
+        reinterpret_cast<half*>(in), out, tiles);
 }
 extern "C" void launch_camodel_icdf_quantize_bf16(void* stream, std::uint16_t* in,
-                                                  std::uint8_t* out)
+                                                  std::uint8_t* out, std::uint32_t tiles)
 {
     camodel_icdf_quantize_bf16<<<1, nullptr, stream>>>(
-        reinterpret_cast<bfloat16_t*>(in), out);
+        reinterpret_cast<bfloat16_t*>(in), out, tiles);
 }
 #endif

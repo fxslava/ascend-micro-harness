@@ -1,7 +1,7 @@
 // Fused TurboQuant paged attention, Ascend 950PR / arch35 / dav-3510 / CANN 9.2.
 //
 // MIX_AIC_1_2: one Cube core and BOTH Vector cores, three-stage modulo
-// software pipeline over kTiles key pages, pure streaming online softmax, and
+// software pipeline over runtime-selected key pages, pure streaming online softmax, and
 // a hardware Cube-Vector transfer that keeps the dequantised key page on chip.
 //
 //   engine        owner        work
@@ -33,7 +33,7 @@
 // superseded: CANN 9.2 has both Te CopyUB2L1 and the basic_api DataCopy used
 // here.
 //
-// Three-stage modulo schedule, branch free in the steady state
+// Three-stage modulo schedule
 // ------------------------------------------------------------
 // Column j of the schedule, with slots taken modulo kStageDepth at compile
 // time, runs three mutually independent stages:
@@ -44,20 +44,18 @@
 //
 // Nothing in a column depends on anything else in that column, so MTE2,
 // Vector, MTE3, MTE1, Cube and Fixpipe are all free to be in flight together.
-// The kTiles columns are emitted by a fold over a compile-time index sequence,
-// one specialisation per column, with the three slot indices and the two ramp
-// flags computed from the column number in the template argument list: the
-// steady state contains no loop, no modulo, no predicate and no scalar read of
-// UB, at any page count. Synchronisation is HardEvent tokens inside a core and
+// Up to kMaxTiles columns are emitted by a fold over a compile-time index
+// sequence, one specialisation per column. Runtime guards select the requested
+// page count; slot indices remain compile-time constants. Synchronisation is
+// HardEvent tokens inside a core and
 // mode-4 intra-block flags between cores; there is no PipeBarrier<PIPE_ALL>.
 //
-// kTiles is a build parameter (FUSED_ATTENTION_TILES), because the two page
-// counts measure different things:
+// The runtime page count selects two useful boundaries:
 //
-//   kTiles == 3   the depth boundary. No ring slot is ever reused, so the
+//   tiles == 3    the depth boundary. No ring slot is ever reused, so the
 //                 reuse back edges are primed and drained but never contended,
 //                 and the span is a pipeline fill, not a throughput interval.
-//   kTiles == 8   wraps the depth-3 ring twice. Slot s is refilled for tile
+//   tiles == 8    wraps the depth-3 ring twice. Slot s is refilled for tile
 //                 s + 3 and again for s + 6, so every back edge below carries
 //                 real contention and the per-column interval is measurable.
 //
@@ -138,7 +136,7 @@
 // unaffected: S = Q * K^T exactly as before, and the runner oracle is
 // unchanged.
 //
-// Scales are compile time so no scalar argument is read on device.
+// Scales are compile time; the page count is a scalar kernel argument.
 
 #include <cstdint>
 #include <utility>
@@ -153,17 +151,11 @@
 #include "../../../routines/routine_vector_normalize_store.hpp"
 #endif
 
-// The page count is the one build parameter. Three is the depth boundary that
-// established the numerics; eight wraps the depth-3 ring twice.
-#ifndef FUSED_ATTENTION_TILES
-#define FUSED_ATTENTION_TILES 3
-#endif
-
 namespace fused_attention {
-constexpr std::uint32_t kTiles = FUSED_ATTENTION_TILES;
 constexpr std::uint32_t kStageDepth = 3;
-static_assert(kTiles >= kStageDepth,
-              "the prologue stages kStageDepth - 1 pages before the first column");
+// The score archive and unrolled column list need compile-time bounds. Eight
+// pages covers two depth-3 ring wraps and is the largest supported fixture.
+constexpr std::uint32_t kMaxTiles = 8;
 constexpr std::uint32_t kDim = 16;   // head dim, channel count and Cube M
 constexpr std::uint32_t kKeys = 16;  // keys per page
 constexpr std::uint32_t kPanel = kDim * kKeys;
@@ -220,7 +212,7 @@ constexpr std::uint32_t kRingSlotPacked = kPackedBytes + kBankSkewBytes; // 160
 // The Fixpipe landing ring stays at UB 0 so the Cube side can form a raw
 // __ubuf__ pointer without depending on any Vector-side allocation. It is
 // kStageDepth panels deep and no deeper: that is what makes the panel-free
-// back edge a real WAR guard once the ring wraps. Widening it to kTiles would
+// back edge a real WAR guard once the ring wraps. Widening it to kMaxTiles would
 // let the whole sequence be checked without the archive below, but it would
 // also uncontend the edge this revision exists to contend.
 constexpr std::uint32_t kUbScoreRing = 0u;
@@ -281,12 +273,12 @@ constexpr std::uint32_t kUbContext = NextSlot(kUbNormalized, kDim * kF32);
 // Score archive, one slot per page, written by the recurrence from the panel
 // it has just consumed and read back by the single end-of-sequence outflow.
 // The Fixpipe ring is only kStageDepth deep, so without this the panels of
-// tiles 0..kTiles - 4 would be overwritten before the outflow could read them
+// tiles 0..tiles - 4 would be overwritten before the outflow could read them
 // and only the last three would be checkable. The copy is a Vector Muls by
 // 1.0f, which is bit exact for every finite value including signed zeros, so
 // the archived panel is the Fixpipe output bit for bit.
 constexpr std::uint32_t kUbScoreArchive = NextSlot(kUbContext, kDim * kF16);
-constexpr std::uint32_t kArenaEnd = kUbScoreArchive + kTiles * kRingSlotF32;
+constexpr std::uint32_t kArenaEnd = kUbScoreArchive + kMaxTiles * kRingSlotF32;
 
 static_assert(kUbScoreRing % kBlock == 0 && kUbPackedKRing % kBlock == 0 &&
               kUbPackedVRing % kBlock == 0 && kUbKeyRing % kBlock == 0 &&
@@ -374,18 +366,16 @@ constexpr std::uint16_t kFlagL1Free = 20u + Slot;          // 20..22 AIC  -> AIV
 constexpr std::int32_t kEvtEpilogue = 3;
 
 // ------------------------------------------------- compile-time column list
-// The schedule is kTiles columns long. Column j is the triple
+// The schedule runs tiles columns. Column j is the triple
 //
-//   ingress slot (j + 2) % kStageDepth   present while j + 2 <  kTiles
-//   GEMM    slot (j + 1) % kStageDepth   present while j + 1 <  kTiles
+//   ingress slot (j + 2) % kStageDepth   present while j + 2 < tiles
+//   GEMM    slot (j + 1) % kStageDepth   present while j + 1 < tiles
 //   recur   slot  j      % kStageDepth   always
 //
 // and every one of those five values is a constant expression in a template
 // argument list, evaluated by the front end. A fold over an index sequence
-// instantiates one column body per column, in order, with no runtime loop
-// counter, no runtime modulo and no predicate: exactly what the three
-// hand-written columns of the N = 3 revision did, generalised to any page
-// count. This is the same idiom routine_cv_transfer_ub_to_l1.hpp uses to
+// instantiates one column body per supported column, in order, with runtime
+// guards for presence. This is the same idiom routine_cv_transfer_ub_to_l1.hpp uses to
 // unroll its burst strips.
 template <std::uint32_t Column>
 constexpr std::uint32_t kIngressSlot = (Column + 2u) % kStageDepth;
@@ -393,12 +383,7 @@ template <std::uint32_t Column>
 constexpr std::uint32_t kGemmSlot = (Column + 1u) % kStageDepth;
 template <std::uint32_t Column>
 constexpr std::uint32_t kRecurSlot = Column % kStageDepth;
-template <std::uint32_t Column>
-constexpr bool kHasIngress = Column + 2u < kTiles;
-template <std::uint32_t Column>
-constexpr bool kHasGemm = Column + 1u < kTiles;
-
-using ColumnSeq = std::make_integer_sequence<std::uint32_t, kTiles>;
+using ColumnSeq = std::make_integer_sequence<std::uint32_t, kMaxTiles>;
 
 // ============================================================ AIV1: key path
 // MTE2 ingress of the packed key page, Vector dequantisation to FP16, and the
@@ -466,21 +451,23 @@ __aicore__ inline void StageKeyPage(KeyEngine& engine, std::uint32_t tile)
 }
 
 template <std::uint32_t Column>
-__aicore__ inline void StepColumnKey(KeyEngine& engine)
+__aicore__ inline void StepColumnKey(KeyEngine& engine, std::uint32_t tiles)
 {
     static_assert(kIngressSlot<Column> < kStageDepth);
-    if constexpr (kHasIngress<Column>)
+    if (Column + 2u < tiles)
         StageKeyPage<kIngressSlot<Column>>(engine, Column + 2u);
 }
 
 template <std::uint32_t... Columns>
 __aicore__ inline void StepColumnsKey(
-    KeyEngine& engine, std::integer_sequence<std::uint32_t, Columns...>)
+    KeyEngine& engine, std::uint32_t tiles,
+    std::integer_sequence<std::uint32_t, Columns...>)
 {
-    (StepColumnKey<Columns>(engine), ...);
+    (StepColumnKey<Columns>(engine, tiles), ...);
 }
 
-__aicore__ inline void run_key_core(__gm__ std::int8_t* gm_k_packed)
+__aicore__ inline void run_key_core(__gm__ std::int8_t* gm_k_packed,
+                                    std::uint32_t tiles)
 {
     KeyEngine engine;
     engine.k_packed.SetGlobalBuffer(gm_k_packed);
@@ -497,7 +484,7 @@ __aicore__ inline void run_key_core(__gm__ std::int8_t* gm_k_packed)
     StageKeyPage<0>(engine, 0);
     StageKeyPage<1>(engine, 1);
 
-    StepColumnsKey(engine, ColumnSeq{});
+    StepColumnsKey(engine, tiles, ColumnSeq{});
 
     // Drain every primed token and every token the Cube handed back, so no
     // event bit and no intra-block flag leaks into the next launch. These
@@ -554,7 +541,7 @@ __aicore__ inline void StageValuePage(ValueEngine& engine, std::uint32_t tile)
 template <std::uint32_t Slot, std::uint32_t Tile>
 __aicore__ inline void RecurPage(ValueEngine&)
 {
-    static_assert(Slot < kStageDepth && Tile < kTiles);
+    static_assert(Slot < kStageDepth && Tile < kMaxTiles);
     constexpr auto ub = AscendC::TPosition::VECCALC;
     constexpr std::int32_t evt = static_cast<std::int32_t>(Slot);
 
@@ -585,7 +572,7 @@ __aicore__ inline void RecurPage(ValueEngine&)
     es.weighted = {ub, kUbWeighted, kPanel};
 
     // The whole panel, not just the query row the recurrence reads, so the
-    // outflow can check all kTiles * kPanel entries from one UB region after
+    // outflow can check all tiles * kPanel entries from one UB region after
     // the Fixpipe ring has been reused. Muls by 1.0f is an exact FP32 copy and
     // stays on the Vector pipe, so the cross-core set below, which is issued
     // on PIPE_V, is ordered after it: the Cube cannot overwrite the panel
@@ -611,20 +598,22 @@ __aicore__ inline void RecurPage(ValueEngine&)
 }
 
 template <std::uint32_t Column>
-__aicore__ inline void StepColumnValue(ValueEngine& engine)
+__aicore__ inline void StepColumnValue(ValueEngine& engine, std::uint32_t tiles)
 {
     static_assert(kIngressSlot<Column> < kStageDepth &&
                   kRecurSlot<Column> < kStageDepth);
-    if constexpr (kHasIngress<Column>)
+    if (Column + 2u < tiles)
         StageValuePage<kIngressSlot<Column>>(engine, Column + 2u);
-    RecurPage<kRecurSlot<Column>, Column>(engine);
+    if (Column < tiles)
+        RecurPage<kRecurSlot<Column>, Column>(engine);
 }
 
 template <std::uint32_t... Columns>
 __aicore__ inline void StepColumnsValue(
-    ValueEngine& engine, std::integer_sequence<std::uint32_t, Columns...>)
+    ValueEngine& engine, std::uint32_t tiles,
+    std::integer_sequence<std::uint32_t, Columns...>)
 {
-    (StepColumnValue<Columns>(engine), ...);
+    (StepColumnValue<Columns>(engine, tiles), ...);
 }
 
 __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_v_packed,
@@ -632,7 +621,8 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_v_packed,
                                       __gm__ float* gm_out_scores,
                                       __gm__ float* gm_out_state,
                                       __gm__ float* gm_out_normalized,
-                                      __gm__ half* gm_out_context)
+                                      __gm__ half* gm_out_context,
+                                      std::uint32_t tiles)
 {
     constexpr auto ub = AscendC::TPosition::VECCALC;
 
@@ -672,7 +662,7 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_v_packed,
     StageValuePage<0>(engine, 0);
     StageValuePage<1>(engine, 1);
 
-    StepColumnsValue(engine, ColumnSeq{});
+    StepColumnsValue(engine, tiles, ColumnSeq{});
 
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
@@ -680,7 +670,7 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_v_packed,
 
     // ---- Outflow, once, after the whole page sequence ------------------
     // Nothing above this point stores to Global Memory. The score archive is
-    // read back here as one strided MTE3 burst, kTiles panels of
+    // read back here as one strided MTE3 burst, tiles panels of
     // kPanelF32Bytes separated by the archive bank skew, so the runner can
     // check every entry of every page without the kernel ever dumping a panel
     // per page. The V -> MTE3 edge below covers the archive writes too: the
@@ -700,9 +690,9 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_v_packed,
     ascend_micro::vector_store(en, kDim);
 
     AscendC::LocalTensor<float> score_archive{ub, kUbScoreArchive,
-                                              kTiles * kPanel};
+                                              kMaxTiles * kPanel};
     AscendC::DataCopyParams panels;
-    panels.blockCount = static_cast<std::uint16_t>(kTiles);
+    panels.blockCount = static_cast<std::uint16_t>(tiles);
     panels.blockLen = static_cast<std::uint16_t>(kPanelF32Bytes / kBlock);
     panels.srcStride =
         static_cast<std::uint16_t>((kRingSlotF32 - kPanelF32Bytes) / kBlock);
@@ -770,21 +760,22 @@ __aicore__ inline void GemmPage(CubeEngine& engine, std::uint32_t)
 }
 
 template <std::uint32_t Column>
-__aicore__ inline void StepColumnCube(CubeEngine& engine)
+__aicore__ inline void StepColumnCube(CubeEngine& engine, std::uint32_t tiles)
 {
     static_assert(kGemmSlot<Column> < kStageDepth);
-    if constexpr (kHasGemm<Column>)
+    if (Column + 1u < tiles)
         GemmPage<kGemmSlot<Column>>(engine, Column + 1u);
 }
 
 template <std::uint32_t... Columns>
 __aicore__ inline void StepColumnsCube(
-    CubeEngine& engine, std::integer_sequence<std::uint32_t, Columns...>)
+    CubeEngine& engine, std::uint32_t tiles,
+    std::integer_sequence<std::uint32_t, Columns...>)
 {
-    (StepColumnCube<Columns>(engine), ...);
+    (StepColumnCube<Columns>(engine, tiles), ...);
 }
 
-__aicore__ inline void run_cube_core(__gm__ half* gm_q)
+__aicore__ inline void run_cube_core(__gm__ half* gm_q, std::uint32_t tiles)
 {
     using namespace AscendC::Te;
     __ca__ half l0_a[kDim * kKeys] __attribute__((aligned(512)));
@@ -815,7 +806,7 @@ __aicore__ inline void run_cube_core(__gm__ half* gm_q)
 
     GemmPage<0>(engine, 0);
 
-    StepColumnsCube(engine, ColumnSeq{});
+    StepColumnsCube(engine, tiles, ColumnSeq{});
 
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(1);
@@ -834,35 +825,44 @@ extern "C" __global__ __aicore__ void camodel_fused_attention(
     __gm__ half* q, __gm__ std::int8_t* k_packed, __gm__ std::int8_t* v_packed,
     __gm__ std::uint32_t* offsets, __gm__ float* out_scores,
     __gm__ float* out_state, __gm__ float* out_normalized,
-    __gm__ half* out_context)
+    __gm__ half* out_context, uint32_t tiles)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     AscendC::InitSocState();
+    if (tiles < fused_attention::kStageDepth || tiles > fused_attention::kMaxTiles)
+        return;
     // The only role dispatch in the kernel, outside every pipeline stage.
     if ASCEND_IS_AIC {
-        fused_attention::run_cube_core(q);
+        fused_attention::run_cube_core(q, tiles);
     } else if (AscendC::GetSubBlockIdx() == 0) {
         fused_attention::run_value_core(v_packed, offsets, out_scores,
-                                        out_state, out_normalized, out_context);
+                                        out_state, out_normalized, out_context, tiles);
     } else {
-        fused_attention::run_key_core(k_packed);
+        fused_attention::run_key_core(k_packed, tiles);
     }
 }
 
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 
+#include <cassert>
+#include <stdexcept>
+
 extern "C" __global__ __aicore__ void camodel_fused_attention(
     __gm__ half*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ std::uint32_t*,
-    __gm__ float*, __gm__ float*, __gm__ float*, __gm__ half*);
+    __gm__ float*, __gm__ float*, __gm__ float*, __gm__ half*, uint32_t);
 
 extern "C" void launch_camodel_fused_attention(
     void* stream, std::uint16_t* q, std::int8_t* k_packed, std::int8_t* v_packed,
     std::uint32_t* offsets, float* out_scores, float* out_state,
-    float* out_normalized, std::uint16_t* out_context)
+    float* out_normalized, std::uint16_t* out_context, std::uint32_t tiles)
 {
+    // The fixed UB archive and unrolled schedule are sized for kMaxTiles.
+    assert(tiles >= fused_attention::kStageDepth && tiles <= fused_attention::kMaxTiles);
+    if (tiles < fused_attention::kStageDepth || tiles > fused_attention::kMaxTiles)
+        throw std::invalid_argument("fused attention tiles must be 3..8");
     camodel_fused_attention<<<1, nullptr, stream>>>(
         reinterpret_cast<half*>(q), k_packed, v_packed, offsets, out_scores,
-        out_state, out_normalized, reinterpret_cast<half*>(out_context));
+        out_state, out_normalized, reinterpret_cast<half*>(out_context), tiles);
 }
 
 #endif

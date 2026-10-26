@@ -6,7 +6,7 @@ Usage:
                          <aiv1_popped> <aiv1_complete>
                          <aic_popped>  <aic_complete>
 
---tiles is the kernel's FUSED_ATTENTION_TILES, 3 if omitted. Every per-page
+--tiles is the kernel's runtime page count, 3 if omitted. Every per-page
 assertion below is scaled by it; none of them is relaxed.
 
 Six checks, each fatal:

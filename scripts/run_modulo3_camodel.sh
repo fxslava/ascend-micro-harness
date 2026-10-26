@@ -12,6 +12,7 @@ sim_lib_dir="${toolkit}/tools/simulator/${soc}/lib"
 run_timeout="${MODULO3_TIMEOUT:-120s}"
 mode="${1:-all}"
 micro_name="${2:-dequant4}"
+micro_tiles="${3:-3}"
 
 # The reshape-and-cache operator is addressable by its short name too, so the
 # probe name does not have to repeat the operator family.
@@ -61,7 +62,12 @@ fi
 # selects a different simulator library set on this installation.
 cd "${build_dir}"
 if [[ "${mode}" == "micro" ]]; then
-    timeout "${run_timeout}" "./test_camodel_${micro_name}" 2>&1 | tee "camodel_${micro_name}_run.log"
+    if [[ "${micro_name}" == "fused_attention" ]]; then
+        timeout "${run_timeout}" "./test_camodel_${micro_name}" --tiles "${micro_tiles}" \
+            2>&1 | tee "camodel_${micro_name}_run.log"
+    else
+        timeout "${run_timeout}" "./test_camodel_${micro_name}" 2>&1 | tee "camodel_${micro_name}_run.log"
+    fi
     if grep -Eiq '\[(error|fatal)\]|invalid ldst addr|unrecognize ldst addr' "camodel_${micro_name}_run.log"; then
         echo "CAModel reported execution errors" >&2
         exit 1
@@ -76,12 +82,10 @@ if [[ "${mode}" == "micro" ]]; then
     # The fused probe is the only one that drives the Cube core and both Vector
     # cores together, so it also gets the event-balance, CV-path, steady-state
     # interval and engine-overlap audit over all three per-core dumps. The page
-    # count is part of the target name and every per-page assertion in the
+    # count comes from the runtime option and every per-page assertion in the
     # analyzer is scaled by it.
-    if [[ "${micro_name}" == fused_attention_*tiles ]]; then
-        fused_tiles="${micro_name#fused_attention_}"
-        fused_tiles="${fused_tiles%tiles}"
-        python3 "${repo_dir}/scripts/analyze_fused_trace.py" --tiles "${fused_tiles}" \
+    if [[ "${micro_name}" == "fused_attention" ]]; then
+        python3 "${repo_dir}/scripts/analyze_fused_trace.py" --tiles "${micro_tiles}" \
             core0.veccore0.instr_popped_log.dump \
             core0.veccore0.instr_log.dump \
             core0.veccore1.instr_popped_log.dump \

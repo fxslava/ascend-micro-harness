@@ -1,10 +1,5 @@
-// Steady-state runner for the fused TurboQuant paged-attention kernel. The
-// page count comes from the build (FUSED_ATTENTION_TILES) and is eight here,
-// which wraps the kernel's depth-3 ring twice: slot s carries tile s, s + 3
-// and s + 6, so every buffer-reuse back edge is contended rather than merely
-// primed and drained. The N = 3 boundary run lives in
-// test_camodel_fused_attention_3tiles.cpp and keeps its own fixture, so the
-// two runs are independent evidence.
+// Runtime page-count runner for fused TurboQuant paged attention. Three pages
+// preserve the numerics baseline; eight pages wrap the depth-3 ring twice.
 //
 // Checks, in order:
 //
@@ -17,10 +12,10 @@
 //      cannot detect a wrong-slot read, which is the whole point at this page
 //      count;
 //   1. every 16x16 score panel of every page, bit-exactly. The kernel's
-//      Fixpipe ring is only three panels deep, so the panels of pages 0..4
-//      have been overwritten by the time the sequence ends; the kernel keeps a
+//      Fixpipe ring is only three panels deep; in the eight-page run its
+//      first five panels are overwritten before the sequence ends. It keeps a
 //      per-page archive in UB and the single end-of-sequence outflow carries
-//      all kTiles of them. A wrong-slot read anywhere on the
+//      all tiles of them. A wrong-slot read anywhere on the
 //      dequant4 -> UB -> L1(Zn) -> L0B -> Mmad -> Fixpipe path lands here;
 //   2. the online-softmax state (m, l) and the FP32 normalised context against
 //      a CPU attention oracle, in ULP;
@@ -29,24 +24,22 @@
 #include "camodel_common.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
-
-#ifndef FUSED_ATTENTION_TILES
-#error "build this runner with -DFUSED_ATTENTION_TILES matching the kernel"
-#endif
+#include <string_view>
 
 extern "C" void launch_camodel_fused_attention(
     void*, std::uint16_t*, std::int8_t*, std::int8_t*, std::uint32_t*,
-    float*, float*, float*, std::uint16_t*);
+    float*, float*, float*, std::uint16_t*, std::uint32_t);
 
 namespace {
 
-constexpr int kTiles = FUSED_ATTENTION_TILES;
 constexpr int kStageDepth = 3;
+constexpr int kMaxTiles = 8;
 constexpr int kDim = 16;
 constexpr int kKeys = 16;
 constexpr int kPanel = kDim * kKeys;
@@ -54,12 +47,8 @@ constexpr int kPackedBytes = kPanel / 2;
 constexpr float kKeyScale = 0.5f;
 constexpr float kValueScale = 0.25f;
 
-static_assert(kTiles > kStageDepth,
-              "a run that does not wrap the ring measures a depth boundary");
-static_assert(kTiles <= 16, "the page ramp has to fit in one nibble");
-
 // Fixture generators. key_nibble and value_nibble are indexed by meaning, not
-// by packing order: key_nibble(t, d, key) is the quantised K[key][d] of page t
+// by packing order: key_nibble(tiles, t, d, key) is the quantised K[key][d] of page t
 // and value_nibble(t, ch, key) the quantised V[key][ch]. The oracle below is
 // therefore the same one the GM-workspace revision used.
 //
@@ -78,9 +67,9 @@ static_assert(kTiles <= 16, "the page ramp has to fit in one nibble");
 // large needs a ramp that cannot wrap, so the page index enters as a
 // non-modular slope instead:
 //
-//   key_nibble(t, d, key) = base(d, key) + t * key_ramp(d, key)
+//   key_nibble(tiles, t, d, key) = base(d, key) + t * key_ramp(d, key)
 //
-// with base reduced modulo 16 - (kTiles - 1) so that base + (kTiles - 1) * 1
+// with base reduced modulo 16 - (tiles - 1) so that base + (tiles - 1) * 1
 // still fits in a nibble. Row 0 of the query weights head dimension d by
 // ((5 d mod 9) - 4) / 64, i.e. by
 //
@@ -104,9 +93,13 @@ int key_ramp(int d, int key)
     if (d == 0 || d == 2 || d == 4 || d == 6) return (key >> (d / 2)) & 1;
     return 0;
 }
-int key_nibble(int t, int d, int key)
+int key_nibble(int tiles, int t, int d, int key)
 {
-    return (d * 8 + key) % (16 - (kTiles - 1)) + t * key_ramp(d, key);
+    // Preserve the original three-page numerics fixture exactly. Its modular
+    // ramp folds after page 3, so longer runs use the monotone ramp below.
+    if (tiles == kStageDepth)
+        return (d * 8 + key + t * (d + 1) * 14) % 16;
+    return (d * 8 + key) % (16 - (tiles - 1)) + t * key_ramp(d, key);
 }
 int value_nibble(int t, int ch, int key) { return (ch + key + t * (ch + 3) * 3) % 16; }
 float query(int row, int d) { return static_cast<float>(((row * 3 + d * 5) % 9) - 4) / 64.0f; }
@@ -167,17 +160,44 @@ float ulp_of(float value)
     return std::nextafter(magnitude, HUGE_VALF) - magnitude;
 }
 
+void usage(FILE* output, const char* program)
+{
+    std::fprintf(output, "Usage: %s [--tiles N]\n"
+                         "  N must be 3..8 (default: 3).\n", program);
+}
+
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    int tiles = kStageDepth;
+    if (argc > 1) {
+        const std::string_view arg = argv[1];
+        if ((arg == "-h" || arg == "--help") && argc == 2) {
+            usage(stdout, argv[0]);
+            return 0;
+        }
+        if (arg == "--tiles" && argc == 3) {
+            const std::string_view value = argv[2];
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), tiles);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                tiles < kStageDepth || tiles > kMaxTiles) {
+                usage(stderr, argv[0]);
+                return 2;
+            }
+        } else {
+            usage(stderr, argv[0]);
+            return 2;
+        }
+    }
     try {
+        std::printf("Fused attention tiles: %d\n", tiles);
         camodel::Session session;
         camodel::GuardedDeviceBuffer q(kDim * kKeys * 2);
-        camodel::GuardedDeviceBuffer k_packed(kTiles * kPackedBytes);
-        camodel::GuardedDeviceBuffer v_packed(kTiles * kPackedBytes);
+        camodel::GuardedDeviceBuffer k_packed(tiles * kPackedBytes);
+        camodel::GuardedDeviceBuffer v_packed(tiles * kPackedBytes);
         camodel::GuardedDeviceBuffer offsets(kPanel * 4);
-        camodel::GuardedDeviceBuffer out_scores(kTiles * kPanel * 4);
+        camodel::GuardedDeviceBuffer out_scores(tiles * kPanel * 4);
         camodel::GuardedDeviceBuffer out_state(kDim * 4);
         camodel::GuardedDeviceBuffer out_normalized(kDim * 4);
         camodel::GuardedDeviceBuffer out_context(kDim * 2);
@@ -194,14 +214,14 @@ int main()
         // A nibble out of range would be silently truncated by the packer and
         // would then disagree with the oracle for a reason that has nothing to
         // do with the kernel.
-        for (int t = 0; t < kTiles; ++t)
+        for (int t = 0; t < tiles; ++t)
             for (int a = 0; a < kDim; ++a)
                 for (int b = 0; b < kKeys; ++b)
-                    if (key_nibble(t, a, b) < 0 || key_nibble(t, a, b) > 15 ||
+                    if (key_nibble(tiles, t, a, b) < 0 || key_nibble(tiles, t, a, b) > 15 ||
                         value_nibble(t, a, b) < 0 || value_nibble(t, a, b) > 15) {
                         std::fprintf(stderr, "fixture nibble out of range at "
                                              "t=%d a=%d b=%d: k=%d v=%d\n",
-                                     t, a, b, key_nibble(t, a, b),
+                                     t, a, b, key_nibble(tiles, t, a, b),
                                      value_nibble(t, a, b));
                         throw std::runtime_error("fixture nibble outside 0..15");
                     }
@@ -209,11 +229,11 @@ int main()
         // Pack two nibbles per byte, low nibble first. The key page is packed
         // key-major (index key * kDim + d) and the value page channel-major
         // (index ch * kKeys + key).
-        for (int t = 0; t < kTiles; ++t)
+        for (int t = 0; t < tiles; ++t)
             for (int i = 0; i < kPackedBytes; ++i) {
                 const int lo = 2 * i, hi = 2 * i + 1;
-                const int k_lo = key_nibble(t, lo % kDim, lo / kDim);
-                const int k_hi = key_nibble(t, hi % kDim, hi / kDim);
+                const int k_lo = key_nibble(tiles, t, lo % kDim, lo / kDim);
+                const int k_hi = key_nibble(tiles, t, hi % kDim, hi / kDim);
                 const int v_lo = value_nibble(t, lo / kKeys, lo % kKeys);
                 const int v_hi = value_nibble(t, hi / kKeys, hi % kKeys);
                 kv[t * kPackedBytes + i] = static_cast<std::uint8_t>((k_hi << 4) | k_lo);
@@ -235,7 +255,8 @@ int main()
             static_cast<float*>(out_scores.payload()),
             static_cast<float*>(out_state.payload()),
             static_cast<float*>(out_normalized.payload()),
-            static_cast<std::uint16_t*>(out_context.payload()));
+            static_cast<std::uint16_t*>(out_context.payload()),
+            static_cast<std::uint32_t>(tiles));
         camodel::check(aclrtSynchronizeStream(session.stream), "fused attention synchronize");
 
         q.download(); k_packed.download(); v_packed.download(); offsets.download();
@@ -250,20 +271,20 @@ int main()
         // Q and the dequantised key page are both half and exactly
         // representable, and every product and partial sum is a multiple of
         // 1/128 well inside FP32, so the reference score panel is exact.
-        static float reference_scores[kTiles][kDim][kKeys];
-        for (int t = 0; t < kTiles; ++t)
+        static float reference_scores[kMaxTiles][kDim][kKeys];
+        for (int t = 0; t < tiles; ++t)
             for (int row = 0; row < kDim; ++row)
                 for (int key = 0; key < kKeys; ++key) {
                     float sum = 0.0f;
                     for (int d = 0; d < kKeys; ++d)
                         sum += half_to_float(qv[row * kKeys + d]) *
-                               (static_cast<float>(key_nibble(t, d, key)) * kKeyScale);
+                               (static_cast<float>(key_nibble(tiles, t, d, key)) * kKeyScale);
                     reference_scores[t][row][key] = sum;
                 }
 
         float m = 0.0f, l = 0.0f, acc[kDim] = {};
-        float page_max[kTiles], page_psum[kTiles], page_alpha[kTiles];
-        for (int t = 0; t < kTiles; ++t) {
+        float page_max[kMaxTiles], page_psum[kMaxTiles], page_alpha[kMaxTiles];
+        for (int t = 0; t < tiles; ++t) {
             const float* s0 = reference_scores[t][0];
             const float tile_max = *std::max_element(s0, s0 + kKeys);
             const float next_m = std::max(m, tile_max);
@@ -290,7 +311,7 @@ int main()
         for (int ch = 0; ch < kDim; ++ch) context[ch] = acc[ch] / l;
 
         // ---- 0. the fixture properties of guidelines section 6.4 ----------
-        for (int t = 0; t < kTiles; ++t)
+        for (int t = 0; t < tiles; ++t)
             for (int row = 0; row < kDim; ++row)
                 for (int key = 0; key < kKeys; ++key) {
                     const float scaled = reference_scores[t][row][key] * 128.0f;
@@ -302,7 +323,7 @@ int main()
                         throw std::runtime_error("fixture score not dyadic");
                     }
                 }
-        for (int t = 1; t < kTiles; ++t)
+        for (int t = 1; t < tiles; ++t)
             if (!(page_max[t] > page_max[t - 1]) || !(page_alpha[t] < 1.0f)) {
                 std::fprintf(stderr,
                              "page %d max %.9g is not above page %d max %.9g "
@@ -310,8 +331,8 @@ int main()
                              t, page_max[t], t - 1, page_max[t - 1], page_alpha[t]);
                 throw std::runtime_error("page maxima are not strictly increasing");
             }
-        for (int t = 0; t < kTiles; ++t)
-            for (int u = t + 1; u < kTiles; ++u)
+        for (int t = 0; t < tiles; ++t)
+            for (int u = t + 1; u < tiles; ++u)
                 if (page_psum[t] == page_psum[u]) {
                     std::fprintf(stderr, "pages %d and %d share p_sum %.9g\n",
                                  t, u, page_psum[t]);
@@ -331,16 +352,16 @@ int main()
         // "panel 0 holds page 3" is a diagnosis where "panel 0 entry 0 is
         // 0.195 not 0.031" is only a symptom.
         const auto* got_scores = static_cast<const float*>(out_scores.host_payload());
-        const float* reference = &reference_scores[0][0][0];  // kTiles panels
+        const float* reference = &reference_scores[0][0][0];  // tiles panels
         int mismatches = 0;
-        for (int i = 0; i < kTiles * kPanel; ++i)
+        for (int i = 0; i < tiles * kPanel; ++i)
             if (bits(got_scores[i]) != bits(reference[i])) ++mismatches;
         if (mismatches) {
             std::fprintf(stderr, "%d of %d score entries differ\n",
-                         mismatches, kTiles * kPanel);
-            for (int t = 0; t < kTiles; ++t) {
+                         mismatches, tiles * kPanel);
+            for (int t = 0; t < tiles; ++t) {
                 int carries = -1, wrong = 0;
-                for (int u = 0; u < kTiles; ++u) {
+                for (int u = 0; u < tiles; ++u) {
                     int same = 0;
                     for (int i = 0; i < kPanel; ++i)
                         same += bits(got_scores[t * kPanel + i]) ==
@@ -363,11 +384,11 @@ int main()
                                  static_cast<double>(reference[t * kPanel]));
             }
             std::fprintf(stderr, "  page row 0 key 0 reference:");
-            for (int u = 0; u < kTiles; ++u)
+            for (int u = 0; u < tiles; ++u)
                 std::fprintf(stderr, " %d:%.9g", u,
                              static_cast<double>(reference[u * kPanel]));
             std::fprintf(stderr, "\n  panel row 0 key 0 device   :");
-            for (int t = 0; t < kTiles; ++t)
+            for (int t = 0; t < tiles; ++t)
                 std::fprintf(stderr, " %d:%.9g", t,
                              static_cast<double>(got_scores[t * kPanel]));
             std::fprintf(stderr, "\n");
@@ -423,21 +444,21 @@ int main()
                     "(%d slot reuses), %d/%d score entries bit-exact, "
                     "max %.3f ULP (worst operand %s), %d/%d FP16 context within 1 half ULP, "
                     "%zu/%zu GM guard bytes intact\n",
-                    kTiles, kStageDepth, kTiles - kStageDepth,
-                    kTiles * kPanel, kTiles * kPanel,
+                    tiles, kStageDepth, tiles - kStageDepth,
+                    tiles * kPanel, tiles * kPanel,
                     static_cast<double>(max_ulp), worst, kDim, kDim,
                     guard_bytes, guard_bytes);
         std::printf("  final m=%.9g l=%.9g  context[0]=%.9g context[15]=%.9g\n",
                     static_cast<double>(got_state[0]), static_cast<double>(got_state[8]),
                     static_cast<double>(got_norm[0]), static_cast<double>(got_norm[15]));
         std::printf("  fixture: page maxima");
-        for (int t = 0; t < kTiles; ++t)
+        for (int t = 0; t < tiles; ++t)
             std::printf(" %.6g", static_cast<double>(page_max[t]));
         std::printf("\n           alpha       ");
-        for (int t = 0; t < kTiles; ++t)
+        for (int t = 0; t < tiles; ++t)
             std::printf(" %.6g", static_cast<double>(page_alpha[t]));
         std::printf("\n           p_sum       ");
-        for (int t = 0; t < kTiles; ++t)
+        for (int t = 0; t < tiles; ++t)
             std::printf(" %.6g", static_cast<double>(page_psum[t]));
         std::printf("\n");
         return 0;
