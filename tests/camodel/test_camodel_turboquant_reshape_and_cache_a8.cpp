@@ -73,6 +73,7 @@
 #include "../common/turboquant_sampling.hpp"
 #endif
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
@@ -115,9 +116,12 @@ void require(bool ok, const char* what)
 void usage(std::FILE* output, const char* argv0)
 {
     std::fprintf(output,
-                 "Usage: %s [--slices N]\n"
+                 "Usage: %s [--slices N] [--window W]\n"
                  "  N aligned 16-token strips, one grid block each (default 1,"
                  " 1..%d).\n"
+                 "  --window W splits the context into launches of at most W\n"
+                 "  strips, which is how a context wider than the AI Core count\n"
+                 "  is driven. Needs sparse sampling compiled out.\n"
                  "  The inductive set for multi-strip addressing is 1, 2, 3;\n"
                  "  32 and 64 are the device shapes (512 and 1024 tokens).\n"
 #if defined(ASCEND_MICRO_SPARSE_SAMPLING)
@@ -236,7 +240,7 @@ int diagnose(const Shape& shape, const tq_oracle::Reference& ref, int strip, int
     return 1;
 }
 
-int run(int slices)
+int run(int slices, int window)
 {
     Shape shape;
     shape.num_tokens = slices * kBlockSize;
@@ -261,6 +265,12 @@ int run(int slices)
 #endif
     int sampled = 0;
     for (char r : runs) sampled += (r != 0);
+    // Sampling keys on the grid block index, which restarts at 0 in every
+    // launch, so a multi-launch run would sample a different strip set than
+    // the one computed above. The two are not combined.
+    require(window <= 0 || sampled == shape.strips(),
+            "--window needs sparse sampling compiled out: the sample set is "
+            "keyed on the block index, which restarts in each launch");
 
     // ---- fixture and oracle, both from the shared header -------------------
     std::vector<std::int8_t> key_in, value_in;
@@ -333,21 +343,45 @@ int run(int slices)
     pi_signs.upload();
     tables.upload();
 
-    launch_turboquant_reshape_and_cache_a8(
-        session.stream, static_cast<const std::int8_t*>(key.payload()),
-        static_cast<const std::int8_t*>(value.payload()),
-        static_cast<std::int8_t*>(key_cache.payload()),
-        static_cast<std::int8_t*>(value_cache.payload()),
-        static_cast<float*>(scale_cache.payload()),
-        static_cast<const std::int32_t*>(slot_mapping.payload()),
-        static_cast<const float*>(pi_signs.payload()),
-        static_cast<const std::int32_t*>(tables.payload()),
-        static_cast<std::uint32_t>(shape.num_tokens),
-        static_cast<std::uint32_t>(shape.num_kv_heads),
-        static_cast<std::uint32_t>(shape.head_size),
-        static_cast<std::uint32_t>(shape.block_size),
-        static_cast<std::uint32_t>(shape.num_blocks),
-        static_cast<std::uint32_t>(shape.block_size), shape.inv_sqrt_len());
+    // One launch per window of at most `window` strips. The default window is
+    // the whole context, which is the single launch this probe has always
+    // done. A smaller window is how a context wider than the AI Core count is
+    // driven: each launch sees a grid no wider than the core count and one
+    // strip per block, which is the schedule that was verified chunk by chunk,
+    // and the strip window is selected purely by advancing the activation and
+    // slot-mapping bases. Nothing in the kernel changes.
+    //
+    // It also answers a question nothing else here can: whether the mode-4
+    // intra-block flags reset between launches. They are level bits that a
+    // wait does not clear -- which is why one id may be set only once per
+    // launch -- so if they survived a launch boundary, the second launch would
+    // read stale landing panels exactly the way a second grid-stride
+    // iteration did.
+    const int strips_per_launch = window > 0 ? window : shape.strips();
+    int launches = 0;
+    for (int first = 0; first < shape.strips(); first += strips_per_launch) {
+        const int count = std::min(strips_per_launch, shape.strips() - first);
+        const std::size_t token_base =
+            static_cast<std::size_t>(first) * shape.block_size;
+        const std::size_t act_base = token_base * channels;
+        launch_turboquant_reshape_and_cache_a8(
+            session.stream,
+            static_cast<const std::int8_t*>(key.payload()) + act_base,
+            static_cast<const std::int8_t*>(value.payload()) + act_base,
+            static_cast<std::int8_t*>(key_cache.payload()),
+            static_cast<std::int8_t*>(value_cache.payload()),
+            static_cast<float*>(scale_cache.payload()),
+            static_cast<const std::int32_t*>(slot_mapping.payload()) + token_base,
+            static_cast<const float*>(pi_signs.payload()),
+            static_cast<const std::int32_t*>(tables.payload()),
+            static_cast<std::uint32_t>(count * shape.block_size),
+            static_cast<std::uint32_t>(shape.num_kv_heads),
+            static_cast<std::uint32_t>(shape.head_size),
+            static_cast<std::uint32_t>(shape.block_size),
+            static_cast<std::uint32_t>(shape.num_blocks),
+            static_cast<std::uint32_t>(shape.block_size), shape.inv_sqrt_len());
+        ++launches;
+    }
     camodel::check(aclrtSynchronizeStream(session.stream), "aclrtSynchronizeStream");
 
     key_cache.download();
@@ -455,8 +489,9 @@ int run(int slices)
     std::printf("PASS turboquant_reshape_and_cache_a8: %d of %d strips x 16 tokens x "
                 "%d channels, %d chunks over a depth-4 L1 ring and depth-2 UB rings\n",
                 sampled, shape.strips(), channels, chunks);
-    std::printf("  grid %d blocks, strip s -> physical page 2s+1 of %d\n",
-                shape.strips(), shape.num_blocks);
+    std::printf("  %d launch(es) of at most %d strips, strip s -> physical page "
+                "2s+1 of %d\n",
+                launches, strips_per_launch, shape.num_blocks);
 #if defined(ASCEND_MICRO_SPARSE_SAMPLING)
     if (sampled != shape.strips()) {
         std::printf("  sparse boundary sampling: %d blocks per wave, first %d, "
@@ -508,20 +543,31 @@ int run(int slices)
 int main(int argc, char** argv)
 {
     int slices = 1;
+    int window = 0;
     bool saw_slices = false;
+    bool saw_window = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             usage(argc == 2 ? stdout : stderr, argv[0]);
             return argc == 2 ? 0 : 2;
         }
-        if (arg == "--slices" && !saw_slices && i + 1 < argc) {
+        const bool is_slices = (arg == "--slices" && !saw_slices);
+        const bool is_window = (arg == "--window" && !saw_window);
+        if ((is_slices || is_window) && i + 1 < argc) {
             const std::string_view value = argv[++i];
-            const auto parsed =
-                std::from_chars(value.data(), value.data() + value.size(), slices);
+            int parsed_value = 0;
+            const auto parsed = std::from_chars(
+                value.data(), value.data() + value.size(), parsed_value);
             if (parsed.ec == std::errc() && parsed.ptr == value.data() + value.size() &&
-                slices >= 1 && slices <= kMaxSlices) {
-                saw_slices = true;
+                parsed_value >= 1 && parsed_value <= kMaxSlices) {
+                if (is_slices) {
+                    slices = parsed_value;
+                    saw_slices = true;
+                } else {
+                    window = parsed_value;
+                    saw_window = true;
+                }
                 continue;
             }
         }
@@ -529,10 +575,11 @@ int main(int argc, char** argv)
         return 2;
     }
     try {
-        return run(slices);
+        return run(slices, window);
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "FAIL turboquant_reshape_and_cache_a8 (%d slices): %s\n",
-                     slices, error.what());
+        std::fprintf(stderr,
+                     "FAIL turboquant_reshape_and_cache_a8 (%d slices, window %d): %s\n",
+                     slices, window, error.what());
         return 1;
     }
 }
