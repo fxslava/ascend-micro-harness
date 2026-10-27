@@ -28,6 +28,18 @@ function(add_ascend_micro_npu_targets)
   ascendc_compile_options(turboquant_bf16_baseline_npu PRIVATE
       -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS})
 
+  # The BF16 input instance of our own operator -- a dedicated kernel, not a
+  # templated A8, so the verified INT8 path is untouched. ASCEND_MICRO_SPARSE
+  # _SAMPLING is deliberately absent here as it is for the A8 library: sparse
+  # sampling is a CAModel verification device and must not exist in a
+  # physical-device build.
+  ascendc_library(turboquant_bf16_npu SHARED
+      kernels/ops/turboquant/turboquant_reshape_and_cache_bf16.cpp)
+  ascendc_compile_definitions(turboquant_bf16_npu PRIVATE ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(turboquant_bf16_npu PRIVATE
+      -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
   add_executable(test_turboquant_a8_validation
       tests/npu/validation/test_turboquant_a8_validation.cpp)
   target_include_directories(test_turboquant_a8_validation PRIVATE
@@ -35,6 +47,10 @@ function(add_ascend_micro_npu_targets)
   target_link_libraries(test_turboquant_a8_validation PRIVATE turboquant_a8_npu ascendcl)
   target_compile_options(test_turboquant_a8_validation PRIVATE -Wall -Wextra -Werror)
 
+  # TODO: tests/npu/validation/test_turboquant_bf16_validation.cpp, then an
+  # executable here mirroring test_turboquant_a8_validation. The BF16 kernel
+  # itself is already built and warning-checked by turboquant_bf16_npu above,
+  # and validated on CAModel by test_camodel_turboquant_reshape_and_cache_bf16.
   add_executable(bench_turboquant_a8_vs_bf16
       tests/npu/bench/bench_turboquant_a8_vs_bf16.cpp)
   target_include_directories(bench_turboquant_a8_vs_bf16 PRIVATE

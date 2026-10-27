@@ -122,4 +122,34 @@ function(add_ascend_micro_sim_targets)
   # compiler as a bare -D.
   add_micro_camodel_probe(turboquant_reshape_and_cache_a8
       kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp ${a8_defs})
+
+  # The BF16 input instance: a dedicated kernel rather than a templated A8, so
+  # the verified INT8 path is not touched. Same output contract, same golden
+  # oracle -- with integer-valued BF16 activations it must produce byte
+  # identical nibbles and scales to the INT8 instance. No sparse sampling: its
+  # grids are 1 and 32, where every block runs anyway.
+  add_micro_camodel_probe(turboquant_reshape_and_cache_bf16
+      kernels/ops/turboquant/turboquant_reshape_and_cache_bf16.cpp)
+
+  # The BF16 operand-layout micro-probe. Explicit rather than through
+  # add_micro_camodel_probe because its runner is test_micro_layout_bf16.cpp,
+  # not test_camodel_<name>.cpp: it is a data-movement probe over one tile, not
+  # a second runner for an operator. Everything else -- the forwarding rules
+  # for ASCEND_MICRO_CANN_LAUNCH, the simulator link line and the install
+  # RPATH -- matches the helper above.
+  ascendc_library(camodel_micro_layout_bf16_kernel SHARED
+      kernels/camodel/micro_layout_bf16.cpp)
+  ascendc_compile_definitions(camodel_micro_layout_bf16_kernel PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(camodel_micro_layout_bf16_kernel PRIVATE
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+  add_executable(test_micro_layout_bf16 tests/camodel/test_micro_layout_bf16.cpp)
+  target_include_directories(test_micro_layout_bf16 PRIVATE "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_micro_layout_bf16 PRIVATE camodel_micro_layout_bf16_kernel
+      ascendcl "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  target_link_options(test_micro_layout_bf16 PRIVATE
+      "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+  target_compile_options(test_micro_layout_bf16 PRIVATE -Wall -Wextra -Werror)
+  set_target_properties(test_micro_layout_bf16 PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 endfunction()

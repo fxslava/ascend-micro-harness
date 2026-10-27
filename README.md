@@ -134,6 +134,41 @@ bin/test_reshape_and_cache_a8_probe
 Results, including what the trace does and does not establish, are in
 [`reports/reshape_and_cache_a8.md`](reports/reshape_and_cache_a8.md).
 
+The BF16 instance of that operator raised a data-movement question the INT8
+one could not: the arch-3510 fractal is 16 × (32B/sizeof(T)), so C0 drops from
+32 to 16 and a 32-wide axis stops being one fractal. The single-tile probe in
+[`tests/camodel/test_micro_layout_bf16.cpp`](tests/camodel/test_micro_layout_bf16.cpp)
+answers it on one AIC, sixteen Mmads and no synchronization at all:
+
+```sh
+bash scripts/run_micro_layout_bf16_camodel.sh
+```
+
+The 16 × 256 activation page's Nz/Zn duality **survives** the widening, so the
+Value chunks need no new load path. The 32 × 32 resident rotation block's does
+**not**: a row-major blob stops being its own Nz image, and the probe
+reproduces the resulting misread bit-exactly from the index map before showing
+that an ND→Nz ingress removes it. MTE1 cannot repair this — its copy unit is
+the 512-byte fractal and its only rearrangement is an intra-fractal transpose —
+so the fix is at ingress: `stage_blocks_nz` in
+[`routines/routine_stage_page_zn_bf16.hpp`](routines/routine_stage_page_zn_bf16.hpp),
+with the four byte-identity L1→L0 loads in
+[`routines/routine_fractal_load_zn_bf16.hpp`](routines/routine_fractal_load_zn_bf16.hpp).
+
+That ingress is now the operator's prologue, and the operator is bit-exact on
+CAModel at 1, 2 and 3 strips:
+
+```sh
+bash scripts/run_reshape_bf16_camodel.sh
+```
+
+With the flat copy put back it fails on the same runner, which is what makes
+the fix measured rather than argued. The report also records why the failure
+looked Value-specific — the runner caps its comparison at three chunks and the
+value heads come first, so the equally broken key chunks were never printed.
+Details and the gates in
+[`reports/micro_layout_bf16.md`](reports/micro_layout_bf16.md).
+
 `routines/routine_cube_hadamard16.hpp` dispatches one FP16×FP16→FP32
 `Mmad` followed by one L0C→GM `Fixpipe` copy. The caller precomputes the
 canonical Sylvester matrix as four Kronecker `H2` factors and stages the
