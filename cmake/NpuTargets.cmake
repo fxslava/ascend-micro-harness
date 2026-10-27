@@ -47,22 +47,37 @@ function(add_ascend_micro_npu_targets)
   target_link_libraries(test_turboquant_a8_validation PRIVATE turboquant_a8_npu ascendcl)
   target_compile_options(test_turboquant_a8_validation PRIVATE -Wall -Wextra -Werror)
 
-  # TODO: tests/npu/validation/test_turboquant_bf16_validation.cpp, then an
-  # executable here mirroring test_turboquant_a8_validation. The BF16 kernel
-  # itself is already built and warning-checked by turboquant_bf16_npu above,
-  # and validated on CAModel by test_camodel_turboquant_reshape_and_cache_bf16.
+  # The BF16 instance's validation harness. It shares the fixture, the golden
+  # oracle and the per-page verifier with the A8 one through
+  # tests/npu/turboquant_npu_common.hpp -- only the input encoding differs --
+  # and drives its strip ladder as several launches, so its default run reaches
+  # the second execution wave at 33 and 64 strips.
+  add_executable(test_turboquant_bf16_validation
+      tests/npu/validation/test_turboquant_bf16_validation.cpp)
+  target_include_directories(test_turboquant_bf16_validation PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_turboquant_bf16_validation PRIVATE
+      turboquant_bf16_npu ascendcl)
+  target_compile_options(test_turboquant_bf16_validation PRIVATE -Wall -Wextra -Werror)
+
+  # The benchmark now measures three kernels, so it links our BF16 Cube library
+  # as well: A8 Cube, BF16 Cube and the vendored BF16 Vector baseline. Only the
+  # two BF16 figures share an input precision and a quantiser, so only that pair
+  # isolates Cube against Vector; the runner says so in its own output.
   add_executable(bench_turboquant_a8_vs_bf16
       tests/npu/bench/bench_turboquant_a8_vs_bf16.cpp)
   target_include_directories(bench_turboquant_a8_vs_bf16 PRIVATE
       "${ASCEND_HOME_PATH}/include" "${BASELINE_DIR}")
   target_link_libraries(bench_turboquant_a8_vs_bf16 PRIVATE
-      turboquant_a8_npu turboquant_bf16_baseline_npu ascendcl)
+      turboquant_a8_npu turboquant_bf16_npu turboquant_bf16_baseline_npu ascendcl)
   target_compile_options(bench_turboquant_a8_vs_bf16 PRIVATE -Wall -Wextra -Werror)
 
-  foreach(target test_turboquant_a8_validation bench_turboquant_a8_vs_bf16)
+  foreach(target test_turboquant_a8_validation test_turboquant_bf16_validation
+      bench_turboquant_a8_vs_bf16)
     set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
   endforeach()
   add_custom_target(turboquant_npu_all DEPENDS
-      test_turboquant_a8_validation bench_turboquant_a8_vs_bf16)
+      test_turboquant_a8_validation test_turboquant_bf16_validation
+      bench_turboquant_a8_vs_bf16)
 endfunction()

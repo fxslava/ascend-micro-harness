@@ -35,16 +35,45 @@ the benchmark binary:
 
 ```powershell
 wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/test_turboquant_a8_validation
+wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/test_turboquant_bf16_validation
 wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/bench_turboquant_a8_vs_bf16
 ```
 
-Validation checks one 16-token strip and 512/1024-token contexts. Each strip
+A8 validation checks one 16-token strip and 512/1024-token contexts. Each strip
 uses one physical AI Core; all packed key and value nibbles and FP32 scale bits
-are compared with an independent integer Hadamard oracle. The benchmark uses
-50 warmups and 500 device-event samples per kernel in both warm and 128 MiB
-SDMA cache-pressure modes. The dummy copy does not guarantee full L2 invalidation.
-A8 and BF16 use different input precision and quantizers;
-the speedup is a wall-time comparison for the same 1024-token geometry.
+are compared with an independent integer Hadamard oracle.
+
+BF16 validation shares that fixture, oracle and per-page verifier — only the
+input encoding differs, and with integer activations the two instances must
+produce byte-identical pages — and drives its context as several launches:
+
+```powershell
+wsl -- .../test_turboquant_bf16_validation --strips 33 --window 32
+wsl -- .../test_turboquant_bf16_validation --tokens 1024
+```
+
+`--strips` and `--tokens` are repeatable and build a custom ladder; with
+neither, the ladder is 1, 32, 33 and 64 strips. `--window W` caps the strips per
+launch at W (default 32), because the kernel allows one strip per grid block per
+launch and a grid wider than the AI core count does not dispatch. The rungs are
+chosen for what they can fail on: 33 is one strip in the **second** wave, a
+ragged tail launch straight after a full one, where a core that has already used
+its mode-4 flag ids must re-arm them; 64 is two full waves, which needs a
+complete reuse cycle instead. A token leaked by the first launch shows up at 33
+and at no smaller rung.
+
+The benchmark measures three kernels — A8 Cube, BF16 Cube and the vendored BF16
+Vector baseline — with 50 warmups and 500 device-event samples each, in both
+warm and 128 MiB SDMA cache-pressure modes. The dummy copy does not guarantee
+full L2 invalidation. Only the two BF16 figures share an input precision and a
+quantizer, so only that pair isolates Cube against Vector rotation; either
+against A8 also changes the input precision and is a wall-time comparison for
+the same 1024-token geometry and nothing narrower.
+
+These three binaries need an attached 950PR. On a host without one they abort
+during static initialization of the NPU-mode runtime, before `main`, so they
+cannot even print their usage — the CAModel probes above are the verification
+gate here.
 
 Micro-routine development rules — the zero-scalar-compute invariant, UB
 alignment and bank invariants (AKA3003), RAW/WAR hazard management inside the

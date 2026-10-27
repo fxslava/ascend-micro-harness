@@ -38,6 +38,15 @@ extern "C" void launch_turboquant_reshape_and_cache_a8(
     std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
     std::uint32_t, std::uint32_t, float);
 
+// The BF16 input instance. Same output contract, and `tables` keeps the
+// std::int32_t* spelling the INT8 kernel published even though the blob is
+// BF16 -- it is reinterpreted device side.
+extern "C" void launch_turboquant_reshape_and_cache_bf16(
+    void*, const std::uint16_t*, const std::uint16_t*, std::int8_t*, std::int8_t*,
+    float*, const std::int32_t*, const float*, const std::int32_t*,
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t, float);
+
 namespace tq_npu {
 
 using tq_oracle::ChunkRef;
@@ -65,6 +74,28 @@ inline void require(bool condition, const char* message)
 }
 
 inline std::uint32_t bits(float value) { return tq_oracle::float_bits(value); }
+
+// An integer as a BF16 bit pattern, exact or not at all. BF16 is the top 16
+// bits of the FP32 pattern and carries an 8-bit significand, so every integer
+// the fixture produces -- INT8 activations in [-128, 127] and +-1 table
+// entries -- narrows exactly rather than rounding. That exactness is what lets
+// the BF16 instance be checked against the *integer* oracle bit for bit
+// instead of against a tolerance, so the require() is part of the contract and
+// not a sanity check.
+inline std::uint16_t to_bf16(int value)
+{
+    const std::uint32_t raw = bits(static_cast<float>(value));
+    require((raw & 0xFFFFu) == 0u, "operand is not exactly representable in BF16");
+    return static_cast<std::uint16_t>(raw >> 16);
+}
+
+inline std::vector<std::uint16_t> to_bfloat16(const std::vector<std::int8_t>& input)
+{
+    std::vector<std::uint16_t> output(input.size());
+    for (std::size_t i = 0; i < input.size(); ++i)
+        output[i] = to_bf16(static_cast<int>(input[i]));
+    return output;
+}
 
 // --------------------------------------------------------------- the fixture
 struct Fixture {
@@ -218,6 +249,94 @@ struct A8Device {
     }
 };
 
+// ------------------------------------------------------------- BF16 instance
+// Same fixture, same reference, same verifier: only the input *encoding*
+// differs, 2-byte BF16 instead of 1-byte INT8, and with integer activations
+// the transform is over the same values, so the BF16 kernel must produce
+// byte-identical pages and scales to the INT8 one. Nothing BF16-specific
+// reaches the oracle.
+//
+// Unlike A8Device this drives the context as several launches. The kernel
+// labels every cross-core event with its own mode-4 flag id, set once and
+// waited once, which bounds a schedule to one strip per grid block per launch
+// (turboquant_reshape_and_cache_bf16.cpp, "cross-core flag ids"); and a grid
+// wider than the device's AI core count does not dispatch in one go. Entering
+// the kernel again is also what re-arms the flags: each launch primes its own
+// tokens and drains them, so a window boundary is a clean restart rather than
+// a state carry-over. Launching in windows is therefore the normal mode here,
+// not a workaround -- which is why `window` is a parameter and the harness
+// reports how many launches a ladder rung took.
+struct Bf16Device {
+    Buffer key, value, key_cache, value_cache, scale_cache, slots, signs, tables;
+    explicit Bf16Device(const Fixture& f)
+        : key(f.key.size() * sizeof(std::uint16_t)),
+          value(f.value.size() * sizeof(std::uint16_t)),
+          key_cache(f.shape.cache_bytes()), value_cache(f.shape.cache_bytes()),
+          scale_cache(f.shape.scale_floats() * sizeof(float)),
+          slots(f.slots.size() * sizeof(std::int32_t)),
+          signs(f.signs.size() * sizeof(float)),
+          tables(f.tables.size() * sizeof(std::uint16_t))
+    {
+        key.upload(to_bfloat16(f.key));
+        value.upload(to_bfloat16(f.value));
+        slots.upload(f.slots);
+        signs.upload(f.signs);
+        // Row-major 32x32 blocks, as the GM contract publishes them. The kernel
+        // converts each block ND -> Nz on the way into L1, because at 16 bits a
+        // row-major block is no longer its own Nz image -- see
+        // reports/micro_layout_bf16.md. The host uploads the same bytes the
+        // INT8 instance does, widened.
+        tables.upload(to_bfloat16(f.tables));
+        key_cache.fill_canary();
+        value_cache.fill_canary();
+        scale_cache.fill_canary();
+    }
+
+    // One launch over `count` strips starting at strip `first`. The activation
+    // and slotMapping pointers advance by the strips already done, so each
+    // launch sees a context that starts at its own strip 0 and the kernel's
+    // one-strip-one-page contract holds inside every window.
+    void launch_window(aclrtStream stream, const Fixture& f, int first, int count)
+    {
+        require(first >= 0 && count > 0 && first + count <= f.strips(),
+                "launch window falls outside the context");
+        const std::size_t channels =
+            static_cast<std::size_t>(f.shape.num_kv_heads) * f.shape.head_size;
+        const std::size_t token_base =
+            static_cast<std::size_t>(first) * f.shape.block_size;
+        launch_turboquant_reshape_and_cache_bf16(
+            stream,
+            static_cast<const std::uint16_t*>(key.ptr) + token_base * channels,
+            static_cast<const std::uint16_t*>(value.ptr) + token_base * channels,
+            static_cast<std::int8_t*>(key_cache.ptr),
+            static_cast<std::int8_t*>(value_cache.ptr),
+            static_cast<float*>(scale_cache.ptr),
+            static_cast<const std::int32_t*>(slots.ptr) + token_base,
+            static_cast<const float*>(signs.ptr),
+            static_cast<const std::int32_t*>(tables.ptr),
+            static_cast<std::uint32_t>(count * f.shape.block_size),
+            static_cast<std::uint32_t>(f.shape.num_kv_heads),
+            static_cast<std::uint32_t>(f.shape.head_size),
+            static_cast<std::uint32_t>(f.shape.block_size),
+            static_cast<std::uint32_t>(f.shape.num_blocks),
+            static_cast<std::uint32_t>(f.shape.block_size), f.shape.inv_sqrt_len());
+    }
+
+    // The whole context in windows of at most `window` strips. Returns the
+    // launch count, which is what distinguishes a one-wave run from a tail
+    // wave and belongs in the report.
+    int launch(aclrtStream stream, const Fixture& f, int window)
+    {
+        require(window > 0, "the launch window must be positive");
+        int launches = 0;
+        for (int first = 0; first < f.strips(); first += window) {
+            launch_window(stream, f, first, std::min(window, f.strips() - first));
+            ++launches;
+        }
+        return launches;
+    }
+};
+
 // ----------------------------------------------------------------- verifier
 // Per page, because that is the unit the bug moves in. A byte-by-byte report
 // over 32 pages says "512342 mismatches" and nothing else; a per-page report
@@ -234,7 +353,12 @@ struct PageVerdict {
     bool ok() const { return key_bad == 0 && value_bad == 0 && scale_bad == 0; }
 };
 
-inline void verify(const Fixture& f, const A8Device& d)
+// Templated on the device only so that A8Device and Bf16Device share it: it
+// touches nothing but the three output buffers, and the oracle it compares
+// against has no notion of the input encoding. If the two instances ever need
+// different verifiers, one of them has stopped honouring the output contract.
+template <class Device>
+inline void verify(const Fixture& f, const Device& d)
 {
     const Shape& shape = f.shape;
     const tq_oracle::Reference& ref = f.ref;

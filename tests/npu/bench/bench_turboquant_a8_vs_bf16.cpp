@@ -23,6 +23,12 @@ constexpr int kTokens = 1024;
 constexpr int kWarmups = 50;
 constexpr int kSamples = 500;
 constexpr std::size_t kEvictionBytes = 128u * 1024u * 1024u;
+// Our BF16 Cube kernel is driven in windows, like its validation harness: one
+// strip per grid block per launch, at most this many blocks at a time. At
+// kTokens that makes 64 strips two launches against the A8 kernel's one, and
+// the timed sample covers all of them, so the comparison is end-to-end work
+// rather than per-dispatch. The launch count is printed next to the timings.
+constexpr int kBenchWindow = 32;
 
 std::int32_t float_word(float x) {
     const auto raw = tq_npu::bits(x);
@@ -55,13 +61,6 @@ std::vector<std::int32_t> baseline_tables() {
     tq_npu::require(t.size() == 2320, "baseline codec table size");
     return t;
 }
-std::vector<std::uint16_t> to_bfloat16(const std::vector<std::int8_t>& input) {
-    std::vector<std::uint16_t> output(input.size());
-    for (std::size_t i = 0; i < input.size(); ++i)
-        output[i] = static_cast<std::uint16_t>(
-            tq_npu::bits(static_cast<float>(input[i])) >> 16);
-    return output;
-}
 struct Baseline {
     tq_npu::Buffer key, value, key_cache, value_cache, scale_cache, slots, signs, tables;
     explicit Baseline(const tq_npu::Fixture& f)
@@ -70,7 +69,8 @@ struct Baseline {
           scale_cache(f.shape.scale_floats() * sizeof(float)),
           slots(f.slots.size() * sizeof(std::int32_t)),
           signs(f.signs.size() * sizeof(float)), tables(2320 * sizeof(std::int32_t)) {
-        key.upload(to_bfloat16(f.key)); value.upload(to_bfloat16(f.value));
+        key.upload(tq_npu::to_bfloat16(f.key));
+        value.upload(tq_npu::to_bfloat16(f.value));
         slots.upload(f.slots); signs.upload(f.signs); tables.upload(baseline_tables());
     }
     void launch(aclrtStream stream, const tq_npu::Fixture& f) {
@@ -142,7 +142,8 @@ int main() {
         tq_npu::Fixture f(kTokens);
         tq_npu::Session session;
         tq_npu::A8Device a8(f);
-        Baseline bf16(f);
+        tq_npu::Bf16Device bf16_cube(f);
+        Baseline bf16_vec(f);
         tq_npu::Buffer eviction_src(kEvictionBytes), eviction_dst(kEvictionBytes);
         tq_npu::check(aclrtMemset(eviction_src.ptr, eviction_src.bytes, 0xA5,
                                   eviction_src.bytes), "initialize eviction buffer");
@@ -158,29 +159,55 @@ int main() {
             tq_npu::kBlockSize * sizeof(float);
         const double a8_bytes = 2.0 * f.key.size() + 2.0 * written_cache + written_scales;
         const double bf16_bytes = 4.0 * f.key.size() + 2.0 * written_cache + written_scales;
-        std::printf("%d tokens, %d strips over %d physical pages, 50 warmups, "
-                    "500 device-event runs\n",
-                    f.shape.num_tokens, f.strips(), f.shape.num_blocks);
+        const int cube_launches = (f.strips() + kBenchWindow - 1) / kBenchWindow;
+        std::printf("%d tokens, %d strips over %d physical pages, %d warmups, "
+                    "%d device-event runs\n",
+                    f.shape.num_tokens, f.strips(), f.shape.num_blocks, kWarmups,
+                    kSamples);
+        std::printf("A8 and BF16-vec dispatch one launch of %d blocks; BF16-cube "
+                    "dispatches %d launch(es) of at most %d, all inside the timed "
+                    "sample\n",
+                    f.strips(), cube_launches, kBenchWindow);
         for (bool evict : {false, true}) {
             const char* mode = evict ? "pressure" : "warm";
             const Stats sa = measure(session.stream, [&] { a8.launch(session.stream, f); },
                                      eviction_src, eviction_dst, evict);
-            const Stats sb = measure(session.stream, [&] { bf16.launch(session.stream, f); },
+            const Stats sc = measure(session.stream,
+                                     [&] { bf16_cube.launch(session.stream, f,
+                                                            kBenchWindow); },
+                                     eviction_src, eviction_dst, evict);
+            const Stats sv = measure(session.stream,
+                                     [&] { bf16_vec.launch(session.stream, f); },
                                      eviction_src, eviction_dst, evict);
             report(mode, "A8", sa, a8_bytes);
-            report(mode, "BF16", sb, bf16_bytes);
-            std::printf("%-8s median speedup BF16/A8: %.3fx\n", mode,
-                        sb.median / sa.median);
+            report(mode, "BF16-cube", sc, bf16_bytes);
+            report(mode, "BF16-vec", sv, bf16_bytes);
+            // Two comparisons, and only one of them is apples to apples.
+            // BF16-cube against BF16-vec is the same input precision and the
+            // same quantiser, so it isolates Cube-versus-Vector rotation.
+            // Either against A8 also changes the input precision, so it is a
+            // wall-time figure for the same geometry and nothing narrower.
+            std::printf("%-8s median BF16-vec / BF16-cube: %.3fx (same precision, "
+                        "same quantiser -- Cube versus Vector rotation)\n",
+                        mode, sv.median / sc.median);
+            std::printf("%-8s median BF16-cube / A8: %.3fx, BF16-vec / A8: %.3fx "
+                        "(different input precision)\n",
+                        mode, sc.median / sa.median, sv.median / sa.median);
         }
-        constexpr double a8_rotation_ops =
+        // The Cube form folds the outer factor's signs into the resident blocks,
+        // so it spends eight times the multiply-adds of the factored Vector form
+        // and buys back the Vector passes. Both Cube paths do the same work; only
+        // their input precision, and so their GM traffic, differs.
+        constexpr double cube_rotation_ops =
             2.0 * kTokens * 2 * tq_npu::kHeads * tq_npu::kHeadSize * tq_npu::kHeadSize;
-        constexpr double bf16_rotation_ops =
+        constexpr double vector_rotation_ops =
             2.0 * kTokens * 2 * tq_npu::kHeads * 8 * (tq_npu::kHeadSize / 2);
         std::printf("Rotation-only intensity: A8 Cube %.1f ops/GM byte, "
-                    "BF16 Vector %.1f ops/GM byte. GM bytes exclude tables and "
-                    "slot metadata; both estimates exclude quantization. "
-                    "Input precision and quantizers differ.\n",
-                    a8_rotation_ops / a8_bytes, bf16_rotation_ops / bf16_bytes);
+                    "BF16 Cube %.1f ops/GM byte, BF16 Vector %.1f ops/GM byte. "
+                    "GM bytes exclude tables and slot metadata; every estimate "
+                    "excludes quantization.\n",
+                    cube_rotation_ops / a8_bytes, cube_rotation_ops / bf16_bytes,
+                    vector_rotation_ops / bf16_bytes);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL turboquant NPU benchmark: %s\n", e.what());
