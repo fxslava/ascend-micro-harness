@@ -203,6 +203,72 @@ only the first output block — `Brcb` re-establishes replication there.
 replicated or `n > 64` (`routine_vector_normalize_store.hpp` keeps it for
 precisely that reason), subject to Rule A3 below.
 
+### 1.5 The `Reg::` level, and the seven traps in it
+
+Everything above is about the level-2 APIs, whose operands live in Unified
+Buffer. Inside a `__simd_vf__` body the `AscendC::Reg::` APIs operate on
+vector registers directly, and a leaf that keeps its working set resident
+there is a different performance regime entirely — measured, on the same
+256-channel randomised-Hadamard cascade over 16 rows
+(`reports/rotate_butterfly.md`):
+
+| form | vector instructions | `RVECEX` | `RV_VLD` | `RV_VST` | vector span |
+| --- | --- | --- | --- | --- | --- |
+| level-2 over UB operands | 11250 | 2512 | 3072 | 1728 | 30215 |
+| `Reg::` register-resident | 1203 | 1057 | 64 | 64 | 1850 |
+
+Same arithmetic, same answer bit for bit, 16.3x the Vector-engine span. Three
+things cost the level-2 form that are not arithmetic: nine stage results per
+row written back to UB and read out again (`RV_VLD`/`RV_VST` are 70% of its
+vector instructions against 22% for `RVECEX`), **288 `VF` entries** — one per
+level-2 API call, each opening and closing its own vector function — and
+1,696 `RV_SMEM_BAR` plus 1,440 `RV_SEND` of intra-VF bookkeeping. Its
+`RVECEX` is also 2.4x the register form's for identical work, because a
+repeat-form instruction covers 64 lanes and a 256-lane stage therefore needs
+four `RV_VLOOP`-driven repeats where the register form has four *named*
+registers and no loop.
+
+**Rule R1 — a leaf whose working set fits in the register file should stay
+there, and should prove it by instruction count.** Four register loads and
+four register stores per 256-channel FP32 row is what no-spill looks like;
+anything more is a spill, and the count is in the trace.
+
+The seven API facts that cost a build cycle each, all verified against the
+dav-3510 implementation headers and then on CAModel:
+
+| Fact | Consequence |
+| --- | --- |
+| `Reg::Arange` has **no unsigned form**. Its `vci` intrinsic is declared for s8/s16/s32/f16/f32 only. | Build the ramp as `int32_t`. |
+| `Reg::Gather` requires an index `RegTensor` of `uint8_t`/`uint16_t`/`uint32_t` **of the same width as the data**. | The `int32_t` ramp has to become `uint32_t` somehow — see the next row. |
+| `Cast<uint32_t, float>` and `Cast<uint32_t, int32_t>` **do not exist**; the FP32 narrowing pairs are `int32_t <- float` (`f322s32`) and `int16_t <- float`, and the only b32 unsigned pairs go *down* to 16 or 8 bits. | A conversion cannot bridge it. |
+| A **reference reinterpret between two `RegTensor`s of one register width** is the vendor's own idiom: `kernel_reg_compute_vec_vconv_impl.h` writes `(RegTensor<uint16_t>&)srcReg` in the bf16 -> fp8e8m0 path. | That is how the ramp, the sign bit patterns and the FP32/uint32 views of a quantiser's absmax are shared, at no instruction cost. |
+| `ShiftLefts` / `ShiftRights` take their shift count as an **`int16_t` and nothing else** (`static_assert(SupportType<U, int16_t>())`), while `Muls`/`Mins`/`Maxs` accept every width. | Cast the literal, or the error arrives as a template instantiation trace. |
+| `Reg::Gather` lowers to **one `RV_VSELR`** and `Reg::MulAddDst` to **one `RV_VMULA`**. | A radix-2 XOR butterfly stage is two instructions per register: gather the partner, fold in the signed self term. |
+| `Reg::DeInterleave` lowers to **one `RV_VDINTLV`** and `Reg::Select` to one `RV_VSEL`, and both take a lane-invariant source, so a constant mask pattern costs one `Interleave` of two `Duplicate`s. | A table-free butterfly is four instructions per register instead of two, and measured 6% slower — a fallback, not a rewrite, if `Gather` ever becomes multi-cycle. |
+
+Two composition rules follow and are worth stating separately.
+
+**Rule R2 — build per-stage constants in-register, not in Unified Buffer.** A
+sign vector of `±1.0f` keyed on bit `k` of the lane index is
+
+```cpp
+//  ((lane & s) << (31 - k)) | 0x3F800000     -- the stride's own bit, moved
+//                                               to the FP32 sign position
+Reg::And<uint32_t>(bit, lane, stride, mask);
+Reg::ShiftLefts<uint32_t>(shifted, bit, int16_t(31 - k), mask);
+Reg::Or<uint32_t>(sign_bits, shifted, one_bits, mask);
+```
+
+three instructions with no comparison, no mask register and no conversion,
+against the 6 KiB of UB offset and sign vectors the level-2 form needs.
+
+**Rule R3 — a cross-lane reduction is a butterfly all-reduce, not a `Reduce`
+plus a broadcast.** Six rounds of (gather the XOR partner, take the max) over
+the index registers an XOR butterfly already carries leave the result in
+**every** lane, which is the form a following per-lane multiply wants anyway:
+fifteen instructions, no reduction API and no new constant. `Reg::Reduce`
+writes lane 0 and then needs a broadcast to be usable.
+
 ---
 
 ## 2. Memory alignment and bank invariants (rule AKA3003)
@@ -868,6 +934,19 @@ stops testing what it was built to test.
 - [ ] Tier 1 green, then Tier 2 green with **zero** `invalid ldst addr`.
 - [ ] Per-tile numeric check, not just an end-of-run check.
 - [ ] ULP budget stated against the largest intermediate.
+
+And for a `Reg::` register-resident leaf (§1.5):
+
+- [ ] Working set resident across the whole cascade, with the **count** to
+      prove it: no more register loads and stores than the data arriving and
+      leaving (Rule R1).
+- [ ] Per-stage constants built in-register from `Arange` and bit arithmetic,
+      not read from a Unified Buffer table (Rule R2).
+- [ ] Cross-lane reductions as a butterfly all-reduce over the index
+      registers the leaf already carries, not `Reduce` plus a broadcast
+      (Rule R3).
+- [ ] Index registers unsigned and of the data's width; `ShiftLefts` counts
+      cast to `int16_t`; no `Cast` to an unsigned b32 type expected to exist.
 
 And when integrating leaves into a pipeline (§6):
 

@@ -89,6 +89,17 @@ function(add_ascend_micro_sim_targets)
   add_micro_camodel_probe(normalize_store)
   add_micro_camodel_probe(online_softmax)
 
+  # The randomised-Hadamard butterfly leaf (roadmap No.6) and its three
+  # competing permutation strategies. One kernel source, three entry points,
+  # one runner that takes --variant: the Unified Buffer censuses that decide
+  # which leaf the AIV-only scatter ingress uses have to come from the same
+  # build, the same fixture and the same surrounding DMA, or they are not a
+  # comparison. Its Tier-1 probe checks the stage tables and both register
+  # algorithms against the dense 256 x 256 matrix with no device at all.
+  add_executable(test_rotate_butterfly_probe tests/cpu/test_rotate_butterfly_probe.cpp)
+  target_compile_options(test_rotate_butterfly_probe PRIVATE -Wall -Wextra -Werror)
+  add_micro_camodel_probe(rotate_butterfly)
+
   # AIV-only inverse-CDF int4x2 quantization; --tiles selects the runtime count.
   add_executable(test_icdf_quantize_probe tests/cpu/test_icdf_quantize_probe.cpp)
   target_compile_options(test_icdf_quantize_probe PRIVATE -Wall -Wextra -Werror)
@@ -149,6 +160,24 @@ function(add_ascend_micro_sim_targets)
   # fixture property are checked here, with no device and no simulator.
   add_executable(test_paged_decode_probe tests/cpu/test_paged_decode_probe.cpp)
   target_compile_options(test_paged_decode_probe PRIVATE -Wall -Wextra -Werror)
+
+  # The AIV-only sub-strip scatter ingress operator (roadmap No.1). Its runner
+  # takes --mode/--head/--tokens at runtime, so one binary covers the
+  # single-head canary sweep, the 1..16 token sweep, the read-modify-write
+  # ladder and the absmax == 0 branch; no build parameter is needed.
+  #
+  # Run the ladder, not just one coordinate. A single launch into a poisoned
+  # cache cannot tell a read-modify-write that preserves from one that rewrites
+  # the whole strip from the oracle it is compared against, because the oracle
+  # starts from the same poison: only --mode sequential, whose second launch
+  # starts from what the FIRST launch left, can.
+  add_micro_camodel_probe(reshape_scatter_aiv
+      kernels/ops/turboquant/turboquant_reshape_scatter_aiv.cpp)
+  # Its Tier-1 host oracle. The layout bijections, the 2048-byte strip window,
+  # the (word, bit) merge arithmetic and the power-of-two scale extraction are
+  # all settled here, with no device and no simulator.
+  add_executable(test_reshape_scatter_probe tests/cpu/test_reshape_scatter_probe.cpp)
+  target_compile_options(test_reshape_scatter_probe PRIVATE -Wall -Wextra -Werror)
 
   # The BF16 operand-layout micro-probe. Explicit rather than through
   # add_micro_camodel_probe because its runner is test_micro_layout_bf16.cpp,
