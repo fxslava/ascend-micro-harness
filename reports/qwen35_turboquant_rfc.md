@@ -58,6 +58,13 @@ Every interface below follows from that.
 
 ## 2. Target operator set
 
+> **Superseded.** The six-kernel AIV/Cube split in
+> [`qwen35_turboquant_execution_roadmap.md`](qwen35_turboquant_execution_roadmap.md) §0.1
+> replaces this inventory: O1 and O2 are renamed, O3 loses its rotation operands to a new
+> `npu_turboquant_rotate_q_batch`, and a new `npu_turboquant_single_token_decode` serves the
+> 6-row case. §3 (layout), §4.1 (adapter contracts) and §9 (Python) below are unaffected.
+
+
 | # | Operator | Status | Regime |
 | --- | --- | --- | --- |
 | O1 | `npu_turboquant_reshape_and_cache` | **modify** — ragged tail, `cu_seqlens`, grid-stride | prefill, all shapes |
