@@ -293,6 +293,86 @@ is not needed. It is printed by the kernel rather than assumed. Details, the
 trace audit's six checks and what the runs do **not** establish are in
 [`reports/reshape_scatter_aiv.md`](reports/reshape_scatter_aiv.md).
 
+The **single-token decode** operator in
+[`kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp`](kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp)
+is the other one with no Cube at all: `KERNEL_TYPE_AIV_ONLY`, a grid of
+`(request, kv_head)` with one task per physical AIV, and 6 query rows — `H_q /
+H_kv` at `query_tokens_per_req == 1`, which is every decode step whatever the
+batch size, because `B` scales the grid and not the row count. It is the 6-row
+kernel, not the `B = 1` kernel. No L1, no `Mmad`, no `Fixpipe`, no CV transfer,
+no mode-4 flag, no modulo ring: its marked graph is a line, and the trace audit
+asserts that as a **positive** property rather than as an absence of findings.
+
+```sh
+bash scripts/run_single_token_decode_camodel.sh         # the spatial sweep, H = 0, 2, 3
+bash scripts/run_single_token_decode_camodel.sh smoke   # one strip, to time a run
+bash scripts/run_single_token_decode_camodel.sh ladder  # every rung
+```
+
+Its score GEMV is **not** the two instructions the roadmap sketched, and the
+reason is worth carrying here because the failure would have been silent. Both
+sketched lines need a 256-lane operand, and `SIMD_compute/mask.md` bounds a
+32-bit continuous-mode mask at 64 — one 256-byte vector register — then adds
+that an over-range mask "is calculated as the maximum mask value of the
+corresponding data type". So a `ReduceRepeat` asking for 256 lanes is neither a
+compile error nor a fault: it reduces the first 64 channels of each token and
+returns a plausible, wrong panel. The `Mul` fails differently, because a
+token-major key page needs query channel quarter `r mod 4` on repeat `r` and
+`src1RepStride = 0` stands still rather than wrapping — the `p_x4` trick works
+for the *value* contraction only because the value page is channel-major, which
+makes the broadcast operand's period exactly 64 lanes.
+[`routines/routine_vector_decode_gemv.hpp`](routines/routine_vector_decode_gemv.hpp)
+issues seven instructions instead: four quarter-major `Mul`s, one 64-repeat
+`ReduceRepeat`, and two `Add` folds at 128 and 64 bytes. The quarter-major
+product layout is the whole trick — it is what makes the 64 first-level
+reductions one instruction and the second level two aligned `Add`s instead of a
+strided reduction the API cannot express.
+
+The panel is still compared **bit-exactly**, and that rests on the fixture
+rather than on the arithmetic: three summation orders are in play — the host's
+loop, the device's binary tree inside a repeat, and the quarter fold across
+repeats — and they agree only because every partial sum is an exact multiple of
+1/16 under 1792. The Tier-1 probe measures the margin (largest sum of absolute
+terms 235.1 against the 2²⁴/16 bound) and replays the device's own repeat
+strides against the direct dot product, so a wrong stride or an aliasing
+product map is caught in milliseconds rather than in a two-minute simulator
+run.
+
+That probe earned its keep twice over before any device run. It rejected the
+first fixture outright: `paged_decode::KeyNibble`'s strip term is `strip * 11`
+mod 8 and its head term `head * 13` mod 8, so the whole pattern depends only on
+`(3·strip + 5·head) mod 8` — **eight distinct key payloads exist in that
+generator** — and handing it a global strip index made page 1 byte-identical to
+page 0, so a kernel that ignored the block table and read page 0 four times
+would have produced exactly the right answer. It also rejected the *check*: per-row
+score maxima pairwise distinct is not a structural property, because a raw score
+is a multiple of 1/16 inside some 4700 values and two of ~2900 strip pairs
+sharing a scalar maximum is an expected coincidence. The gate is now panel
+inequality, which is what "no two strips are interchangeable" actually means.
+
+```sh
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
+    tests/cpu/test_single_token_decode_probe.cpp \
+    -o bin/test_single_token_decode_probe
+bin/test_single_token_decode_probe
+```
+
+Its canary protocol floods the inputs as well as the outputs and uploads only
+the active head's **query** rows, which is stronger than the Cube operator's:
+there, head separation comes only from the cache slice and the gate, so a task
+reading another head's query rows would be invisible. `m` is checked
+bit-exactly — a maximum of exactly representable score columns never passes
+through a transcendental — while `l`, `acc` and the egress are bounded in ULP
+and relative terms, because they do. The trace audit also caught its own first
+prediction being wrong: `RV_VMULA` came back at 288 against 144, and grouping
+by program counter separates the fully unrolled butterfly body from six other
+PCs retiring once per 64-lane register, flanked by an `RV_VMULS` against
+`0xbf800000` and an `RV_VABS_FP` — the 0-ULP FP32 `Div`, three fused
+multiply-adds per register, twice in the epilogue. Details, the per-engine
+census against a pre-registered budget, and what the runs do **not** establish
+— no silicon, no grid past the physical AIV count, no ragged tail, no MTP — are
+in [`reports/single_token_decode_aiv.md`](reports/single_token_decode_aiv.md).
+
 The prefill counterpart in
 [`kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp`](kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp)
 is a **four-stage** `MIX_AIC_1_2` ring over the eight chunks of one 16-token ×

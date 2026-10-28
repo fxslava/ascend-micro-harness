@@ -285,6 +285,32 @@ __aicore__ inline void vector_decode_recur_strip(Engine& engine)
     }
 }
 
+// The whole strip at a RUNTIME row count (roadmap D1). Added for the
+// single-token decode operator, which carries 6 x (1 + k) rows per
+// (request, kv_head) and is 6 rows at k = 0.
+//
+// Additive on purpose. `vector_decode_recur_strip` above is left exactly as
+// the Cube decode operator calls it -- same symbol, same compile-time bound,
+// same emitted instruction stream -- because that operator and its verified
+// eight-strip ladder are frozen. D1 will later rewrite the bound in place and
+// retire this entry point; until it does, the two coexist and the 16-row path
+// is not touched by anything the 6-row path needs.
+//
+// Only the bound differs. Every phase below already addresses its operands
+// through `select_query`'s runtime base addresses, so nothing else in the
+// engine is row-count dependent -- but the CALLER's buffers are: `m_prev`,
+// `l_prev` and `acc` must hold `rows` entries, and `Brcb`/`Duplicate` read a
+// whole 256-byte register from their source base regardless of the lane count,
+// so the caller still owns the read pad behind the last row's state block.
+template <class Engine>
+__aicore__ inline void vector_decode_recur_rows(Engine& engine, std::uint32_t rows)
+{
+    for (std::uint32_t query = 0; query < rows; ++query) {
+        engine.select_query(query);
+        vector_decode_recur_query(engine);
+    }
+}
+
 #endif  // __CCE_AICORE__
 
 }  // namespace ascend_micro

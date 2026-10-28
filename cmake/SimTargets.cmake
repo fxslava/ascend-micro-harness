@@ -179,6 +179,29 @@ function(add_ascend_micro_sim_targets)
   add_executable(test_reshape_scatter_probe tests/cpu/test_reshape_scatter_probe.cpp)
   target_compile_options(test_reshape_scatter_probe PRIVATE -Wall -Wextra -Werror)
 
+  # The AIV-only single-token decode operator (roadmap No.3): 6 query rows,
+  # d = 256, a grid of (request, kv_head) with one task per physical AIV, and
+  # no Cube, no L1 and no cross-core flag of any kind. Its runner takes
+  # --head/--pages/--strips/--rows at runtime, so one binary covers the
+  # single-head canary sweep, the multi-page rung and the row sweep; no build
+  # parameter is needed.
+  #
+  # Run the canary coordinates AND the multi-page rung. A single-page run
+  # cannot tell a kernel that walks the block table from one that ignores it,
+  # because with one page there is only one page to read -- it takes --pages 4
+  # to make a wrong page observable, and the oracle's nibble generator had to
+  # be extended before even that was true (tests/common/single_token_decode
+  # _oracle.hpp).
+  add_micro_camodel_probe(single_token_decode_aiv
+      kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp)
+  # Its Tier-1 host oracle. The GEMV's repeat-stride arithmetic, the
+  # order-independence the bit-exact panel gate rests on, the egress stage
+  # order against the dense rotation and every fixture property are settled
+  # here, with no device and no simulator.
+  add_executable(test_single_token_decode_probe
+      tests/cpu/test_single_token_decode_probe.cpp)
+  target_compile_options(test_single_token_decode_probe PRIVATE -Wall -Wextra -Werror)
+
   # The BF16 operand-layout micro-probe. Explicit rather than through
   # add_micro_camodel_probe because its runner is test_micro_layout_bf16.cpp,
   # not test_camodel_<name>.cpp: it is a data-movement probe over one tile, not

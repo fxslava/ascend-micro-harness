@@ -551,6 +551,21 @@ Vector  Mul(prod, key_page_fp32, q_bcast, 64 lanes, 64 repeats, {1,1,1,8,8,0})
 Vector  ReduceRepeat over 256 contiguous lanes x 16 repeats -> S[q][0..15]
 ```
 
+> **Amended by measurement — neither instruction above exists on this part.**
+> `SIMD_compute/mask.md` bounds a 32-bit continuous-mode mask at 64 (one 256-byte vector
+> register) and states that an over-range mask "is calculated as the maximum mask value of
+> the corresponding data type", so the 256-lane `ReduceRepeat` is neither a compile error
+> nor a fault: it silently reduces the first 64 channels of each token. The `Mul` fails
+> separately, because a token-major key page needs query channel quarter `r mod 4` on
+> repeat `r` and `src1RepStride = 0` stands still rather than wrapping — the `p_x4` trick
+> transfers to the value contraction only because the value page is channel-major, which
+> makes that broadcast operand's period exactly 64 lanes. The implemented leaf is **seven**
+> instructions per row (four quarter-major `Mul`s, one 64-repeat `ReduceRepeat`, two `Add`
+> folds), so **42 per strip at 6 rows** rather than 12. The clamped-mask form is computed
+> by the Tier-1 probe and coincides with the correct panel on 13 of 3072 entries, so the
+> deviation is measured rather than argued. See
+> [`single_token_decode_aiv.md`](single_token_decode_aiv.md) §1.
+
 Two instructions per query row per strip, so **12 per strip at 6 rows**, plus the int4
 unpack of the key page. This is the second payoff of the token-major key layout, alongside
 the `Nz(K) = Zn(K^T)` identity that serves the Cube: the channel axis being contiguous per
