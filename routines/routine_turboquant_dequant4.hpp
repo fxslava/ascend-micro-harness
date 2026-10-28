@@ -29,6 +29,43 @@ ASCEND_MICRO_DEQUANT_INLINE void turboquant_dequant4(Engine& engine, std::uint32
     engine.cast_and_scale(count);
 }
 
+// SIGNED int4 straight to the output type, with no row scale, no mask and no
+// intermediate plane the caller has to allocate.
+//
+// For a caller that stores symmetric int4 (-8..+7, which is what `int4b_t`
+// means) and applies the quantisation scale somewhere cheaper -- the decode
+// operator folds the key scale into the 16 score columns and the value scale
+// into the 16 probabilities rather than multiplying a 4096-entry page -- this
+// is one instruction for a 16-bit output and two for FP32.
+//
+// Which conversions exist is not a matter of taste here
+// -----------------------------------------------------
+// The 950PR `Cast` table (type_conversion/Cast.md) lists, for a bfloat16_t
+// destination, exactly four sources: int4b_t, the two fp4 types, and half.
+// **`int16_t -> bfloat16_t` is not among them**, and on dav-3510 that pair
+// compiles without a diagnostic and emits NO instructions at all. That cost a
+// full debugging cycle: the paged decode operator's score panel came back
+// 256/256 zero on CAModel while every address, every flag and every other
+// instruction in the trace was correct, and what finally located it was a
+// full opcode census of the staging core's dump -- three vector stores and one
+// conversion where the four-stage unpack should have left four and two. The
+// missing store was the key page itself.
+//
+// So this path uses only listed pairs:
+//
+//   int4b_t -> bfloat16_t   CAST_NONE   direct, and likewise int4b_t -> half
+//   int4b_t -> int16_t      CAST_NONE   then
+//   int16_t -> float        CAST_NONE   because int4b_t -> float is not listed
+//
+// The unsigned-nibble path above is unaffected and keeps its own semantics:
+// it masks to 0..15 and scales, which is what its callers were verified with.
+template <class Engine>
+ASCEND_MICRO_DEQUANT_INLINE void turboquant_dequant4_signed(Engine& engine,
+                                                            std::uint32_t count)
+{
+    engine.cast_signed(count);
+}
+
 #if defined(__CCE_AICORE__) || defined(ASCEND_MICRO_ENABLE_NATIVE)
 
 template <class Output>
@@ -52,6 +89,23 @@ struct NativeDequant4Engine {
     {
         AscendC::Duplicate(nibble_mask, std::int16_t{kDequant4NibbleMask}, count);
         AscendC::And(unsigned_nibbles, signed_nibbles, nibble_mask, count);
+    }
+
+    // The signed nibble value in the output type, over listed Cast pairs only.
+    // A 16-bit float output is one instruction; FP32 goes through int16_t,
+    // because int4b_t -> float is not a listed pair. `signed_nibbles` is used
+    // only on the FP32 path, so a 16-bit caller need not allocate it.
+    __aicore__ inline void cast_signed(std::uint32_t count)
+    {
+        auto nibbles = packed.template ReinterpretCast<AscendC::int4b_t>();
+        if constexpr (sizeof(Output) == sizeof(float)) {
+            AscendC::Cast(signed_nibbles, nibbles,
+                          AscendC::RoundMode::CAST_NONE, count);
+            AscendC::Cast(output, signed_nibbles,
+                          AscendC::RoundMode::CAST_NONE, count);
+        } else {
+            AscendC::Cast(output, nibbles, AscendC::RoundMode::CAST_NONE, count);
+        }
     }
 
     __aicore__ inline void cast_and_scale(std::uint32_t count)

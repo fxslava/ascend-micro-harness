@@ -131,6 +131,25 @@ function(add_ascend_micro_sim_targets)
   add_micro_camodel_probe(turboquant_reshape_and_cache_bf16
       kernels/ops/turboquant/turboquant_reshape_and_cache_bf16.cpp)
 
+  # The paged decode attention operator: 16 query tokens, d = 256, an int4
+  # paged KV cache, a 12-column eight-strip modulo schedule over two-slot UB
+  # rings, and a 32-block grid. Its runner takes --strips/--strip-begin/--block
+  # at runtime, so one binary covers both the single-tile canary protocol and
+  # the eight-strip steady-state run; no build parameter is needed.
+  #
+  # Run the strip ladder, not just the canary coordinates. All nine canary
+  # coordinates passed while two separate ring-reuse faults were live, because
+  # a single strip reuses no slot; it took --strips 4 and --strips 8 to expose
+  # them. reports/paged_decode_attention.md sections 4.5 and 4.6.
+  add_micro_camodel_probe(paged_decode_attention
+      kernels/ops/turboquant/turboquant_paged_decode_attention.cpp)
+  # Its Tier-1 host oracle. The CAModel runner compares the device against
+  # this oracle, so it cannot tell a wrong device from a wrong oracle: the
+  # rotation's factorisation, the egress butterfly, the cache packing and every
+  # fixture property are checked here, with no device and no simulator.
+  add_executable(test_paged_decode_probe tests/cpu/test_paged_decode_probe.cpp)
+  target_compile_options(test_paged_decode_probe PRIVATE -Wall -Wextra -Werror)
+
   # The BF16 operand-layout micro-probe. Explicit rather than through
   # add_micro_camodel_probe because its runner is test_micro_layout_bf16.cpp,
   # not test_camodel_<name>.cpp: it is a data-movement probe over one tile, not

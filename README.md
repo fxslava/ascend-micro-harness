@@ -120,6 +120,88 @@ interval — and which is how AIV1's missing packed-page WAR edge was found. See
 That report also retracts an earlier claim, repeated in §6.1 of the
 guidelines, that no UB → L1 transfer exists on this part.
 
+The **decode** operator in
+[`kernels/ops/turboquant/turboquant_paged_decode_attention.cpp`](kernels/ops/turboquant/turboquant_paged_decode_attention.cpp)
+is the full-width one: 16 query tokens, head dimension 256, a symmetric int4
+paged KV cache with a planar FP32 scale cache, and a `gridDim = 32` grid of
+4 KV heads × 8 temporal blocks mapping one task per physical AIC. Each 128-token
+page is eight 16-token strips, and a strip occupies five pipeline stages, so
+eight strips span a twelve-column modulo schedule. The Unified Buffer landings
+and the score windows are **two** slots deep, so eight strips wrap each of them
+four times and every buffer-reuse back edge carries real contention. The L1 key
+staging is deliberately *not* a ring — one page per strip — because the ladder
+measured its back edge failing to bound the staging core.
+
+```sh
+bash scripts/run_paged_decode_camodel.sh --canary 0 0   # one tile, isolated
+bash scripts/run_paged_decode_camodel.sh --strips 8     # steady state
+bash scripts/run_paged_decode_camodel.sh ladder         # every rung
+```
+
+The 256 × 256 randomised Hadamard is applied to the query **once**, in the Cube
+prologue, as 64 accumulating bf16 Mmads against 16 resident 32 × 32 blocks —
+the decode-side reuse of the prefill operator's measured result. Each strip's
+score GEMM is then eight accumulating Mmads of k = 32, and the egress rotates
+the accumulator back out of the cache's basis on AIV0 as eight radix-2
+butterfly stages before an in-place `sigmoid(gate)`. Neither quantisation scale
+is ever applied to a 4096-entry page: the key's goes on the 16 score columns
+after the Fixpipe and the value's into the 16 probabilities, both exactly,
+because the scales are powers of two.
+
+Its verification is a single-tile **canary protocol**. Every Global Memory
+buffer is filled with `0x7FC0BEEF` and the fixture is written into one
+`(page, head, strip)` slice, so a read outside that slice returns a quiet NaN
+and a write outside the active block's output slices leaves a canary word
+behind. `Q_rot` and every raw score panel are checked **bit-exactly**; the
+softmax state, accumulator, egress rotation and gated context are bounded in
+ULP against the largest value in the row, because each passes through `Exp`.
+
+That protocol earned its keep. It located a `Cast(bfloat16_t ← int16_t)` that
+is **not a listed conversion pair on this part** and silently emits no
+instructions at all, an egress gate running two MTE2 iterations ahead of its
+consumer for want of a WAR back edge, and a single k = 256 Mmad that disagrees
+with eight accumulating k = 32 Mmads over the same operands. The host oracle
+rejected two degenerate fixtures before any of that.
+
+The **strip ladder** then earned its keep separately, and that part is the one
+worth copying. All nine canary coordinates passed, and so did two strips — the
+last grid that reuses no ring slot — while four and eight strips failed. Two
+distinct faults sat behind that split: a slot released by the dequant when the
+*recurrence* was its last reader, which corrupted the key scale while leaving
+every raw score bit-exact; and an L1 key ring whose mode-4 back edge did not
+bound the staging core, so AIV1 restaged a page twice more before the Cube read
+it. The second was proven from the instruction trace alone — AIV1 wrote L1
+`0xc060` at ticks 6754, 8703, 10653 and 12608; the Cube read it at 7088, 26994,
+66481 and 106697 — and it is a measured instance of the stale-flag mechanism
+the guidelines record. A third fault was in the verification itself: the trace
+audit's flag-ordering check could not have caught either, because a
+`CrossCoreWaitFlag` retires on arrival and arms a block on its pipe's *next*
+instruction, so no dump tick for a wait marks when its flag released it. That
+check now tests the L1 pages directly, and passes two strips while failing four
+and eight on the archived dumps of the original runs. A fourth was introduced
+by the first fix and caught the same way: releasing the slot in the recurrence
+put the `SetFlag` *after* its `WaitFlag` in program order, which an intra-core
+event does not tolerate, and the model said so while the output stayed
+correct — so the audit now also checks set-before-wait per route.
+
+A fifth was in the verification again, and it is the one to be wary of. The
+model dumps all 32 cores of the grid and block `N` runs on core `N`, but the
+runner archived and audited `core0` unconditionally, so the six canary rungs on
+blocks 16 and 24 were audited against a core that had taken the early return.
+An idle core is not an empty one — 133 instructions of scalar prologue — and
+every balance check in the audit is vacuously true on it, including the one
+named "both Vector cores executed", whose test the prologue's single `MTE2`
+satisfies. Only the L1-page check noticed. The audit now begins by asserting
+that the core it is reading did the work that core is defined by, and takes
+which core to read from the runner's own report of the block it isolated, so
+the block → core mapping is under test rather than assumed.
+
+All nine, the two WSL and CANN toolchain traps that cost a cycle each, and
+what the runs do **not** establish — no silicon, no concurrent 32-block grid,
+no cross-block combine, and why a mode-4 counter released a wait it should have
+held — are in
+[`reports/paged_decode_attention.md`](reports/paged_decode_attention.md).
+
 The prefill counterpart in
 [`kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp`](kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp)
 is a **four-stage** `MIX_AIC_1_2` ring over the eight chunks of one 16-token ×
