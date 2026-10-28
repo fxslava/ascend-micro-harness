@@ -19,8 +19,12 @@ G1. A TurboQuant 4-bit KV path that serves **all four** regimes — single-token
 batched decode, short/paged prefill, batched and long-context prefill — without the host
 having to pad, split or pre-gather tensors in ways that defeat the quantisation win.
 
-G2. One cache layout, declared honestly, shared by every operator, and verified as such
-rather than agreed by inspection (F4, I13).
+G2. One cache layout — the hardware-native one that is already in the kernels — described
+honestly to Python, shared by every operator, and verified as such rather than agreed by
+inspection (F4, I13). **No byte of either packed plane moves.** The `Nz(K) = Zn(K^T)`
+identity and the channel-contiguous value strip are invariants, not implementation details:
+§3.1a states them normatively and nothing in this RFC may introduce a transpose, gather or
+repack into prefill ingestion or the decode pipeline.
 
 G3. No operator whose grid can exceed the AI core count (F5, I8).
 
@@ -72,8 +76,17 @@ the layout contract to drift.
 
 ## 3. GM layout contract (normative)
 
-This section supersedes the shape comments in `turboquant_torch_ops.h`. The index
-functions are what the writer already emits (audit §2.1); only the *declaration* changes.
+This section supersedes the shape comments in `turboquant_torch_ops.h`. **The index
+functions below are exactly what the writer already emits and what the decoder already
+reads** (audit §2.1, verified plane by plane by
+[`scripts/kv_plane_layout_check.py`](../scripts/kv_plane_layout_check.py)): no byte moves,
+no stride flips, no transposes. What changes is only how the planes are *described* to
+Python and to the adapter.
+
+Both orders are hardware mandates, not choices, and §3.1a records why. Any proposal that
+would make a plane's declared PyTorch strides authoritative over these index functions is
+out of scope and must be refused: it would force a Vector-side permutation into a pipeline
+that currently has none.
 
 Let `P = num_blocks`, `S = block_size` (multiple of 16), `H = num_kv_heads`, `d = head_size`,
 `R = 16` (the strip height, `= M0` of the DaVinci fractal and the only compile-time shape
@@ -90,21 +103,63 @@ value nibble index   = ((block*H + head)*S)       * d
                        + (token / R) * (R*d) + channel * R + (token % R)
 ```
 
-Honest torch shapes, which is what the schema must declare and the adapter must check:
+**The planes are an opaque hardware-packed byte pool, not PyTorch-strided tensors.**
+Neither plane's physical order is expressible as a contiguous PyTorch shape that a consumer
+could index safely: `key_cache` carries fractal packing inside each strip that has no stride
+expression at all, and `value_cache`'s in-strip order makes its honest rank differ from
+`key_cache`'s. So the contract is bytes plus **plane accessors**, in both languages:
 
 ```
-key_cache   : [P, H, S,     d/2]
-value_cache : [P, H, S/R, R*d/2]
+allocation  : int8[P * H * S * d/2]   per plane     # what get_kv_cache_shape reports
+accessor    : key_byte(block, head, token, channel)  }  the index functions above,
+              value_byte(block, head, token, channel) }  single-sourced, §9.1
 ```
 
-Both are `P*H*S*d/2` bytes; they differ in rank and in axis meaning, and that is the point.
-A single declared shape for both planes is the root of F4 and must not be restored.
+For *descriptive* purposes only — never as a shape the adapter enforces or a view a
+consumer indexes — the key plane's page-level nesting is that of a contiguous
+`[P, H, S, d/2]`, which is what audit §2.4 verifies and what the schema's
+`[P, S, H, d/2]` gets wrong. The value plane has no such equivalent above the strip.
 
 Rationale for the value plane's strip blocking: channel-major over a whole 128-token page
 would make one strip 256 runs of 8 bytes on a 64-byte stride — not burst-sized, not
 burst-aligned, and two strips of a page would share a 32-byte word and tear each other.
 Blocking by `R` makes every strip one aligned 2048-byte burst, and at `S == R` it is
 byte-identical to plain channel-major, which is the form the CAModel probe verified.
+
+### 3.1a Why these two orders, and not any others
+
+Normative: an implementation may not change either order, and a reviewer should reject a
+change that does.
+
+**`key` is token-major inside the strip because `Nz(K) = Zn(K^T)`.** With
+`nibble = token*d + channel`, the dequantised UB page on AIV1 *is* the ND matrix
+`K[token][channel]` of shape `[R, d]`. At 16 bits `C0 = 32B/2 = 16`, and `Nz([N, D])` is
+indexed `(D1, N1, N0, D0)` while `Zn([K, N])` in the Cube's B role is indexed
+`(K1, N1, N0, K0)` — the same tuple, because `D` and `K` are the same channel axis. So one
+L1 image serves both operand roles and the Cube reaches its B operand for
+`S = Q_rot . K_strip^T` through a **byte-identity** L1->L0 load
+(`load_page_group_b_zn<16, 256>`). The staging path is `cv_transfer_nd2nz`
+(`routine_cv_transfer_ub_to_l1.hpp`): the dav-3510 UB->L1 channel on the AIV MTE3 queue,
+`DataCopyUB2L1Impl` -> one `CopyUbufToCbuf`, with ND->NZ expressed as a **strided placement**
+at 32-byte granularity — one `DataCopy` per `C0` column strip — not as an element
+permutation. No TPipe, no UB scratch, no GM hop. The measured alternative is the cost of
+getting this wrong: a row-major `K^T` disagrees with the fractal image in 3,840 of 4,096
+offsets, so an explicit transpose is what a "shape fix" would buy.
+
+**`value` is strip-blocked channel-major because the accumulation is a `ReduceRepeat`.**
+With `nibble = channel*R + token` inside the strip, a channel's `R` keys are contiguous,
+which makes the per-channel reduction over keys a contiguous `ReduceRepeat` over 16 lanes
+on AIV0 and the 2048-byte strip one contiguous MTE2 read. It is also what lets the weighted
+product avoid a `Gather`: a 64-lane `Mul` repeat covers four channels' worth of 16 keys, so
+with `P[q]` pre-replicated into one 64-lane block and `src1RepStride = 0` a single
+instruction forms all 4096 products — removing 32 KiB of UB and the 4096-entry offset
+vector a `Gather` would need.
+
+**Consequence for the whole pipeline.** Writer ND->Nz ingress, Cube rotation, packed store,
+packed load, dequant, UB->L1 placement, byte-identity L1->L0 load, `Mmad`, Fixpipe to UB,
+`ReduceRepeat` — every stage consumes the bytes the previous one produced, in that order.
+**No transpose, gather or repack exists anywhere in prefill ingestion or in the decode
+pipeline, and none is introduced by anything in this RFC.**
 
 ### 3.2 Scale plane
 
@@ -247,8 +302,13 @@ Shared by every op, failing loudly rather than silently:
 * `head_size == 256`, `num_kv_heads == 4` — the kernels' compile-time constants, checked
   rather than passed as free parameters. **New:** `num_heads % num_kv_heads == 0` and
   `num_heads / num_kv_heads == 6` for this kernel family (I1).
-* `key_cache`/`value_cache` int8 with the §3.1 shapes, `scale_cache` fp32 with
-  `numel >= 2*P*H*S`.
+* `key_cache`/`value_cache` int8, `scale_cache` fp32, each checked as a **byte budget**
+  (`numel >= P*H*S*d/2`, `numel >= 2*P*H*S`) plus contiguity and burst alignment — **not**
+  as a sizes tuple. A sizes-tuple check is what let F4 through: `(P, S, H, d/2)` and
+  `(P, H, S, d/2)` have the same `numel` and the check cannot tell them apart, so it
+  certified an axis order the kernel does not use. The adapter must not impose PyTorch
+  stride semantics on a hardware-packed plane (§3.1, §3.1a); `P`, `S` and `H` arrive as
+  launch scalars and are cross-checked against the byte budget.
 * `block_size % 16 == 0`.
 * int32 for `slot_mapping`, `block_tables`, `seq_lens`, `cu_seqlens`.
 * `check_burst_aligned` on every GM operand base (I6; a violation surfaces as CANN error
@@ -641,19 +701,39 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
     @staticmethod
     def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size,
                            cache_dtype_str="") -> tuple[int, ...]:
-        # One flat byte budget. The two packed planes have different ranks
-        # (RFC §3.1), so a single 5-tuple cannot describe both honestly; the
-        # per-plane views are built in _reshape_kv_cache_tensors instead.
+        # PHYSICAL ALLOCATION BYTES, not an indexable logical shape. The planes
+        # are hardware-packed (RFC §3.1a): the key plane carries fractal packing
+        # inside each strip that has no PyTorch stride expression, and the value
+        # plane's in-strip order gives it a different rank from the key plane's.
+        # Nothing may index these tensors directly -- use the accessors below.
         ...
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
         return [128]          # any multiple of 16 is expressible; 128 is what is verified
 ```
 
-`AscendTurboQuantAttentionSpec` (`core/kv_cache_interface.py`) keeps `payload_bytes`,
-`scale_plane_bytes` and `real_page_size_bytes`; the only change is that the plane *views*
-must follow §3.1's head-major order, which is the F4/I13 fix and must be asserted against
-the C++ layout by a unit test rather than by comment.
+```python
+# vllm_ascend/attention/turboquant_layout.py -- the single source of truth for
+# the physical layout, mirroring the C++ index functions of RFC §3.1 term for
+# term. Every host-side reader goes through these; none builds a view and
+# indexes it.
+def turboquant_key_byte(block, head, token, channel, block_size, num_kv_heads, head_size): ...
+def turboquant_value_byte(block, head, token, channel, block_size, num_kv_heads, head_size): ...
+def turboquant_scale_float(kv, block, head, token, num_blocks, num_kv_heads, block_size): ...
+```
+
+`AscendTurboQuantAttentionSpec` (`core/kv_cache_interface.py`) needs no structural change:
+it already budgets `payload_bytes`, `scale_plane_bytes` and `real_page_size_bytes` rather
+than element shapes, which is exactly the right abstraction here. What must change is that
+nothing downstream reconstructs a logical view from those bytes.
+
+`turboquant_layout.turboquant_dequantize` is the one existing host reader and must be
+rewritten onto the accessors; today it would read the wrong `(head, token)` pair (audit
+§2.4). `swap_blocks` / `copy_blocks` are already correct because they move whole pages.
+
+**This is the F4/I13 fix in full, and it moves no bytes.** The physical layout is right and
+stays as it is; only the description changes, from a shape that contradicts it to accessors
+that state it.
 
 ```python
 class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
@@ -753,7 +833,7 @@ Both entry ops stay graph-splitting custom ops with `mutates_args=["output"]` an
 | `csrc/torch_binding_meta.cpp`, `vllm_ascend/meta_registration.py` | no-op meta kernels for O1-O5 |
 | `CMakeLists.txt` | add the O2/O3/O4 translation units to `ascendc_library(vllm_ascend_turboquant ...)`; keep the `ascend950` gate; drop `turboquant_paged_attention_opt.cpp` once O3 lands, since its only purpose was to keep a schedule compiling |
 | `vllm_ascend/envs.py` | `VLLM_ASCEND_TURBOQUANT_TEMPORAL_SPLITS` (0 = auto) for bring-up; document in the `env_variables` dict |
-| `vllm_ascend/attention/turboquant_layout.py` | `turboquant_dequantize` must read §3.1's head-major order; today it would decode transposed (F4) |
+| `vllm_ascend/attention/turboquant_layout.py` | add the three plane accessors of §9.1 as the single source of truth, and move `turboquant_dequantize` onto them; today it indexes the declared view and reads the wrong `(head, token)` pair (F4, audit §2.4) |
 
 ---
 
@@ -768,7 +848,7 @@ and a trace audit of the dumps.
 | Phase | Lands | Gate |
 | --- | --- | --- |
 | **P0** | re-vendor the vllm writer copy into the harness; raise `block_size` to 128 in the probe | existing bit-exact oracle passes at `block_size = 128`, 8 strips per page, head-major planes; canary sweep clean. This closes the audit §1 staleness and is a prerequisite for everything |
-| **P1** | §3.1/§3.2 honest shapes; `absmax == 0` branch; `kNumPages` -> runtime `num_blocks` (I14, I15) | a layout unit test that asserts the Python view order equals the C++ index function, token by token, for `(P, S, H, d) = (9, 128, 4, 256)`; a zero-row fixture |
+| **P1** | §3.1 byte-pool + plane accessors; §3.2 scale plane; `absmax == 0` branch; `kNumPages` -> runtime `num_blocks` (I14, I15) | a layout UT that asserts each Python **accessor** returns the same byte as the C++ index function for every `(block, head, token, channel)` of `(P, S, H, d) = (9, 128, 4, 256)` — the host-side form of [`scripts/kv_plane_layout_check.py`](../scripts/kv_plane_layout_check.py), whose three checks (writer/decoder agreement, page-level nesting, `Nz(K) = Zn(K^T)` against a row-major control) are the acceptance conditions; plus a zero-row fixture. **No byte may move in this phase** — a diff that changes a kernel's store address has failed it |
 | **P2** | O1 §5.1 grid-stride + table hoist | bit-exact at `total_strips > core_count` (the shape F5 spins on today); trace audit check 1b extended to iteration boundaries; measured GM->L1 traffic down ~33% per strip |
 | **P3** | O1 §5.2 ragged tail + §5.3 `cu_seqlens` | new golden coverage for `n in [1, 15]` on the tail strip, including the value plane's UB zero-pad and the canary that the pad bytes land only in the request's own unwritten page remainder; a ragged-batch fixture with `L_b % 16 != 0` for every `b` |
 | **P4** | O2 decode writer | single-token and `(request, 1+k)`-token RMW both bit-exact against the oracle; canary proves no strip outside the target is touched; `VALIDATE_SLOTS` form for O2 |
