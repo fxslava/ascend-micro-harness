@@ -47,19 +47,30 @@ still stand — only the inventory moved.
 | --- | --- | --- | --- |
 | №1 | `npu_turboquant_reshape_scatter` | O2 `..._decode_cache_update`, widened to cover ragged prefill tails | rename + widen RFC §4 schema |
 | №2 | `npu_turboquant_reshape_aligned` | O1 `..._reshape_and_cache` | rename; RFC §4 schema holds, `cu_seqlens` already in it |
-| №3 | `npu_turboquant_single_token_decode` | — | **new schema needed** |
+| №3 | `npu_turboquant_single_token_decode` | — | written, RFC §4 |
 | №4 | `npu_turboquant_gqa_paged_decode` | O3 | RFC §4 schema holds, minus the rotation operands №5 now owns |
-| №5 | `npu_turboquant_rotate_q_batch` | — | **new schema needed** |
+| №5 | `npu_turboquant_rotate_q_batch` | — | written, RFC §4 |
 | №6 | — (header leaf, no operator) | — | n/a |
 | — | `npu_turboquant_decode_combine` | O4 | RFC §4 schema holds |
 | — | `npu_turboquant_decode_workspace_size` | O5 | unchanged |
 | — | `npu_turboquant_vector_core_num` | O6 | exists on `feat/tq-main-clean` |
 
-Eight registered entry points, six kernels. The two schemas marked **new** are a Phase 5
-prerequisite and are the one piece of interface design this roadmap does not carry: №3's
-operand list is №4's minus `workspace`, `temporal_splits` and the Cube-side tables, and №5's
-is `(query, pi_signs, tables, query_rot, num_heads, head_size, rows, inv_sqrt_len)` — but
-both should be written into the RFC before Phase 5 starts, not invented at the adapter.
+Eight registered entry points, six kernels. All eight schemas, their adapter contracts and
+their launcher signatures are in RFC §4; three things settled while writing them are worth
+carrying here, because each changes a kernel's operand list:
+
+* **№3 keeps `workspace` and `temporal_splits`.** An earlier sketch dropped them on the
+  grounds that the AIV kernel is split-free. It cannot be: at `B = 1` the
+  `(request, kv_head)` grid is 4 tasks, which is exactly the case №3 exists for, so it needs
+  the temporal split more than №4 does. №3's operand list is therefore №4's minus
+  `query_tokens_per_req` (1 by definition) and nothing else, which also makes the two
+  interchangeable at the call site.
+* **`tables` is two different blobs** — №2's entries are `±1`, №4/№5's are `±1/16` — and
+  passing one for the other scales every score by 16. RFC §4.0 H-A.
+* **`scale_value` is a new operand, not a renaming.** The probe applies no softmax scale at
+  all; the only multiply on a score row is the per-token key scale, and the oracle's
+  `kInvSqrtLen = 1/16` is `Pi`'s orthonormalisation, not `1/sqrt(d)`. RFC §4.0 H-C, and
+  audit I16.
 
 ### 0.2 The two design rules, and what they are allowed to cost
 

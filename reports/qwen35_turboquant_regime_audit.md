@@ -129,6 +129,18 @@ Per task: one `(kv_head, temporal_block)` pair, one 128-token page as 8 strips o
 panels, `(m, l)`, `out_acc` (still in the rotated basis), `out_rotated` (pre-gate) and
 `out_context` (`Acc . Pi`, gated by `sigmoid(gate)`, bf16).
 
+**It applies no softmax scale.** The only multiply on a score row is the per-token key
+dequant scale (`Mul(scaled_row, panel_row, key_scale)`,
+`routine_vector_decode_recurrence.hpp:181`), and the host oracle matches it:
+`p[t] = exp(scores[t] - m_new)` over `S[q][t] = keyScale[t] . R[q][t]`. The oracle's
+`kInvSqrtLen = 1/16` is the **orthonormalisation of `Pi`** — `Pi = M / sqrt(d)` makes
+`Pi . Pi^T = I`, which is what leaves the score rotation-invariant — and it is consumed by
+the rotation table, not by the softmax. So the probe computes `softmax(q.k^T)`, not
+`softmax(q.k^T / sqrt(d))`, and a production operator needs a `scale_value` operand the
+probe's signature does not have. Folding it into the 16-lane key-scale vector keeps the
+score panel bit-checkable, because `1/sqrt(256) = 2^-4` and the key scales are `2^(e-2)`, so
+the product stays a power of two. See RFC §4.0 H-C.
+
 `out_context` is the exact answer **only when that one page is the whole context for its
 head**. The rotation commutes with a cross-page log-sum-exp combine; the sigmoid gate does
 not, so a real answer needs combine-then-gate, and the combine is not in this kernel
@@ -455,8 +467,14 @@ hardware's, and a production kernel should assert against the API rather than a 
 The UB ceiling is what caps a tile: **48 rows fits the declared window, 64 needs the whole
 UB, 96 does not fit at all.** That matters in §4.4.
 
-At `M = 6` the arena is 109.97 KiB. There is no UB argument for a separate single-token
-kernel; the existing one with a runtime `M` covers `B = 1`.
+At `M = 6` the arena is 109.97 KiB. **There is no *UB* argument for a separate single-token
+kernel** — the existing one with a runtime `M` fits `B = 1` comfortably. The argument that
+did carry is a different one, and it is on the engine rather than the budget: at 6 rows the
+MIX kernel starts a Cube that does 0.75% of the work and pays ring priming and three
+cross-core channels for it, while a Vector-only GEMV needs neither, and the token-major key
+layout makes its per-token reduction contiguous. That is why the roadmap's №3 exists
+alongside №4; see RFC §2 and roadmap §3.1. This paragraph's narrower claim stands as
+written: the UB budget does not force the split.
 
 ---
 
@@ -788,6 +806,7 @@ refactor is to the **work distribution**, not to the operator's contract.
 | I13 | `key_cache` layout is the hardware-native `Nz`/`Zn` equivalent (token-major in strip) and `value_cache` strip-blocked channel-major; Python shape abstractions must accommodate the hardware fractal packing **without transposing physical buffers** | §2.2; `Mmad` B-operand and `ReduceRepeat` contracts | layout: yes, by construction. Declaration: **no** — the schema's axis nesting contradicts it (F4, §2.4) |
 | I14 | scale-plane stride = `num_blocks * H_kv * block_size` | writer | decoder hardcodes `kNumPages = 9` |
 | I15 | `absmax == 0` has a defined scale | — | **no (§5.3)** |
+| I16 | the softmax scale `1/sqrt(d)` is applied somewhere | attention definition | **no** — neither the kernel nor the oracle applies it (§1.1); `Pi`'s `1/16` is orthonormalisation, not the softmax scale |
 
 ---
 

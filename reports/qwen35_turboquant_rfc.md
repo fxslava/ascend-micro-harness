@@ -58,28 +58,30 @@ Every interface below follows from that.
 
 ## 2. Target operator set
 
-> **Superseded.** The six-kernel AIV/Cube split in
-> [`qwen35_turboquant_execution_roadmap.md`](qwen35_turboquant_execution_roadmap.md) §0.1
-> replaces this inventory: O1 and O2 are renamed, O3 loses its rotation operands to a new
-> `npu_turboquant_rotate_q_batch`, and a new `npu_turboquant_single_token_decode` serves the
-> 6-row case. §3 (layout), §4.1 (adapter contracts) and §9 (Python) below are unaffected.
+Six kernels, eight registered entry points. Two of the six exist and are adapted; the
+provenance and the phase order are in
+[`qwen35_turboquant_execution_roadmap.md`](qwen35_turboquant_execution_roadmap.md) §0.
 
+| # | Entry point | Engine | Status | Regime |
+| --- | --- | --- | --- | --- |
+| №1 | `npu_turboquant_reshape_scatter` | AIV | new | 1..16 tokens: per-step decode writes (F3) and ragged prefill tails |
+| №2 | `npu_turboquant_reshape_aligned` | MIX | adapt the bf16 writer | prefill, `num_tokens % 16 == 0` |
+| №3 | `npu_turboquant_single_token_decode` | AIV | new | `query_tokens_per_req == 1`, any `B` (6 rows) |
+| №4 | `npu_turboquant_gqa_paged_decode` | MIX | adapt the decode probe | decode + MTP, rows 12..48 |
+| №5 | `npu_turboquant_rotate_q_batch` | Cube | extract from №4's prologue | `Q_rot` for all `B x H_q x (1+k)` vectors |
+| №6 | — (header leaf) | AIV | new | the 8-stage butterfly, both directions |
+| — | `npu_turboquant_decode_combine` | AIV | new | cross-page log-sum-exp, only when `splits > 1` |
+| — | `npu_turboquant_decode_workspace_size` | host | new | sizing |
+| — | `npu_turboquant_vector_core_num` | host | exists on `feat/tq-main-clean` | planning, I8 |
 
-| # | Operator | Status | Regime |
-| --- | --- | --- | --- |
-| O1 | `npu_turboquant_reshape_and_cache` | **modify** — ragged tail, `cu_seqlens`, grid-stride | prefill, all shapes |
-| O2 | `npu_turboquant_decode_cache_update` | **new** | the per-step KV write (F3, §5.4) |
-| O3 | `npu_turboquant_gqa_paged_decode` | **new** — promote the harness probe | decode + MTP, all `B` |
-| O4 | `npu_turboquant_decode_combine` | **new** | cross-page log-sum-exp, only when `splits > 1` |
-| O5 | `npu_turboquant_decode_workspace_size` | **new** | host sizing |
-| O6 | `npu_turboquant_vector_core_num` | exists on `feat/tq-main-clean` | host planning, I8 |
-
-O3 subsumes the single-token decode kernel the brief asks about: with a runtime row count
-there is no UB, layout or scheduling argument for a separate `turboquant_single_token_decode`
-(§3.3 — the `M = 6` arena is 109.97 KiB), and a second kernel would be a second place for
-the layout contract to drift.
-
----
+**№3 is not subsumed by №4.** An earlier revision of this section argued that №4 with a
+runtime row count covers the 6-row case and that a second kernel would only duplicate the
+layout contract. The measurement says otherwise: at 6 rows №4 starts a Cube that does 0.75%
+of the work and pays ring priming plus three cross-core channels for it, while №3's score is
+one 4096-lane `Mul` and one contiguous `ReduceRepeat` per row with no cross-core flag at all.
+The two share an operand list and are interchangeable at the call site, so the choice is a
+planner decision (roadmap §5.1), not a shape constraint — and the crossover is a measured
+quantity, not a derived one.
 
 ## 3. GM layout contract (normative)
 
@@ -254,51 +256,140 @@ Added to `csrc/attention/turboquant/op_adapter/turboquant_torch_ops.h`, register
 the existing single `TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)` from
 `csrc/torch_binding.cpp`. PrivateUse1 kernel dispatch, as today.
 
+Eight entry points for six kernels; the numbering follows the roadmap's §0.1.
+
 ```
-# O1 — prefill ingestion. Change: cu_seqlens added (defaulted, so existing callers are
-#      unaffected), and the num_tokens % 16 restriction is lifted.
-npu_turboquant_reshape_and_cache(Tensor key, Tensor value,
-                                 Tensor! key_cache, Tensor! value_cache,
-                                 Tensor! scale_cache, Tensor slot_mapping,
-                                 Tensor pi_signs, Tensor tables,
-                                 Tensor? cu_seqlens=None) -> ()
+# No.2 — aligned prefill ingestion (MIX). num_tokens % 16 == 0; cu_seqlens keeps a strip
+#        from straddling a request boundary. Was O1 npu_turboquant_reshape_and_cache.
+npu_turboquant_reshape_aligned(Tensor key, Tensor value,
+                               Tensor! key_cache, Tensor! value_cache,
+                               Tensor! scale_cache, Tensor slot_mapping,
+                               Tensor pi_signs, Tensor tables,
+                               Tensor? cu_seqlens=None) -> ()
 
-# O2 — per-step KV write. Arbitrary token count, arbitrary non-negative slots.
-npu_turboquant_decode_cache_update(Tensor key, Tensor value,
-                                   Tensor! key_cache, Tensor! value_cache,
-                                   Tensor! scale_cache, Tensor slot_mapping,
-                                   Tensor pi_signs, Tensor tables) -> ()
+# No.1 — sub-strip ingestion (AIV). 1..16 tokens: per-step decode writes and ragged
+#        prefill tails. Arbitrary non-negative slots. Was O2 ..._decode_cache_update.
+#        `tables` is absent: the Pi transform here is the Vector butterfly (No.6), which
+#        reads `pi_signs` directly rather than a Cube table.
+npu_turboquant_reshape_scatter(Tensor key, Tensor value,
+                               Tensor! key_cache, Tensor! value_cache,
+                               Tensor! scale_cache, Tensor slot_mapping,
+                               Tensor pi_signs,
+                               Tensor? cu_seqlens=None) -> ()
 
-# O3 — GQA-folded paged decode. One task per (request, kv_head, temporal split).
-#      output_stage: 0 = raw Acc + (m,l) to workspace, 1 = rotated, 2 = rotated + gated.
-npu_turboquant_gqa_paged_decode(Tensor query, Tensor? gate,
-                                Tensor pi_signs, Tensor tables,
+# No.5 — batched Q rotation (Cube). Q_rot = Q . Pi^T for every (token, q_head) vector,
+#        64 accumulating Mmads per row tile against the 16 resident blocks. `num_rows`
+#        is B * H_q * (1 + k); the caller may pass fewer rows than `query` holds.
+#        No scale operand: the 1/sqrt(d) orthonormalisation is folded into `tables`.
+npu_turboquant_rotate_q_batch(Tensor query, Tensor pi_signs, Tensor tables,
+                              Tensor! query_rot, int num_rows) -> ()
+
+# No.4 — GQA-folded paged decode (MIX). One task per (request, kv_head, temporal split).
+#        Takes the ALREADY ROTATED query from No.5 — the rotation operands and the
+#        `query_rot` output of the former O3 are gone with it.
+#        output_stage: 0 = raw Acc + (m, l) to workspace, 1 = rotated, 2 = rotated + gated.
+npu_turboquant_gqa_paged_decode(Tensor query_rot, Tensor? gate,
                                 Tensor key_cache, Tensor value_cache,
                                 Tensor scale_cache,
                                 Tensor block_tables, Tensor seq_lens,
-                                Tensor! workspace, Tensor! query_rot,
+                                Tensor pi_signs, Tensor egress_offsets,
+                                Tensor egress_signs,
+                                Tensor! workspace,
                                 int num_heads, int num_kv_heads,
                                 int query_tokens_per_req, int temporal_splits,
                                 float scale_value, int output_stage,
                                 Tensor! out) -> ()
 
-# O4 — cross-page combine. Only called when temporal_splits > 1. Reads the partials O3
-#      wrote with output_stage 0, applies the egress rotation and then the gate.
+# No.3 — 6-row paged decode (AIV). Same contract as No.4 and the same operand list: it
+#        serves query_tokens_per_req == 1 at ANY batch size, and it needs the temporal
+#        split for exactly the case it exists for (at B = 1 the (request, kv_head) grid is
+#        4 tasks). The only difference is the engine, so the two are interchangeable at the
+#        call site and the choice is a planner decision, not a shape constraint.
+npu_turboquant_single_token_decode(Tensor query_rot, Tensor? gate,
+                                   Tensor key_cache, Tensor value_cache,
+                                   Tensor scale_cache,
+                                   Tensor block_tables, Tensor seq_lens,
+                                   Tensor pi_signs, Tensor egress_offsets,
+                                   Tensor egress_signs,
+                                   Tensor! workspace,
+                                   int num_heads, int num_kv_heads,
+                                   int temporal_splits,
+                                   float scale_value, int output_stage,
+                                   Tensor! out) -> ()
+
+# — cross-page combine (AIV). Only when temporal_splits > 1. Reads the partials No.3/No.4
+#   wrote at output_stage 0, then the egress rotation, then the gate.
 npu_turboquant_decode_combine(Tensor workspace, Tensor? gate,
-                              Tensor pi_signs, Tensor tables, Tensor seq_lens,
+                              Tensor seq_lens,
+                              Tensor pi_signs, Tensor egress_offsets,
+                              Tensor egress_signs,
                               int num_heads, int num_kv_heads,
                               int query_tokens_per_req, int temporal_splits,
                               int output_stage, Tensor! out) -> ()
 
-# O5/O6 — host planning.
+# — host planning.
 npu_turboquant_decode_workspace_size(int num_reqs, int num_kv_heads, int head_size,
                                      int query_tokens_per_req,
                                      int temporal_splits) -> int
 npu_turboquant_vector_core_num() -> int
 ```
 
-Meta/FakeTensor registrations for all of O1-O5 in `csrc/torch_binding_meta.cpp` and
+Meta/FakeTensor registrations for every mutating op in `csrc/torch_binding_meta.cpp` and
 `vllm_ascend/meta_registration.py`, as no-ops, so `torch.export` and FakeTensor tracing work.
+
+### 4.0 Three operand hazards the schemas cannot express
+
+These are the places where two operands share a name and differ in content. Each returns
+plausible wrong numbers rather than an error, which is the failure mode this family has
+already been bitten by: a drifted `turboquant_codec_tables` against
+`TurboQuantCodec<4>::ConstTableWords` gives cosine ≈ 0.33 and never an exception.
+
+**H-A — `tables` is normalised differently for No.2 than for No.4/No.5.** The writer's
+equation (2) is
+
+```
+T_write[s][g][c0][i] = (s ? -1 : +1) . piSigns[g*32 + c0] . H32[c0][i]
+```
+
+with `invSqrtLen = 1/sqrt(d)` folded into the *stored scale* instead — scaling `Y` and
+`absmax` together leaves every nibble unchanged, and that is what keeps the quantiser
+bit-exact against an integer oracle. The decode-side rotation table carries the factor:
+
+```
+T_rot[s][g][c0][i] = (s ? -1 : +1) . piSigns[g*32 + c0] . H32[c0][i] / 16
+```
+
+(`routine_cube_decode_score.hpp`, "Why 64 Mmads and not 16"). `1/16 = 2^-4` is exact in
+bf16, so `T_rot` entries are exactly `±0.0625`. **These are two distinct 16384-element
+blobs**, and passing one where the other belongs scales every score by 16 or by 1/16. Name
+them apart in Python (`turboquant_write_tables` / `turboquant_rotate_tables`) and have the
+adapter check a cheap invariant on element 0: magnitude `1.0` for No.2, `0.0625` for No.5.
+
+**H-B — `pi_signs` is dead in No.2 and live everywhere else.** No.2 folds the sign diagonal
+into `tables` and never reads the operand; the adapter already accepts an empty tensor and
+passes `nullptr`. No.1, No.3, No.4 and the combine all read it, because the Vector butterfly
+applies the sign diagonal as its own stage. An empty `pi_signs` reaching any of those four
+is a null dereference, not a no-op, so the adapter must require `numel() == head_size` for
+them and tolerate `0` only for No.2.
+
+**H-C — `scale_value` is a new operand, not a renaming.** The probe applies **no softmax
+scale at all**. The only multiply on a score row is the per-token key scale
+(`Mul(scaled_row, panel_row, key_scale)`, `routine_vector_decode_recurrence.hpp:181`), and
+the host oracle matches it — `p[t] = exp(scores[t] - m_new)` over
+`S[q][t] = keyScale[t] . R[q][t]`. The oracle's `kInvSqrtLen = 1/16` is the
+**orthonormalisation of `Pi`**, consumed by the rotation table: `Pi . Pi^T = I` is what makes
+the score rotation-invariant, and it does not scale the softmax. So the probe computes
+`softmax(q.k^T)`, not `softmax(q.k^T / sqrt(d))`, and production must supply
+`scale_value`.
+
+Fold it into the 16-lane key-scale vector at the scale ingress, never onto the 4096-entry
+page: 16 multiplies instead of 4096, recurrence unchanged. The exactness argument survives
+**provided `scale_value` is a power of two** — the key scales are `2^(e-2)` and
+`1/sqrt(256) = 2^-4`, so the product stays a power of two, the score panel stays exactly
+representable, and the bit-exact gate stays available. The adapter should `TORCH_CHECK` that
+`scale_value` is dyadic and say in the message that a non-dyadic scale demotes the
+score-panel gate from bit equality to a tolerance. For this family `d` is always 256, so the
+check always passes; it is there for the day it does not.
 
 ### 4.1 Adapter contracts (`turboquant_torch_adpt.h`)
 
@@ -320,70 +411,157 @@ Shared by every op, failing loudly rather than silently:
 * int32 for `slot_mapping`, `block_tables`, `seq_lens`, `cu_seqlens`.
 * `check_burst_aligned` on every GM operand base (I6; a violation surfaces as CANN error
   264, not an alignment report).
-* `tables` bf16, `numel == 16*32*32`.
-* **New:** `query.numel() >= (last_used_row + 1 + 15) * head_size` (§3.5).
-* **New, O3/O4:** `temporal_splits >= 1` and
+* `tables` bf16, `numel == 16*32*32`, plus the H-A normalisation check on element 0.
+* `query` / `query_rot` guard band: `numel() >= (num_rows + tile - 1) * head_size`, with
+  `tile = kRotateRowsPerTile` for No.5 and `tile = M_pad` for No.3/No.4 (§3.5). The adapter
+  owns both constants, mirroring the kernels'.
+* **No.3/No.4/combine:** `temporal_splits >= 1` and
   `num_reqs * num_kv_heads * temporal_splits <= npu_turboquant_vector_core_num()` — I8 is a
   correctness gate, and the adapter is where it belongs because the kernel cannot see the
   grid it was launched with.
-* `VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS` keeps its current meaning for O1 and gains an O2
-  form (slots `>= 0`, distinct, within `P*S`). Off by default; the cost is a D2H copy and a
-  synchronisation per layer per step.
+* `VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS` keeps its current meaning for No.2 and gains a
+  No.1 form (slots `>= 0`, distinct per `(block, head, strip)`, within `P*S`). Off by
+  default; the cost is a D2H copy and a synchronisation per layer per step.
+
+Per-operator, beyond the shared set:
+
+| Op | Additional checks |
+| --- | --- |
+| No.2 | `num_tokens % 16 == 0`; `cu_seqlens` int32 `[B+1]` monotone with `cu_seqlens[B] == num_tokens`; `tables[0]` magnitude `1.0` (H-A); `pi_signs.numel()` is `0` or `head_size` (H-B) |
+| No.1 | `1 <= num_tokens`; no `% 16` constraint; `pi_signs.numel() == head_size` (H-B); every slot `>= 0` — a `-1` padding slot must never reach this op, so slice to `num_actual_tokens` first |
+| No.5 | `num_rows >= 1` and `num_rows % (num_heads) == 0` (whole tokens); `query_rot` bf16 with `numel() >= num_rows * head_size`; `tables[0]` magnitude `0.0625` (H-A); `pi_signs` may be empty — No.5's sign diagonal is in `tables` |
+| No.3 | `query_tokens_per_req` is implicitly 1, so `num_actual_tokens == num_reqs`; refuse otherwise with a message naming No.4 |
+| No.4 | `rows = 6 * query_tokens_per_req <= 48`; `M_pad = ceil(rows/16)*16 in {16, 32, 48}` must be a built bucket |
+| No.3/No.4 | `scale_value` dyadic (H-C); `output_stage in {0, 1, 2}`; **`output_stage == 2` refused when `temporal_splits > 1`** (§7.5, I12) — the gate does not commute with the combine; `gate` present iff `output_stage == 2` |
+| combine | `temporal_splits > 1`; `workspace.numel() >= npu_turboquant_decode_workspace_size(...)`; `gate` present iff `output_stage == 2` |
+| all decode ops | `egress_offsets` int32 `[3, head_size]`, `egress_signs` fp32 `[3, head_size]`, `pi_signs` fp32 `[head_size]` — see §4.1a |
+
+### 4.1a The egress tables, and the host constructor they need
+
+No.6's three sub-DataBlock stages (strides `1, 2, 4`) cannot reach their partner lane with a
+contiguous or masked operand, because a 4/8/16-byte tensor offset is not 32-byte aligned, so
+they pay a `Gather` plus a sign multiply. The `Gather` footprint is per-element, which means
+two tables per stage, built once on the host:
+
+```
+egress_offsets[stage][i] = (i ^ stride[stage]) * sizeof(float)    # BYTE offsets, int32
+egress_signs  [stage][i] = (i & stride[stage]) ? -1.0f : +1.0f    # fp32
+pi_signs      [i]        = PiSign(i)                              # fp32, +-1
+stride = {1, 2, 4};  i in [0, head_size);  3 * 256 entries each = 3 KiB + 3 KiB
+```
+
+That is `6 KiB` of tables against the `16 KiB` a single 4096-entry offset vector would have
+cost. The construction currently lives in the CAModel runner
+(`tests/camodel/test_camodel_paged_decode_attention.cpp`); **it must move to
+`vllm_ascend/attention/turboquant_layout.py` as `turboquant_egress_tables(head_size, device)`
+and be single-sourced from there**, for the H-A reason — a host/device disagreement on a
+`Gather` offset table reads the wrong lane and returns a plausible wrong rotation, never an
+error. The existing determinism anchors apply: `turboquant_pi_signs`' LCG (seed
+`0x5F3759DF`) must match the C++ host reference, and the layout twins must stay bit-identical.
+
+Note the offsets are **byte** offsets and the kernel reads them as `uint32`. The schema
+declares int32 (`TURBOQUANT_INDEX_DTYPE`) and the adapter reinterprets; the largest value is
+`(head_size - 1) * 4 = 1020`, so the signedness never matters.
 
 ### 4.2 C++ launcher signatures
 
 Mirroring the existing `*_impl(void* stream, uint32_t block_dim, ...)` convention. Scalars
 are unqualified `uint32_t` because CANN copies the parameter list verbatim into
-`aclrtlaunch_triple_chevrons_func.h`, which has no `using namespace std`.
+`aclrtlaunch_triple_chevrons_func.h`, which has no `using namespace std`. Activations are
+`uint16_t` on the host leg: `bfloat16_t` lives behind `__CCE_AICORE__`, the two legs are
+separate translation units, and the host naturally holds bf16 as bit patterns.
 
 ```cpp
-extern "C" void turboquant_reshape_and_cache_bf16_impl(
+// No.2 — aligned prefill ingestion, MIX, grid-stride.
+extern "C" void turboquant_reshape_aligned_impl(
     void* stream, uint32_t block_dim,
     const uint16_t* key, const uint16_t* value,
     int8_t* key_cache, int8_t* value_cache, float* scale_cache,
     const int32_t* slot_mapping, const float* pi_signs, const int32_t* tables,
+    const int32_t* strip_begin,           // prefix sum, nullptr => one request
     const int32_t* cu_seqlens,            // nullptr => one request
     uint32_t num_requests, uint32_t num_tokens, uint32_t num_kv_heads,
     uint32_t head_size, uint32_t block_size, uint32_t num_blocks,
     uint32_t total_strips, float inv_sqrt_len);
 
-extern "C" void turboquant_decode_cache_update_impl(
+// No.1 — sub-strip ingestion, AIV only, grid-stride over (request, kv_head).
+extern "C" void turboquant_reshape_scatter_impl(
     void* stream, uint32_t block_dim,
     const uint16_t* key, const uint16_t* value,
     int8_t* key_cache, int8_t* value_cache, float* scale_cache,
-    const int32_t* slot_mapping, const int32_t* tables,
-    uint32_t num_tokens, uint32_t num_kv_heads, uint32_t head_size,
-    uint32_t block_size, uint32_t num_blocks, float inv_sqrt_len);
+    const int32_t* slot_mapping, const float* pi_signs,
+    const int32_t* cu_seqlens,            // nullptr => one token per request
+    uint32_t num_requests, uint32_t num_tokens, uint32_t num_kv_heads,
+    uint32_t head_size, uint32_t block_size, uint32_t num_blocks,
+    float inv_sqrt_len);
 
+// No.5 — batched Q rotation, Cube, grid-stride over row tiles.
+extern "C" void turboquant_rotate_q_batch_impl(
+    void* stream, uint32_t block_dim,
+    const uint16_t* query, const float* pi_signs, const int32_t* tables,
+    uint16_t* query_rot,
+    uint32_t num_rows, uint32_t head_size);
+
+// No.4 — GQA-folded paged decode, MIX. Takes the rotated query; no rotation operands.
 extern "C" void turboquant_gqa_paged_decode_impl(
     void* stream, uint32_t block_dim,
-    const uint16_t* query, const uint16_t* gate,       // gate may be nullptr
-    const float* pi_signs, const int32_t* tables,
+    const uint16_t* query_rot, const uint16_t* gate,   // gate may be nullptr
     const int8_t* key_cache, const int8_t* value_cache, const float* scale_cache,
     const int32_t* block_tables, const int32_t* seq_lens,
-    float* workspace, uint16_t* query_rot, uint16_t* out,
+    const float* pi_signs, const int32_t* egress_offsets, const float* egress_signs,
+    float* workspace, uint16_t* out,
     uint32_t num_requests, uint32_t num_heads, uint32_t num_kv_heads,
     uint32_t head_size, uint32_t block_size, uint32_t num_blocks,
     uint32_t max_blocks_per_seq, uint32_t query_tokens_per_req,
-    uint32_t temporal_splits, uint32_t output_stage,
-    float scale_value, float inv_sqrt_len);
+    uint32_t temporal_splits, uint32_t output_stage, float scale_value);
 
+// No.3 — 6-row paged decode, AIV only. Identical operand list minus
+// query_tokens_per_req, which is 1 by definition.
+extern "C" void turboquant_single_token_decode_impl(
+    void* stream, uint32_t block_dim,
+    const uint16_t* query_rot, const uint16_t* gate,
+    const int8_t* key_cache, const int8_t* value_cache, const float* scale_cache,
+    const int32_t* block_tables, const int32_t* seq_lens,
+    const float* pi_signs, const int32_t* egress_offsets, const float* egress_signs,
+    float* workspace, uint16_t* out,
+    uint32_t num_requests, uint32_t num_heads, uint32_t num_kv_heads,
+    uint32_t head_size, uint32_t block_size, uint32_t num_blocks,
+    uint32_t max_blocks_per_seq, uint32_t temporal_splits,
+    uint32_t output_stage, float scale_value);
+
+// — cross-page combine, AIV only.
 extern "C" void turboquant_decode_combine_impl(
     void* stream, uint32_t block_dim,
-    const float* workspace, const uint16_t* gate,
-    const float* pi_signs, const int32_t* tables, const int32_t* seq_lens,
+    const float* workspace, const uint16_t* gate, const int32_t* seq_lens,
+    const float* pi_signs, const int32_t* egress_offsets, const float* egress_signs,
     uint16_t* out,
     uint32_t num_requests, uint32_t num_heads, uint32_t num_kv_heads,
     uint32_t head_size, uint32_t query_tokens_per_req,
-    uint32_t temporal_splits, uint32_t output_stage, float inv_sqrt_len);
+    uint32_t temporal_splits, uint32_t output_stage);
 ```
 
-Note `total_strips` on O1: the adapter computes it from `cu_seqlens` (sum of
-`ceil(L_b / 16)`, which is **not** `ceil(sum L_b / 16)`) so the device never has to.
+Five notes, each the reason a parameter is there rather than derived:
+
+* **`total_strips` and `strip_begin` on No.2.** The adapter computes `total_strips` as
+  `sum_b ceil(L_b / 16)`, which is **not** `ceil(sum_b L_b / 16)`, and uploads the prefix sum
+  so the device resolves `(request, strip)` with one scalar scan (§5.3). Neither is derivable
+  on device without the prefix sum.
+* **`inv_sqrt_len` on No.1/No.2 and not on the decode ops.** It folds into the *stored scale*
+  of the quantiser, which is a writer-side concern. The decode side's `1/sqrt(d)` is already
+  in `tables` (H-A), and its softmax scale is `scale_value` (H-C). Three different factors,
+  three different homes — the former O3/O4 signatures (superseded) carried an `inv_sqrt_len` that had no
+  job and it is gone.
+* **`num_blocks` everywhere a plane is touched.** It is the `kv` stride of the planar scale
+  plane (§3.2); the decode probe's `kNumPages = 9` is a fixture constant and a mismatch moves
+  the whole V plane silently (I14).
+* **`output_stage` on No.3 as well as No.4.** Both write partials at `0`, and the combine is
+  shared, so the AIV decode is not a split-free special case.
+* **No `query_rot` output on the decode ops.** It was an input-side workspace of the former
+  the former O3's in-kernel rotation; No.5 owns it now and it is a real tensor, not scratch.
 
 ---
 
-## 5. O1 — modifications to `turboquant_reshape_and_cache_bf16.cpp`
+## 5. No.2 `npu_turboquant_reshape_aligned` — modifications to `turboquant_reshape_and_cache_bf16.cpp`
 
 Baseline: the `feat/tq-cube-clean` copy (which has the in-page offset; the harness copy is
 stale, audit §1). Four changes, in dependency order.
@@ -479,7 +657,7 @@ for every full strip, and only the tail needs new golden coverage.
 
 ---
 
-## 6. O2 — `npu_turboquant_decode_cache_update` (new)
+## 6. No.1 `npu_turboquant_reshape_scatter` (new)
 
 The per-step write. `num_tokens` arbitrary (`= B*(1+k)`), slots arbitrary and
 non-consecutive.
@@ -490,9 +668,17 @@ non-consecutive.
 **Vector-only, no Cube.** This is the one place the audit's §3.2 verdict inverts: at `M = 1`
 the Cube prologue stages 32 KiB of rotation tables to transform 512 B of payload, and
 `GEMV.md` records that an `M = 1` Mmad leaves only 32-64 B valid in each 1024-byte L0C
-sub-vector — a 16:1 waste. So `Pi = D H D` runs as the Vector butterfly: one sign multiply,
-8 radix-2 stages over 256 lanes, one scale. The harness already has the leaf
-(`routine_vector_egress_rotate.hpp` does the same transform on the egress side).
+sub-vector — a 16:1 waste. So `Pi . x` runs as the Vector butterfly: 8 radix-2
+stages over 256 lanes with the sign diagonal between them, and one scale.
+
+**It is not the same stage order as the egress.** `Pi = A . D . B` with `A` the strides
+`{32, 64, 128}` and `B` the strides `{1, 2, 4, 8, 16}`, so the ingress `Pi . x` expands as
+`A.(D.(B.x))` — strides `1, 2, 4, 8, 16` then the sign then `32, 64, 128` — while the egress
+`x . Pi` expands as `((x.A).D).B` and runs the reverse, which is what
+`routine_vector_egress_rotate.hpp` ships (`kEgressStrideOf`, `kEgressSignBeforeStage = 3`).
+The shared leaf therefore carries **two stage tables**, and the ingress one puts its three
+`Gather` stages (`s in {1, 2, 4}`, where the partner lane is inside the 8-lane DataBlock)
+first rather than last. Reusing the egress table for the ingress is a silent wrong answer.
 
 **The value-plane write is a read-modify-write of one 2048-byte strip.** A single token owns
 256 nibbles at stride 16 inside the strip — 128 bytes spread over 2048, half-byte granular.
@@ -515,14 +701,14 @@ gather the `1+k` tokens of a request into one burst in the `(request, kv_head)` 
 
 ### 6.1 Alternative considered and rejected
 
-Making the decode write go through O1 by padding `B` to a multiple of 16 and faking
+Making the decode write go through №2 by padding `B` to a multiple of 16 and faking
 consecutive slots. Rejected: there is no slot run to fake (the `B` tokens are in `B`
 different pages), and a reserved bit-bucket page cannot produce a *consecutive* 16-slot run
 mixed with real slots. Audit §5.3.
 
 ---
 
-## 7. O3 — `npu_turboquant_gqa_paged_decode` (new, promoting the harness probe)
+## 7. No.4 `npu_turboquant_gqa_paged_decode` (promoting the harness probe)
 
 Baseline: `turboquant_paged_decode_attention.cpp`. The arithmetic, the 5-stage modulo
 schedule, the marked graph, the flag-id assignment and the two measured faults it fixed
@@ -584,7 +770,7 @@ the recurrence expresses by setting those score columns to a large negative befo
 
 `temporal_splits == 1` is the no-combine path: one task owns a request's whole context for
 one KV head, the online-softmax recurrence carries `(m, l, Acc)` across every strip of every
-page, and `out` is the final answer. **That deletes O4 from the critical path and the
+page, and `out` is the final answer. **That deletes the combine from the critical path and the
 partial-state workspace entirely** for any `B` where occupancy allows it. Audit §4.4.
 
 ### 7.3 L1 key staging back to a ring
@@ -637,7 +823,7 @@ hardware's.
 
 `out_context` from the probe is stage 2. The constraint that makes `output_stage` necessary
 rather than cosmetic: the egress rotation commutes with a cross-page log-sum-exp combine and
-**the sigmoid gate does not**, so with `temporal_splits > 1` the gate must be applied by O4,
+**the sigmoid gate does not**, so with `temporal_splits > 1` the gate must be applied by the combine,
 after the combine (I12). Stage 2 with `temporal_splits > 1` must be refused by the adapter,
 not silently produce a wrong answer.
 
@@ -655,17 +841,21 @@ could read, mechanism unisolated), `workspace` carries `(m, l, Acc)` when
 of §7.4 and removes the score archive's 8 per-strip `Muls`-by-1.0 copies from AIV0 — which
 is the measured critical path.
 
-### 7.7 The prologue round trip
+### 7.7 The prologue round trip — removed by the No.5 split, not fixed
 
-Left as it is, deliberately. Removing it means making `CopyL0C2L1` work with a bf16 Nz
-destination, and the one recorded attempt produced all-256-zero score panels in a run where
-the same L0C reached GM bit-exactly. It is one GM round trip, in the prologue, once per
-launch; the page loop touches GM only to read packed pages and scales. Re-opening it is a
-separate investigation with an isolated mechanism, listed in §11.
+The former text here left the round trip in place deliberately. The six-kernel split
+removes it instead, and the distinction matters: No.4 needed `Q_rot` back as an **L0A
+operand in the same kernel**, which is why it went L0C -> GM -> L1 -> L0A. No.5's output
+*is* GM, so it is one `CopyL0C2GM` per row tile and nothing more.
+
+**This is not evidence that `CopyL0C2L1` works.** The one recorded attempt produced
+all-256-zero score panels in a run where the same L0C reached GM bit-exactly through
+`CopyL0C2GM`, mechanism unisolated. That question is simply no longer on any critical path,
+and it stays open in §11.
 
 ---
 
-## 8. O4 — `npu_turboquant_decode_combine` (new)
+## 8. `npu_turboquant_decode_combine` (new)
 
 Only on the `temporal_splits > 1` path. Per `(b, h, row)`, over the `splits` partials:
 
@@ -678,7 +868,7 @@ out = y * sigmoid(gate)                    # output_stage 2
 ```
 
 Grid `min(num_requests * num_kv_heads, core_count)`, grid-stride, Vector-only. Workspace
-layout, which O3 writes and O4 reads:
+layout, which №3/№4 write and the combine reads:
 
 ```
 workspace : fp32, [splits, num_requests, num_kv_heads, rows, head_size + 16]
@@ -690,10 +880,10 @@ floats    = splits * num_requests * num_kv_heads * rows * (head_size + 16)
 
 The replicated-DataBlock representation of `m` and `l` is the probe's existing
 `kDecodeStateLanes = 8` invariant and is what lets the recurrence run without a single
-scalar read of UB; keeping it in the workspace means O4 reads the same shape O3 wrote, with
+scalar read of UB; keeping it in the workspace means the combine reads the same shape №3/№4 wrote, with
 no repacking.
 
-O5 returns exactly that `floats` count, and `0` when `splits == 1`.
+`npu_turboquant_decode_workspace_size` returns exactly that `floats` count, and `0` when `splits == 1`.
 
 ---
 
@@ -727,6 +917,13 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
 def turboquant_key_byte(block, head, token, channel, block_size, num_kv_heads, head_size): ...
 def turboquant_value_byte(block, head, token, channel, block_size, num_kv_heads, head_size): ...
 def turboquant_scale_float(kv, block, head, token, num_blocks, num_kv_heads, block_size): ...
+
+# The three table families, single-sourced here for the same reason (H-A, H-B, §4.1a):
+# a drifted copy returns a plausible wrong number and never an exception.
+def turboquant_write_tables(head_size, device): ...    # No.2, entries +-1
+def turboquant_rotate_tables(head_size, device): ...   # No.4/No.5, entries +-1/16
+def turboquant_egress_tables(head_size, device): ...   # (offsets int32, signs fp32), 3x256
+def turboquant_pi_signs(head_size, device): ...        # existing, LCG seed 0x5F3759DF
 ```
 
 `AscendTurboQuantAttentionSpec` (`core/kv_cache_interface.py`) needs no structural change:
@@ -749,9 +946,9 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # The dispatch F3 says is missing today.
         if attn_metadata.attn_state in (AscendAttentionState.DecodeOnly,
                                         AscendAttentionState.SpecDecoding):
-            torch.ops._C_ascend.npu_turboquant_decode_cache_update(...)   # O2
+            torch.ops._C_ascend.npu_turboquant_reshape_scatter(...)       # №1
         else:
-            torch.ops._C_ascend.npu_turboquant_reshape_and_cache(         # O1
+            torch.ops._C_ascend.npu_turboquant_reshape_aligned(           # №2
                 ..., cu_seqlens=self._cu_seqlens(attn_metadata))
         return query, key, value, output
 
@@ -767,9 +964,9 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     def forward_paged_attention(self, query, attn_metadata, output, output_gate=None):
         splits, _ = self._decode_plan(attn_metadata)
         stage = 0 if splits > 1 else (2 if output_gate is not None else 1)
-        torch.ops._C_ascend.npu_turboquant_gqa_paged_decode(...)          # O3
+        torch.ops._C_ascend.npu_turboquant_gqa_paged_decode(...)      # №4
         if splits > 1:
-            torch.ops._C_ascend.npu_turboquant_decode_combine(...)        # O4
+            torch.ops._C_ascend.npu_turboquant_decode_combine(...)        # combine
         return output
 ```
 
@@ -790,12 +987,12 @@ New validation, raised at `__init__` rather than discovered at the first launch:
 * an explicit statement for `model_config.is_hybrid` — either support under the chosen
   Phase-0 allocator option, or a clean rejection naming the three-plane carve. Today the
   engine passes validation and fails at cache reshape with `len(raw_planes) == 3`.
-* keep the existing rejections of prefix caching and chunked prefill **until** O1's §5.2/§5.3
+* keep the existing rejections of prefix caching and chunked prefill **until** №2's §5.2/§5.3
   changes land, then lift them: a ragged-tail, `cu_seqlens`-aware writer is exactly what
-  chunked prefill needs. Note in the message that the dependency is O1, so the rejection has
+  chunked prefill needs. Note in the message that the dependency is №2, so the rejection has
   a visible exit.
 * spec decoding moves from "rejected" to "supported with `query_tokens_per_req = 1 + k`",
-  which is the Qwen3.5 MTP case and the regime O3 is best shaped for (audit §4.2).
+  which is the Qwen3.5 MTP case and the regime №4 is best shaped for (audit §4.2).
 * keep the PIECEWISE/NONE graph downgrade.
 
 ### 9.3 `vllm_ascend/patch/worker/patch_qwen3_5.py`
@@ -815,8 +1012,8 @@ else:
 `turboquant_fuses_output_gate` must now also require `temporal_splits == 1`, because §7.5
 forbids stage 2 with a combine. Since `splits` is a per-step quantity and
 `fuses_output_gate` is a per-layer property, the honest shape is: the layer always hands the
-gate to the backend, and the **backend** decides per step whether it goes to O3 (stage 2) or
-to O4. That keeps the gate out of torch on both paths and removes the per-step branch from
+gate to the backend, and the **backend** decides per step whether it goes to №3/№4 (stage 2) or
+to the combine. That keeps the gate out of torch on both paths and removes the per-step branch from
 the model patch. Per the repo's patching rule, all of this stays in `patch/worker/`, not in
 a model file.
 
@@ -837,8 +1034,8 @@ Both entry ops stay graph-splitting custom ops with `mutates_args=["output"]` an
 
 | File | Change |
 | --- | --- |
-| `csrc/torch_binding_meta.cpp`, `vllm_ascend/meta_registration.py` | no-op meta kernels for O1-O5 |
-| `CMakeLists.txt` | add the O2/O3/O4 translation units to `ascendc_library(vllm_ascend_turboquant ...)`; keep the `ascend950` gate; drop `turboquant_paged_attention_opt.cpp` once O3 lands, since its only purpose was to keep a schedule compiling |
+| `csrc/torch_binding_meta.cpp`, `vllm_ascend/meta_registration.py` | no-op meta kernels for every mutating op (§4) |
+| `CMakeLists.txt` | add the five new translation units (№1, №3, №5, combine, and №4's rename) to `ascendc_library(vllm_ascend_turboquant ...)`; keep the `ascend950` gate; drop `turboquant_paged_attention_opt.cpp` once №4 lands, since its only purpose was to keep a schedule compiling |
 | `vllm_ascend/envs.py` | `VLLM_ASCEND_TURBOQUANT_TEMPORAL_SPLITS` (0 = auto) for bring-up; document in the `env_variables` dict |
 | `vllm_ascend/attention/turboquant_layout.py` | add the three plane accessors of §9.1 as the single source of truth, and move `turboquant_dequantize` onto them; today it indexes the declared view and reads the wrong `(head, token)` pair (F4, audit §2.4) |
 
@@ -852,17 +1049,23 @@ this harness already uses: an inductively collapsed grid (`kSlots + 2` tiles rat
 full grid), guard-banded GM buffers, canary sweeps over everything a tile must not touch,
 and a trace audit of the dumps.
 
-| Phase | Lands | Gate |
-| --- | --- | --- |
-| **P0** | re-vendor the vllm writer copy into the harness; raise `block_size` to 128 in the probe | existing bit-exact oracle passes at `block_size = 128`, 8 strips per page, head-major planes; canary sweep clean. This closes the audit §1 staleness and is a prerequisite for everything |
-| **P1** | §3.1 byte-pool + plane accessors; §3.2 scale plane; `absmax == 0` branch; `kNumPages` -> runtime `num_blocks` (I14, I15) | a layout UT that asserts each Python **accessor** returns the same byte as the C++ index function for every `(block, head, token, channel)` of `(P, S, H, d) = (9, 128, 4, 256)` — the host-side form of [`scripts/kv_plane_layout_check.py`](../scripts/kv_plane_layout_check.py), whose three checks (writer/decoder agreement, page-level nesting, `Nz(K) = Zn(K^T)` against a row-major control) are the acceptance conditions; plus a zero-row fixture. **No byte may move in this phase** — a diff that changes a kernel's store address has failed it |
-| **P2** | O1 §5.1 grid-stride + table hoist | bit-exact at `total_strips > core_count` (the shape F5 spins on today); trace audit check 1b extended to iteration boundaries; measured GM->L1 traffic down ~33% per strip |
-| **P3** | O1 §5.2 ragged tail + §5.3 `cu_seqlens` | new golden coverage for `n in [1, 15]` on the tail strip, including the value plane's UB zero-pad and the canary that the pad bytes land only in the request's own unwritten page remainder; a ragged-batch fixture with `L_b % 16 != 0` for every `b` |
-| **P4** | O2 decode writer | single-token and `(request, 1+k)`-token RMW both bit-exact against the oracle; canary proves no strip outside the target is touched; `VALIDATE_SLOTS` form for O2 |
-| **P5** | O3 §7.1 runtime rows, §7.6 probe outputs optional | the 12-rung canary protocol re-run at `rows in {6, 12, 24, 48}`; score panels bit-exact; `(m, l)` within 2 ULP, `Acc` within its per-fixture budget; **flag-id audit re-run at every rows bucket** (§7.3's risk) |
-| **P6** | O3 §7.2 page loop with `temporal_splits == 1` | a 2-page and a 4-page context, `splits = 1`, against a host oracle that does the whole context in one pass — this is the first run that produces a *correct* multi-page answer, which the probe never did |
-| **P7** | O3 §7.3 L1 ring + O4 combine | `splits > 1` matches `splits = 1` bit-for-bit on the same fixture, which is the strongest available check on the combine; trace audit check 3 on a rung with `strips >= 2 * ring_depth` |
-| **P8** | §9 Python integration | existing UT patterns (`test_turboquant_page_budget`, layout/codec UTs) plus a new UT for the §9.1 dispatch and the §9.2 validation messages. End-to-end and accuracy gates belong to whoever has hardware |
+**The phase table lives in the roadmap.**
+[`qwen35_turboquant_execution_roadmap.md`](qwen35_turboquant_execution_roadmap.md) carries
+the five phases, their per-kernel file lists, queue and HardEvent budgets, gates and
+sequencing; an earlier P0-P8 table here duplicated it against the older O-numbering and is
+removed rather than kept in sync. Two conditions from it are interface requirements and so
+stay here:
+
+* **the layout phase moves no bytes.** A UT must assert that each Python plane accessor
+  returns the same byte as the C++ index function for every `(block, head, token, channel)`
+  of `(P, S, H, d) = (9, 128, 4, 256)` — the host-side form of
+  [`scripts/kv_plane_layout_check.py`](../scripts/kv_plane_layout_check.py), whose three
+  checks (writer/decoder agreement, page-level nesting, `Nz(K) = Zn(K^T)` against a
+  row-major control) are the acceptance conditions. A diff that changes a kernel's store
+  address has failed it.
+* **`splits > 1` must match `splits == 1` bit-for-bit** on the same fixture. That is the
+  strongest available check on the combine, and it is available only because the page loop
+  makes `splits == 1` correct first.
 
 ### 10.1 Accuracy, stated honestly
 
@@ -882,8 +1085,8 @@ No LongBench-style accuracy gate has been run on this model; that is hardware wo
 | R1 | the cause of F5 (a MIX grid wider than the core count spins) | §5.1 removes the symptom by never exceeding the core count, but the mechanism is unknown, and anything that reintroduces a wide grid reintroduces the hang | CAModel, an isolating 33-strip run with sampling compiled out |
 | R2 | mode-4 flag-id reuse across ring slots | §7.3 is the riskiest change here. The probe's three surviving channels are correct only because every consumer is slower than its producer, and §7.1 speeds the consumer up by `rows/16` | CAModel trace audit at every `rows` bucket; ultimately a hardware question about whether the flag is a counter or a level |
 | R3 | `CopyL0C2L1` with a bf16 Nz destination | removing it is the only way to delete the prologue's GM round trip; one recorded attempt gave all-zero score panels with the mechanism unisolated | CAModel, with an isolated minimal repro |
-| R4 | the AI core count of the target part | §7.2's `splits` clamp and I8 both need it; a literal would be a latent hang | runtime (`GetBlockNum()` / O6), never a constant |
+| R4 | the AI core count of the target part | §7.2's `splits` clamp and I8 both need it; a literal would be a latent hang | runtime (`GetBlockNum()` / `npu_turboquant_vector_core_num`), never a constant |
 | R5 | concurrent execution of a full grid | no decode run has ever had two blocks computing at once — every rung isolates one of 32. The isolation argument (mode-4 is per core group, each block has its own UB/L1/L0, GM writes are disjoint and canary-verified) is sound but it is an argument | CAModel, if a full-grid run is affordable; one strip of one block is ~7 min of model time on this host |
 | R6 | the hybrid allocator (N1) | upstream of all of this; a TurboQuant Qwen3.5 run dies at `len(raw_planes) == 3` before any kernel executes | vLLM-Ascend, Phase 0 of the integration map |
 | R7 | KV-transfer connectors vs §5.2's pad bytes | a connector that copies a page mid-prefill sees zeros in the request's unwritten remainder. Harmless if `seq_len` gates the read, which it should — but the hybrid connectors assume the documented layout and have not been checked against this | vLLM-Ascend connector review |
-| R8 | whether `rows = 6` is worth a dedicated kernel after all | §7.1 makes O3 cover it, and the UB budget says it fits comfortably. If profiling on silicon shows the strip pipeline's fixed cost dominates at `rows = 6`, a Vector-only variant on O2's pattern becomes attractive | hardware |
+| R8 | the №3/№4 crossover row count | §2 ships `rows == 6 -> №3`, `rows >= 12 -> №4` with an env override, and the roadmap gates №3 on an instruction census rather than a utilisation target. Which engine wins at 12 and 24 rows is unmeasured | CAModel first, then hardware |
