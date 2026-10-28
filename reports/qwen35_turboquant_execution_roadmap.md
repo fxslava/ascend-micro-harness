@@ -126,13 +126,29 @@ consume №5's `query_rot` and both need №6 for their egress.
 
 ### 1.0 №6 first: the shared butterfly leaf
 
+> **DONE**, except the egress refactor. The leaf ships three bit-identical
+> implementations rather than one, because which permutation strategy the eight stages use
+> is the whole arithmetic budget of an AIV-only ingress kernel and therefore a measurement:
+> the CAModel census in [`rotate_butterfly.md`](rotate_butterfly.md) picks the
+> register-resident `Reg::Gather` form over the Unified-Buffer-staged one by **16.3x of
+> Vector-engine span**, and over a table-free `DeInterleave` recursion by 6%. The cost
+> structure quoted below is Approach A's and is now the measured *baseline*, not the plan.
+>
+> `routine_vector_egress_rotate.hpp` is **not** refactored onto it. The decode operator's
+> egress is validated against nine canary coordinates and a three-rung strip ladder, and
+> re-pointing it at a new header is a change to verified device code with no gate of its
+> own in this cycle. The new leaf carries the egress direction, the Tier-1 probe checks it
+> against the dense right-multiplication, and the refactor stays a separate item.
+
 Files:
 
 | Path | Change |
 | --- | --- |
-| `routines/routine_vector_rotate_butterfly.hpp` | **new** — the two-direction leaf |
-| `routines/routine_vector_egress_rotate.hpp` | refactor onto it; keep its published entry points |
+| `routines/routine_vector_rotate_butterfly.hpp` | **new** — the two-direction leaf, three implementations |
+| `routines/routine_vector_egress_rotate.hpp` | refactor onto it; keep its published entry points — **not done, see above** |
 | `tests/cpu/test_rotate_butterfly_probe.cpp` | **new** — host probe against the dense `256 x 256` matrix |
+| `kernels/camodel/rotate_butterfly.cpp` | **new, not in the original plan** — the CAModel benchmark that picks the leaf |
+| `tests/camodel/test_camodel_rotate_butterfly.cpp` | **new, not in the original plan** — its runner |
 
 `Pi = (H8 (x) I32) . diag(piSigns) . (I8 (x) H32) / 16 = A . D . B`, with `A` the strides
 `{32, 64, 128}` and `B` the strides `{1, 2, 4, 8, 16}`. **The two directions are not the
@@ -234,6 +250,16 @@ kernel.
 sub-block count, and the safe MIX idiom is `GetBlockIdx() / GetSubBlockNum()`. Whether
 `GetSubBlockNum() == 1` under AIV-only — making every AIV its own block, which is what this
 kernel wants — must be **observed before either form is relied on**. Print both on rung 0.
+
+> **SETTLED.** The kernel publishes all three from block 0 of every launch and the runner
+> prints them. On `Ascend950PR_9599` CAModel under
+> `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)` with `gridDim = 1`:
+> `GetBlockIdx() == 0`, `GetBlockNum() == 1`, `GetSubBlockNum() == 1`. **Every AIV is its
+> own block, and the MIX idiom `GetBlockIdx() / GetSubBlockNum()` is not needed here** —
+> which is what №1 and №3 want. Measured at `gridDim = 1` only; a wider AIV-only grid has
+> not been launched, so the *scaling* of `GetBlockNum()` under this kernel type remains
+> unobserved. Reported in [`reshape_scatter_aiv.md`](reshape_scatter_aiv.md); risk R5 closes
+> for the one-block case and stays open for a wide grid.
 
 **Gate 1.1.**
 1. Oracle extended to partial strips; bit-exact on nibbles and scales for every
@@ -880,7 +906,7 @@ own. Per the repo's patching rule this stays in `patch/worker/`, never in a mode
 | R2 | D1 destroys the margin the surviving channels rely on | D4 | the channels are correct today only because every consumer is slower than its producer; D1 speeds consumers up to 2.7x. Trace check 3 is the gate, per bucket |
 | R3 | F5 cause unisolated | W1, any grid change | grid-stride makes it unreachable; the isolating 33-strip run with sampling compiled out is still owed |
 | R4 | L0C capacity unknown | №5 `M_chunk` | `static_assert` against a build constant, start at the probe-proven 16, raise only behind a rung. No `GetL0CSize` in the API mirror |
-| R5 | `GetSubBlockNum()` under `KERNEL_TYPE_AIV_ONLY` | №1, №3, Phase 4 | print both forms on rung 0 before relying on either |
+| R5 | `GetSubBlockNum()` under `KERNEL_TYPE_AIV_ONLY` | №1, №3, Phase 4 | **settled at `gridDim = 1`**: `GetBlockIdx() == 0`, `GetBlockNum() == 1`, `GetSubBlockNum() == 1`, printed by №1 from block 0 of every launch (§1.1, [`reshape_scatter_aiv.md`](reshape_scatter_aiv.md)). Every AIV is its own block; the MIX idiom is not needed. **Still open for a wide grid** — no AIV-only launch has used more than one block |
 | R6 | `CopyL0C2L1` with a bf16 Nz destination | not on any critical path after №5 splits out | left open deliberately; re-opening it is a separate investigation with an isolated repro |
 | R7 | AI core count of the target part | §4 `splits` clamp, every `blockDim` | `GetBlockNum()` / `npu_turboquant_vector_core_num()`, never a literal |
 | R8 | accuracy on real activations | №5 Gate 2.1, system level | the integer fixtures prove arithmetic, not accuracy; cosine/rel-L2 rungs are added but no LongBench-style gate has been run |

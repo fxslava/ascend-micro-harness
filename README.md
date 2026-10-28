@@ -202,6 +202,97 @@ no cross-block combine, and why a mode-4 counter released a wait it should have
 held — are in
 [`reports/paged_decode_attention.md`](reports/paged_decode_attention.md).
 
+The **sub-strip ingress** operator in
+[`kernels/ops/turboquant/turboquant_reshape_scatter_aiv.cpp`](kernels/ops/turboquant/turboquant_reshape_scatter_aiv.cpp)
+is the one with no Cube at all: `KERNEL_TYPE_AIV_ONLY`, one KV head of `d = 256`
+owned exclusively by one physical AIV, 1 to 16 tokens per work item. It serves
+what the aligned writer below cannot — a decode step writes `B x (1 + k)` tokens
+into `B` different pages at arbitrary non-consecutive slots, and a ragged prefill
+tail writes `n < 16` — and it is straight-line: no cross-core flag, no mode-4 id,
+no modulo ring, no L1.
+
+```sh
+bash scripts/run_reshape_scatter_camodel.sh            # the spatial sweep, H = 0, 2, 3
+bash scripts/run_reshape_scatter_camodel.sh ladder     # every rung
+```
+
+The two planes are written completely differently and the layout is why. The
+**key** plane is token-major, so one token is 128 contiguous bytes at a 32-byte
+aligned offset and a run of consecutive tokens is one MTE3 burst — no
+read-modify-write. The **value** plane is strip-blocked channel-major, which puts
+one token's 256 nibbles at stride 16 — 128 bytes spread over 2048 at half-byte
+granularity, with no aligned-burst expression at all — so the 2048-byte strip is
+read in one MTE2 burst, the owned nibbles are spliced in by register bitwise
+masks, and the whole strip goes back in one burst. **The read-modify-write always
+preserves**: in decode a strip accumulates over 16 successive steps, so zeroing
+the unowned lanes would destroy the previous fifteen tokens.
+
+Its `Pi . x` is the Vector butterfly, and **which** butterfly was decided by
+measurement. [`routines/routine_vector_rotate_butterfly.hpp`](routines/routine_vector_rotate_butterfly.hpp)
+carries three bit-identical implementations of the eight-stage cascade and
+[`reports/rotate_butterfly.md`](reports/rotate_butterfly.md) has the CAModel
+census that picks one:
+
+| variant | vector instr | RVECEX | RV_VLD | RV_VST | vector span |
+| --- | --- | --- | --- | --- | --- |
+| Blocked — Unified Buffer operands, `BinaryRepeatParams` + UB `Gather` tables | 11250 | 2512 | 3072 | 1728 | 30215 |
+| RegShuffle — register-resident, `DeInterleave`/`Select`, no tables at all | 1981 | 1834 | 64 | 64 | 1965 |
+| RegGather — register-resident, `Reg::Gather` + `MulAddDst` | **1203** | 1057 | 64 | 64 | **1850** |
+
+16 rows of 256 FP32, one AIV. Both register-resident variants issue exactly four
+register loads and four register stores per row and not one more, which is the
+zero-UB-spill invariant as a measured number rather than an intention; Approach A
+spills 1,664 extra registers over the same work and runs 16.3x longer. RegGather
+is the production leaf.
+
+```sh
+bash scripts/run_rotate_butterfly_camodel.sh           # all three variants
+```
+
+The verification is a **single-head canary protocol**. Every Global Memory
+payload is flooded with `0x7FC0BEEF` — a quiet NaN, so a stray scale read
+propagates rather than perturbs — and the oracle is handed the pre-launch cache
+images and returns them with the owned lanes replaced, so the comparison is byte
+for byte over every byte of every plane. That one comparison is simultaneously
+the correctness gate, the read-modify-write preservation gate and the
+unassigned-head gate. The mismatches are then classified into owned nibbles that
+disagree, unowned nibbles inside a written strip that moved, and nibbles outside
+every written strip that moved, because a byte comparison alone reports a wrong
+page and a page packed the wrong way round identically.
+
+Both of its Tier-1 oracles run in well under a second and are what the two
+scripts above run first, because a CAModel run compares the device against them
+and a wrong oracle is indistinguishable from a wrong kernel there:
+
+```sh
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
+    tests/cpu/test_rotate_butterfly_probe.cpp -o bin/test_rotate_butterfly_probe
+bin/test_rotate_butterfly_probe
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
+    tests/cpu/test_reshape_scatter_probe.cpp -o bin/test_reshape_scatter_probe
+bin/test_reshape_scatter_probe
+```
+
+The butterfly probe checks both stage tables against the dense `256×256`
+multiplication and all three register algorithms against the cascade — including
+the `(P·B₀)⁶ = B₅…B₀` identity the table-free variant is built on, which is
+settled there rather than by a simulator. The scatter probe checks the two
+layout maps are bijections, that every nibble of a strip lies inside its
+2048-byte window and no nibble outside it does, that the kernel's `(word, bit)`
+merge derivation agrees with the nibble map, and then **simulates the masked
+merge at word granularity** against the nibble-level reference — the one check
+that could catch an endianness or half-selection error before a ten-minute
+device run. It also prints what the unguarded `absmax == 0` scale would have
+been: `-1.70141e+38`.
+
+The protocol's first run also settled the roadmap's open item: under
+`KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)` with a one-block grid the kernel
+observes `GetBlockIdx() == 0`, `GetBlockNum() == 1` and `GetSubBlockNum() == 1`,
+so every AIV is its own block and the MIX idiom `GetBlockIdx() / GetSubBlockNum()`
+is not needed. It is printed by the kernel rather than assumed. Details, the
+trace audit's six checks and what the runs do **not** establish are in
+[`reports/reshape_scatter_aiv.md`](reports/reshape_scatter_aiv.md).
+
 The prefill counterpart in
 [`kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp`](kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp)
 is a **four-stage** `MIX_AIC_1_2` ring over the eight chunks of one 16-token ×
