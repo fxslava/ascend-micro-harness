@@ -335,4 +335,28 @@ function(add_ascend_micro_sim_targets)
   target_compile_options(test_micro_layout_bf16 PRIVATE -Wall -Wextra -Werror)
   set_target_properties(test_micro_layout_bf16 PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
       INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+
+  # ---------------------------------------------------- Cluster Sync Research Probe
+  ascendc_library(camodel_cluster_sync_probe_kernel SHARED
+      tests/research/kernel_cluster_sync_probe.cpp)
+  ascendc_compile_definitions(camodel_cluster_sync_probe_kernel PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(camodel_cluster_sync_probe_kernel PRIVATE
+      -std=c++17 -Wall -Werror -Wno-missing-braces ${splitk_system_options}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  add_executable(test_cluster_sync_probe_sim
+      tests/research/test_cluster_sync_probe.cpp)
+  target_include_directories(test_cluster_sync_probe_sim PRIVATE
+      "${ASCEND_HOME_PATH}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/research")
+  target_compile_options(test_cluster_sync_probe_sim PRIVATE -Wall -Wextra -Werror)
+  target_link_libraries(test_cluster_sync_probe_sim PRIVATE
+      camodel_cluster_sync_probe_kernel ascendcl
+      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  target_link_options(test_cluster_sync_probe_sim PRIVATE
+      "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+  set_target_properties(test_cluster_sync_probe_sim PROPERTIES
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 endfunction()

@@ -137,4 +137,25 @@ function(add_ascend_micro_npu_targets)
   add_custom_target(turboquant_npu_all DEPENDS
       test_turboquant_a8_validation test_turboquant_bf16_validation
       bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk)
+
+  # ---------------------------------------------------- Cluster Sync Research Probe (NPU)
+  ascendc_library(kernel_cluster_sync_probe SHARED
+      tests/research/kernel_cluster_sync_probe.cpp)
+  ascendc_compile_definitions(kernel_cluster_sync_probe PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(kernel_cluster_sync_probe PRIVATE
+      -std=c++17 -Wall -Werror -Wno-missing-braces ${CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  add_executable(test_cluster_sync_probe
+      tests/research/test_cluster_sync_probe.cpp)
+  target_include_directories(test_cluster_sync_probe PRIVATE
+      "${ASCEND_HOME_PATH}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/research")
+  target_link_libraries(test_cluster_sync_probe PRIVATE
+      kernel_cluster_sync_probe ascendcl stdc++)
+  target_compile_options(test_cluster_sync_probe PRIVATE -Wall -Wextra -Werror)
+  set_target_properties(test_cluster_sync_probe PROPERTIES
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
 endfunction()
