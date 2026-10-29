@@ -36,6 +36,13 @@ toolkit="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.2.0-beta.2}"
 build="${A8_BUILD_DIR:-$(mktemp -d /tmp/ascend-a8-camodel-XXXXXX)}"
 sim="${toolkit}/tools/simulator/Ascend950PR_9599/lib"
 slices="${A8_SLICES:-1 2 3}"
+# A8_MODE4=single-shot dispatches the single-shot fallback entry point instead
+# of the recycled two-slot mode-4 ring, which is the default
+# instead of the single-shot one. It exists to reproduce the stale-wait trace,
+# not to be believed: two earlier runs of that policy produced bit-exact output
+# while their traces showed a second wait passing before its set. Audit with
+# scripts/analyze_reshape_trace.py rather than reading the PASS line.
+mode4="${A8_MODE4:-reuse}"
 
 if [[ ! -f "${toolkit}/set_env.sh" ]]; then
     echo "CANN 9.2 toolkit not found: ${toolkit}" >&2
@@ -63,9 +70,11 @@ for n in ${slices}; do
     mkdir -p "${dir}"
     (
         cd "${dir}"
+        args=(--slices "${n}")
+        if [[ "${mode4}" == "single-shot" ]]; then args+=(--mode4-single-shot); fi
         if ! timeout "${A8_TIMEOUT:-900s}" \
                 "${build}/lib/test_camodel_turboquant_reshape_and_cache_a8" \
-                --slices "${n}" > run.log 2>&1; then
+                "${args[@]}" > run.log 2>&1; then
             cat run.log >&2
             echo "FAILED at ${n} slice(s)" >&2
             exit 1

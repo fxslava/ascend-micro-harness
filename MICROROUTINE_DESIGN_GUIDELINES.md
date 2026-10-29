@@ -725,7 +725,7 @@ barrier is two waits, one id from each half. Keep clear of the library's
 reserved ids (`SYNC_AIC_AIV_FLAG` 13, `SYNC_AIV_ONLY_ALL` 14, and their +16
 images).
 
-This is load bearing in **both** directions, and §6.2c records the run that
+This is load bearing in **both** directions, and §6.2d records the run that
 showed it: renumbering AIV1's channel into 0..15 — on the mistaken reading
 that the id is a four-bit field in one pool shared by the block — deadlocks the
 kernel, with the Cube stuck on its own "panel free" wait and AIV1 stuck on its
@@ -807,13 +807,58 @@ Note that `CrossCoreSetFlag` calls issued back to back by one core have **no
 guaranteed order** between different flagIds. Separate them with a wait if the
 order matters.
 
-### 6.2c A reused mode-4 flag id is not a reliable token
+### 6.2c A recycled mode-4 flag id is a token — once the announcement is drained
 
-A mode-4 flag is **not** a counting semaphore you can cycle an id through. The
-reshape-and-cache operator measured a stale announcement releasing a wait: with
-`kFlagProductReady = Owner * INTRA_NUM + Slot` — two slots, so each id carries
-*two* announcements over the run — AIV1's second wait on its slot-1 id did not
-block.
+**This section previously claimed that a mode-4 flag "is not a counting
+semaphore you can cycle an id through", and that recycling an id was refuted on
+this part. That diagnosis is wrong and is retracted. The measurements below are
+unchanged; their cause was not the flag mechanism.** Mode-4 flags do implement
+consuming-latch behaviour on Ascend 950PR and in the CANN 9.2 CAModel. What
+produced the stale releases was §6.2a's hazard — a `CrossCoreSetFlag` issued on
+the scalar unit, overtaking the pipeline work it reports, because the `pipe`
+template argument does not order it. Recycling an id turns that reordering into
+a *stale release*; single-shot allocation turns it into a harmless duplicate.
+That is why it showed under recycling and why recycling looked like the cause.
+
+So the rule is now a precondition rather than a prohibition:
+
+> A cyclic two-slot `READY`/`FREE` ring over recycled mode-4 ids is valid for
+> production pipelines, provided **every** announcement is preceded by its
+> `SetFlag<HardEvent::x_S>` / `WaitFlag<HardEvent::x_S>` pair on the pipe whose
+> work it reports, and provided the epilogue drains every queue before the
+> kernel body returns (§6.5, rule 3). A priming set, whose meaning is "this
+> buffer starts empty", reports no earlier work and needs no drain.
+
+`scripts/audit_cross_core_fences.py` is the gate for that precondition over
+both reshape-and-cache kernels and the probe below, with negative controls. It
+exists because the property is invisible to every other check here: set and
+wait counts balance without it, the id census passes, and the output can be
+bit-exact while a panel is read a generation early.
+
+#### What settled it
+
+`tests/research/kernel_cluster_sync_probe.cpp` (targets `test_cluster_sync_probe`
+on hardware and `test_cluster_sync_probe_sim` on CAModel) isolates the
+question: one physical AI Core block, `MIX_AIC_1_2`, 1 Cube + 2 Vector cores, no
+data at all, and a multi-iteration cyclic bilateral handshake over **recycled**
+ids 0, 1, 16 and 17 — AIV *k* announces on `k*16`, the Cube waits both, drains
+`MTE1_M` then `M_S`, and releases both on `k*16 + 1`; each Vector core drains
+`V_S` before its own announcement. Both iterations executed cleanly on physical
+silicon. CAModel completed cleanly too (176,061 ticks), with no early wait
+retirement in the trace.
+
+Read the trace, not the exit status. The probe moves no data, so a *sticky*
+latch would retire every wait early and the run would still finish and still
+print nothing wrong; what distinguishes the two semantics is the tick order of
+`SET_INTRA_BLOCK` against `WAIT_INTRA_BLOCK` on one recycled id. The probe's
+own output says so, and the binaries name their leg so a pasted log cannot be
+mistaken for the other.
+
+#### The measurements that were misread
+
+With `kFlagProductReady = Owner * INTRA_NUM + Slot` — two slots, so each id
+carries *two* announcements over the run — AIV1's second wait on its slot-1 id
+did not block.
 
 | event | CAModel cycle |
 | --- | ---: |
@@ -825,18 +870,27 @@ block.
 | Cube's chunk-7 `SET_INTRA_BLOCK sync_id:17` | 11167 |
 
 The chunk-7 wait was released 2179 cycles before the announcement it was
-waiting for, by the set from 6840 that the chunk-3 wait had supposedly
-consumed. The resulting page was 87% identical to the page the slot had held
-for chunk 3. **The mechanism was not isolated** — whether the flag is a level
-bit that a wait tests without clearing, or something subtler, is untested here;
-what is measured is that the *second* wait on a reused id passed early.
+waiting for, and the resulting page was 87% identical to the page the slot had
+held for chunk 3. `safe_pipeline.md` records the same shape with a 1032-cycle
+margin on READY id 16 of the synthesised ring.
 
-The fix that holds under either reading is to **label every cross-core event
-uniquely**: one flag id per announcement and one per release, each set exactly
-once and waited exactly once in the whole kernel, rather than an id per ring
-slot. Twelve ids per sub block are available (0..10 and 15), which bounds this
-discipline to short schedules — a production-length loop has to reuse ids, and
-nothing here establishes what makes that safe.
+At the time **the mechanism was not isolated**, and the reading taken — that
+the flag is a level bit a wait tests without clearing — was the conservative
+one. It was also wrong: the probe above exercises exactly the recycled
+handshake those runs were doing, with drains added, and finds no early
+retirement on silicon or in simulation. What the revisions above lacked was a
+drain on the *producer's* pipe before the announcement, so the Cube's "panel
+ready" for chunk 7 was visible on the scalar stream before its Fixpipe had
+written the panel. With one id per slot, the wait that observed it was the
+chunk-7 wait, and it read the panel early.
+
+The first fix adopted was to **label every cross-core event uniquely** — one
+flag id per announcement and one per release, each set and waited exactly once.
+It works, and it remains available as the regression fallback, but it is not
+the production policy: eleven ids per sub block saturates the legal 0..10 at an
+eight-chunk schedule, so a ninth chunk or a second temporal segment does not
+fit. The recycled ring costs five ids at any schedule length, and §6.5's rule 2
+is now written around it.
 
 **Why it had never shown.** Set and wait counts balance under a reused id, so
 no token-leak audit and no per-id pairing check fails. And a pipeline in which
@@ -844,15 +898,22 @@ one engine runs far ahead never consumes a stale token: the factored revision
 of that operator had its Cube finish all eight chunks by cycle 6121 of a
 19331-cycle run, so every panel was ready long before a Vector core looked at
 it. **Balancing the pipeline is what exposed it** — the kernel had been passing
-twice, reproducibly, with every gate green. Two consequences:
+twice, reproducibly, with every gate green. Three consequences:
 
-* a cross-core edge audit should check that no flag id carries more than one
-  set, not just that sets and waits balance;
+* a cross-core edge audit should check **tick order**, not just balance: that
+  every wait was released by an announcement already issued, and that no id
+  ever carried two outstanding ones. `scripts/analyze_reshape_trace.py` does
+  this per id across all three core dumps, and it is the check that caught
+  both stale releases; a per-id count check passes vacuously;
+* the fence in front of every announcement is a correctness precondition of
+  the recycled policy, so it gets its own audit
+  (`scripts/audit_cross_core_fences.py`) rather than a comment;
 * `kernels/ops/turboquant/turboquant_paged_attention_opt.cpp` cycles three
   slots through each of five ids over eight pages, so each of its cross-core
-  ids carries up to three announcements. It passes today with its Cube ahead of
-  its Vector cores, which is the same position the reshape operator was in.
-  Not investigated here.
+  ids carries up to three announcements. Under the corrected diagnosis that is
+  legitimate — but only if each of its announcements is drained first, which
+  has not been audited. Run `scripts/audit_cross_core_fences.py` over it before
+  relying on that.
 
 ### 6.2d The id space really is per sub block
 
@@ -920,6 +981,218 @@ distinct, output channels pairwise distinct, every reference value exactly
 representable. A fixture property stated only in a comment is one edit away
 from being false, and when it goes false the probe does not fail — it silently
 stops testing what it was built to test.
+
+### 6.5 The Mode-4 inter-wave drain protocol
+
+A `KERNEL_TYPE_MIX_AIC_1_2` launch dispatches its grid across physical AI Core
+blocks of one Cube and two Vector cores. Above the physical block count the
+scheduler runs the grid in **waves**: with 32 blocks of silicon, grid blocks
+0..31 are wave 0 and 32..63 wave 1, and each physical block executes its wave-1
+block after its wave-0 one. Two things survive that boundary:
+
+* the **mode-4 intra-block flag registers**, which are local to the physical
+  block and are not cleared by the hardware scheduler between waves;
+* the block's **engine queues**. An MTE2 burst, a Fixpipe transfer or an MTE3
+  store still in flight when the wave-0 block returns is still in flight when
+  the wave-1 block starts — and every address a kernel like this uses is a
+  compile-time constant, so wave 1 allocates the *same* L1 ring slot, the same
+  landing panel and the same packed egress slot the in-flight transfer is
+  writing.
+
+Both reshape-and-cache instances now carry the protocol below, and both
+dispatch monolithic multi-wave grids as a result. The host-side consequence
+came first and is worth stating plainly: **a launch window is not a fix, it is
+a way of not testing this.** Driving 64 strips as two 32-strip launches re-enters
+the kernel at the boundary, which re-arms everything; the bug the window hides
+only appears when one dispatch spans two waves. Every `--window` parameter,
+cyclic slice and staggered sub-launch in the reshape harnesses was removed for
+that reason, and the validation ladder is now 1, 32, 33, 48, 64, 128 strips,
+each one dispatch.
+
+#### Rule 1 — boundary and guard isolation
+
+Every core role computes the true task boundary from the same two host scalars:
+
+```cpp
+const uint32_t total_strips = numTokens / tokensPerCore;   // TotalStrips()
+if (block >= total_strips) return;                         // before anything
+AscendC::InitSocState();
+```
+
+The return is taken **before `InitSocState`, before any tensor or SOC state
+exists, before a feedback cycle is primed and before any Global Memory address
+is formed.** The failure it prevents is not a wrong answer: a block past the
+end has no `slotMapping` entry, and reading `slotMapping[block]` there is an
+invalid load that kills that AIV, after which the Cube sits on its next
+`CrossCoreWaitFlag` for the rest of the launch. All three roles derive `block`
+from the same two hardware registers, so they reach the same decision, and a
+guarded group announces nothing its peers would wait for. Divide-by-zero is
+part of the guard, not an assumption: `TotalStrips` returns 0 for a zero
+`tokensPerCore`, which guards every block rather than faulting the scalar unit.
+
+#### Rule 2 — deterministic intra-block channel allocation
+
+Single-shot id allocation — one id per announcement and one per release — does
+not scale: eleven ids per sub block covers an eight-chunk schedule and the
+legal space is 0..10, so a ninth chunk or a second temporal segment collides
+with the library's reserved 11..14. The answer is a bounded bilateral ring:
+two READY and two FREE channels per sub block, each alternating strictly
+`SET, WAIT, SET, WAIT`, the alternation enforced by the paired channel rather
+than asserted. **Five ids per sub block, whatever the schedule length, and that
+is the shipped default.**
+
+It was synthesised and exhaustively checked 1-safe, deadlock-free and
+co-reachable over 41,844,109 modulo states
+(`kernels/ops/turboquant/safe_pipeline_proof.json`) *under an explicit
+consuming one-bit latch semantics*, and that premise is now measured rather
+than assumed: §6.2c's probe ran the cyclic handshake over recycled ids on
+physical silicon and on CAModel with no early wait retirement.
+
+**The precondition is the fence, and it is not optional.** Every announcement
+must be behind its `SetFlag`/`WaitFlag<HardEvent::x_S>` pair on the pipe whose
+work it reports (§6.2a), because a mode-4 set issues on the scalar unit and the
+`pipe` argument does not order it. Two earlier revisions of this operator
+recycled ids *without* that drain and measured a second wait retiring 1032 and
+2179 cycles before its announcement; §6.2c has the tables and the corrected
+diagnosis. `scripts/audit_cross_core_fences.py` is the gate, and a priming set
+is the only exemption.
+
+The budget is a compile-time object rather than a comment in both policies:
+
+```cpp
+template <std::uint32_t Chunks, std::uint32_t LandDepth>
+struct RecycledChannels {
+    static constexpr std::uint32_t kMaxLocalId = 2u * LandDepth;
+    static_assert(kMaxLocalId <= kMaxSafeLocalId, "...");
+};
+```
+
+A schedule that outgrows the legal space fails to compile instead of silently
+renumbering a flag into id 13.
+
+Both policies are compiled, selected by a non-type template parameter, and
+both are dispatchable:
+
+```cpp
+template <bool Reuse> using Flags =
+    turboquant_wave::ChannelPolicy<Reuse, kChunks, kLandDepth>;
+
+extern "C" __global__ void op(...)                     { KernelBody<true>(...);  }
+extern "C" __global__ void op_mode4_single_shot(...)   { KernelBody<false>(...); }
+```
+
+They differ in **nothing but the id allocation** — same schedule, same wait
+placement, same priming, same drain — so a difference in behaviour between the
+two entry points isolates recycling and nothing else. The harnesses expose this
+as `--mode4-single-shot` (and `-DTQ_TEST_MODE4_SINGLE_SHOT=1` for a whole CI
+job). Keep the fallback: it is the bisection control for any future
+cross-core fault, and the one policy under which no reading of the flag
+mechanism can make a second wait pass early. **Read the trace either way.**
+Both revisions that were wrong produced bit-exact caches and intact guards; a
+green run has never been the gate here.
+
+#### Rule 3 — the mandatory inter-wave epilogue drain
+
+Draining the marked graph's credits retires this block's *event bits*. It does
+not retire its *transfers*. Before leaving the kernel body — or before
+advancing to a next temporal or page segment — every role moves every
+asynchronous queue it owns into the scalar stream, and the Cube then tells both
+Vector cores that it has:
+
+```cpp
+// Cube, after draining every ring credit and every panel release:
+SetFlag<HardEvent::MTE2_S>(0); WaitFlag<HardEvent::MTE2_S>(0);
+SetFlag<HardEvent::M_S>(0);    WaitFlag<HardEvent::M_S>(0);
+SetFlag<HardEvent::FIX_S>(0);  WaitFlag<HardEvent::FIX_S>(0);
+CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrained<0>);
+CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrained<1>);
+
+// AIV0:                                   // AIV1:
+CrossCoreWaitFlag<4, PIPE_V>(drained0);    CrossCoreWaitFlag<4, PIPE_MTE3>(drained1);
+V_S, then MTE2_S, then MTE3_S              MTE3_S, then V_S, then MTE2_S
+```
+
+Four points, each of which cost something to learn:
+
+* **The Vector cores await the Cube's drain first.** The Cube is the only core
+  that writes their landing rings, so until it reports every queue retired, a
+  Fixpipe of *this* wave can still be in flight against a panel the next wave
+  is about to allocate at the same UB address.
+* **MTE1 has no scalar route.** §6.2a: the available routes are `V_S`,
+  `MTE2_S`, `MTE3_S`, `FIX_S` and `M_S`, and there is no `MTE1_S`. MTE1 is
+  covered transitively by the `M_MTE1` wait, which sits behind the Mmads that
+  consumed its loads.
+* **Drain an idle queue anyway.** Neither Vector core issues MTE2 work in these
+  kernels. The pair is issued regardless, because "this queue is empty" is
+  exactly what the wave boundary needs established, and an empty queue retires
+  it immediately. Two instructions, against a whole-pipeline stall for
+  `PipeBarrier<PIPE_ALL>`.
+* **The two Vector cores drain in different orders**, each leading with the
+  pipe it is most likely to still have work on — AIV0 the Vector queue it has
+  just finished casting on, AIV1 the MTE3 queue carrying its last cache bursts.
+
+#### What the model establishes, and what it does not
+
+`tests/cpu/test_reshape_wave_model.py` is the capacity-one token/queue model of
+this protocol: three cores, in-order engine queues, a scalar stream that
+dispatches into them in program order and stalls on cross-core waits, HardEvent
+places of capacity one, mode-4 places shared between the Cube and one Vector
+core, and generation ownership on every L1 slot, landing panel, packed slot,
+L0 page region and L0C. It runs **two** grid blocks on the same physical block,
+carrying the marking across, which is what a multi-wave grid does.
+
+Two hardware properties were unestablished when the model was written, and it
+treats both as knobs rather than assumptions: whether `wait_intra_block`
+**consumes** the flag it tested, and whether kernel entry **clears** the
+block's mode-4 registers. The four combinations do not agree, which is the
+useful part — the model says what each world costs without picking one:
+
+| wait consumes | entry clears | single-shot | recycled |
+| --- | --- | --- | --- |
+| yes | yes | safe | safe |
+| yes | no | safe | safe |
+| no (sticky) | yes | safe | fails in wave 0 |
+| no (sticky) | no | fails in wave 1 | fails in wave 0 |
+
+**§6.2c's probe puts the hardware in the top half of that table**: mode-4 waits
+consume, on silicon and in the CANN 9.2 CAModel, provided the announcement is
+drained first. Rows 1 and 2 are the live ones and both policies are safe there,
+which is why the recycled default is sound and why the fallback stays
+dispatchable rather than being deleted. The bottom half is kept because it is
+what the two stale releases *looked* like, and because it says what to expect
+if a toolkit revision ever reintroduces them: the model reproduces both
+failures as buffer-ownership violations rather than as assertions about flags —
+the recycled policy's second wait on a reused id passes early and the Vector
+core casts a landing panel the Fixpipe has not written yet, which is the shape
+of both traces. That is the signature to look for, and
+`scripts/analyze_reshape_trace.py` is what looks for it.
+
+The model is exhaustive on bounded instances (two chunks over a depth-2 L1
+ring: 57,348 reachable states per wave) and randomised on the four- and
+eight-chunk schedules, at ingress lookaheads 1 and 3. Three negative controls
+must fail and do: unprimed landing credits deadlock, a missing epilogue drain
+leaks mode-4 flags past the block, and a doubled announcement is rejected. It
+models synchronisation and buffer lifetime only — not numerics, alignment, bus
+burst splitting or lowering — and **a pass is not a CAModel result**.
+
+#### Checklist for a MIX kernel that may span waves
+
+- [ ] Every role returns on `block >= numTokens / tokensPerCore`, before
+      `InitSocState` and before any GM address is formed.
+- [ ] The strip-count divide happens once; the guard and any sampling
+      predicate share it.
+- [ ] Every cross-core id is `static_assert`ed inside 0..10 per sub block, by
+      a budget expression and not by inspection.
+- [ ] Every announcement is behind its `x_S` drain on the pipe whose work it
+      reports; only priming sets are exempt. Audited, not inspected.
+- [ ] The trace audit checks tick order per id — every wait released by an
+      announcement already issued, never two outstanding — not just balance.
+- [ ] Every role drains every queue it owns into the scalar stream before
+      returning, and the Vector cores wait for the Cube's drain first.
+- [ ] The host drives multi-wave grids as ONE dispatch. No window, no cyclic
+      slice, no staggered sub-launch.
+- [ ] The ladder includes a rung with a *ragged* second wave (33, 48), not
+      only full ones (32, 64).
 
 ## 7. Checklist for a new micro-routine
 

@@ -150,10 +150,17 @@
 //
 // **The risk.** Section 6.2c records a measured case where a mode-4 id reused
 // across ring slots released a wait 2179 cycles before the announcement it was
-// waiting for: a stale set from an earlier announcement on the same id. The
-// fix that holds under any reading of the mechanism is one id per
-// announcement, and with two-slot rings over eight strips each id here carries
-// **four** announcements. The 8-strip rung measured that risk coming true on
+// waiting for: a stale set from an earlier announcement on the same id. NOTE,
+// 2026-10-29: section 6.2c has since been corrected. That stale release was
+// section 6.2a's hazard -- an announcement issued on the scalar unit ahead of
+// the pipeline work it reported -- and not a non-consuming latch; recycled
+// mode-4 ids ARE sound when every announcement is drained first, which
+// tests/research/kernel_cluster_sync_probe.cpp measured on silicon and on
+// CAModel. So the id counts below are no longer a hazard in themselves. What
+// this kernel has NOT had is scripts/audit_cross_core_fences.py run over it,
+// which is the gate for the precondition; do that before relying on the
+// reasoning in the rest of this comment. With two-slot rings over eight
+// strips each id here carries **four** announcements. The 8-strip rung measured that risk coming true on
 // kFlagL1Free -- see the kL1End comment for the ticks -- and that edge is now
 // gone, its ring replaced by one L1 page per strip. The three surviving
 // channels still carry four announcements each, so the same risk applies to

@@ -16,24 +16,16 @@
 // That test, if it is ever wanted, belongs in a separate clearly labelled
 // runner; it must not replace this one.
 //
-// What the ladder covers, and why 33 is on it
-// -------------------------------------------
-// Strips are driven in windows of at most `--window` (default 32), because the
-// kernel allows one strip per grid block per launch and a grid wider than the
-// device's AI core count does not dispatch. The rungs are not arbitrary:
-//
-//    1   cold start: one block, one launch, no window boundary at all.
-//   32   one full wave in a single launch -- the widest grid that dispatches
-//        at the default window, and the rung where every mode-4 flag id is
-//        used once by 32 different physical cores.
-//   33   ONE strip in the second wave. This is the rung that matters: it is a
-//        ragged tail launch of a single block immediately after a full wave,
-//        so a physical core that has already used its mode-4 ids must re-arm
-//        them, and a token leaked by the first launch shows up as a hang or a
-//        wrong page here and nowhere else.
-//   64   two full waves, so every core runs twice and the tail is not ragged.
-//        33 and 64 fail differently: 33 catches a leak that only a *partial*
-//        second launch exposes, 64 catches one that needs a full reuse cycle.
+// What the ladder covers, and why it is one dispatch per rung
+// -----------------------------------------------------------
+// Every rung is a SINGLE monolithic kernel launch of that many grid blocks.
+// There is no --window, no cyclic slice and no staggered sub-launch: those
+// existed to keep each physical wave a fresh kernel entry, because the kernel
+// could not survive its own wave boundary. It can now -- boundary guard,
+// bounded recycled channels, mandatory epilogue drain
+// (turboquant_wave_protocol.hpp, guidelines section 6.5) -- and a capped
+// launch would hide exactly the behaviour this ladder exists to test. The
+// rungs and what each one is for are in tq_npu::default_ladder().
 //
 // Pages are fragmented (numBlocks = 2 * strips + 2, strip s -> page 2s + 1),
 // so the page index is never the grid block index and a stray write lands on a
@@ -43,127 +35,47 @@
 // invisible in an aggregate byte count.
 //
 // Usage:
-//   test_turboquant_bf16_validation [--strips N]... [--tokens N]... [--window W]
-//
-// --strips and --tokens may each be repeated to build a custom ladder; with
-// neither, the ladder is 1, 32, 33, 64 strips.
+//   test_turboquant_bf16_validation [--strips N]... [--tokens N]... [--single]
 
 #include "../turboquant_npu_common.hpp"
 
-#include <charconv>
 #include <cstdio>
-#include <cstring>
 #include <exception>
-#include <string_view>
-#include <vector>
-
-namespace {
-
-constexpr int kDefaultWindow = 32;
-constexpr int kMaxStrips = 4096;
-
-void usage(std::FILE* out, const char* argv0)
-{
-    std::fprintf(out,
-                 "Usage: %s [--strips N]... [--tokens N]... [--window W]\n"
-                 "  --strips N  validate a context of N aligned 16-token strips\n"
-                 "              (repeatable; 1..%d)\n"
-                 "  --tokens N  the same, given in tokens; N must be a multiple of %d\n"
-                 "  --window W  at most W strips per kernel launch (default %d).\n"
-                 "              A context wider than W is driven as several\n"
-                 "              launches, which is how the second wave is reached.\n"
-                 "  With no --strips or --tokens the ladder is 1, 32, 33, 64 strips.\n",
-                 argv0, kMaxStrips, tq_npu::kBlockSize, kDefaultWindow);
-}
-
-bool parse_int(std::string_view text, int& out)
-{
-    const char* begin = text.data();
-    const char* end = begin + text.size();
-    int value = 0;
-    const auto result = std::from_chars(begin, end, value);
-    if (result.ec != std::errc{} || result.ptr != end) return false;
-    out = value;
-    return true;
-}
-
-}  // namespace
 
 int main(int argc, char** argv)
 {
-    std::vector<int> ladder;
-    int window = kDefaultWindow;
-
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view arg(argv[i]);
-        const bool is_strips = arg == "--strips";
-        const bool is_tokens = arg == "--tokens";
-        if (is_strips || is_tokens || arg == "--window") {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "%s needs a value\n", argv[i]);
-                usage(stderr, argv[0]);
-                return 2;
-            }
-            int value = 0;
-            if (!parse_int(argv[i + 1], value)) {
-                std::fprintf(stderr, "%s: not an integer: %s\n", argv[i], argv[i + 1]);
-                return 2;
-            }
-            ++i;
-            if (is_tokens) {
-                if (value <= 0 || value % tq_npu::kBlockSize != 0) {
-                    std::fprintf(stderr,
-                                 "--tokens must be a positive multiple of %d, got %d\n",
-                                 tq_npu::kBlockSize, value);
-                    return 2;
-                }
-                value /= tq_npu::kBlockSize;
-            }
-            if (is_strips || is_tokens) {
-                if (value <= 0 || value > kMaxStrips) {
-                    std::fprintf(stderr, "strip count out of range: %d\n", value);
-                    return 2;
-                }
-                ladder.push_back(value);
-            } else {
-                if (value <= 0) {
-                    std::fprintf(stderr, "--window must be positive, got %d\n", value);
-                    return 2;
-                }
-                window = value;
-            }
-        } else if (arg == "--help" || arg == "-h") {
-            usage(stdout, argv[0]);
-            return 0;
-        } else {
-            std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
-            usage(stderr, argv[0]);
-            return 2;
-        }
+    tq_npu::Options opts;
+    switch (tq_npu::parse_options(argc, argv, opts)) {
+    case tq_npu::ParseResult::kExitOk: return 0;
+    case tq_npu::ParseResult::kExitUsage: return 2;
+    case tq_npu::ParseResult::kRun: break;
     }
-
-    if (ladder.empty()) ladder = {1, 32, 33, 64};
+    const std::vector<int> ladder =
+        opts.single ? tq_npu::single_rung(opts.ladder) : opts.ladder;
 
     try {
         tq_npu::Session session;
         std::printf("turboquant_reshape_and_cache_bf16 NPU validation, "
-                    "window %d strip%s per launch\n",
-                    window, window == 1 ? "" : "s");
+                    "one monolithic dispatch per rung, %s%s\n",
+                    tq_npu::mode4_name(opts.mode4_reuse),
+                    opts.single ? " (--single: last rung only)" : "");
         for (const int strips : ladder) {
             tq_npu::Fixture fixture(strips * tq_npu::kBlockSize);
             tq_npu::Bf16Device device(fixture);
-            const int launches = device.launch(session.stream, fixture, window);
+            device.launch(session.stream, fixture, opts.mode4_reuse);
             tq_npu::check(aclrtSynchronizeStream(session.stream),
                           "aclrtSynchronizeStream");
-            const int tail = strips % window;
-            std::printf("\n%d strips in %d launch%s%s\n", strips, launches,
-                        launches == 1 ? "" : "es",
-                        launches > 1 && tail != 0 ? " (ragged tail wave)" : "");
+            // The wave arithmetic is reported, not assumed: the physical block
+            // count is a property of the part, so the harness states the grid
+            // it dispatched and lets the reader map it onto waves.
+            std::printf("\n%d strips in 1 launch of %d grid blocks\n", strips, strips);
             tq_npu::verify(fixture, device);
         }
-        std::printf("\nPASS turboquant_reshape_and_cache_bf16: %zu ladder rungs, "
-                    "bit-exact against the shared integer oracle\n",
-                    ladder.size());
+        std::printf("\nPASS turboquant_reshape_and_cache_bf16: %zu ladder rung%s, "
+                    "single dispatch each, %s, bit-exact against the shared "
+                    "integer oracle\n",
+                    ladder.size(), ladder.size() == 1 ? "" : "s",
+                    tq_npu::mode4_name(opts.mode4_reuse));
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL turboquant BF16 NPU validation: %s\n", e.what());

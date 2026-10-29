@@ -342,10 +342,22 @@ carries *two* announcements across the eight chunks:
 
 The chunk-7 wait was released 2179 cycles before the announcement it was
 waiting for, by the set from 6840 that the chunk-3 wait had supposedly
-consumed. **A mode-4 flag is not a counting token you can cycle an id
-through.** Whether the flag is a level bit that a wait tests without clearing,
-or something subtler, was not isolated: the fix removes the dependence rather
-than characterising the mechanism.
+consumed. The conclusion drawn at the time -- that a mode-4 flag is not a
+counting token you can cycle an id through -- was the conservative reading, and
+the mechanism was not isolated.
+
+> **Superseded, 2026-10-29.** It was isolated later.
+> `tests/research/kernel_cluster_sync_probe.cpp` ran a cyclic handshake over
+> recycled mode-4 ids on one physical block, with an `x_S` drain before every
+> announcement, and completed cleanly on physical silicon and on CAModel with
+> no early wait retirement. The stale release above was
+> `MICROROUTINE_DESIGN_GUIDELINES.md` §6.2a's hazard: the announcement issued
+> on the scalar unit before the Fixpipe it reported had committed, and
+> recycling turned that reordering into a stale release instead of a harmless
+> duplicate. Mode-4 waits do consume. The fix recorded below is still correct
+> and still ships as the fallback entry point, but the operator's default is
+> now the recycled two-slot ring; see §6.2c, §6.5 rule 2 and
+> `reports/reshape_and_cache_inter_wave.md`.
 
 **Fix: one flag id per cross-core event, never reused.** Per Vector core, over
 its four chunks `j = Chunk / 2`:

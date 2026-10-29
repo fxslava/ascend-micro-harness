@@ -2,9 +2,17 @@
 """Audit the MIX_AIC_1_2 reshape-and-cache probe from its CAModel traces.
 
 Usage:
-  analyze_reshape_trace.py <aiv0_popped> <aiv0_complete>
+  analyze_reshape_trace.py [--mode4-single-shot]
+                           <aiv0_popped> <aiv0_complete>
                            <aiv1_popped> <aiv1_complete>
                            <aic_popped>  <aic_complete>
+
+The recycled two-slot channel entry point is the default, matching the kernels.
+--mode4-single-shot says the run dispatched the fallback that gives every event
+its own id, which changes the expected per-id census. Neither flag relaxes the
+order check: that one is what caught the two stale releases in the first place,
+and it is the audit the recycled policy has to keep passing. --mode4-reuse is
+still accepted, and now selects the default.
 
 The fused attention audit next door checks a three-stage ring whose Vector
 cores have different roles (recurrence and CV staging). This kernel has a
@@ -18,12 +26,16 @@ Seven checks, each fatal:
   1. intra-core SET_FLAG / WAIT_FLAG balance per core and per
      (pipe, trigger pipe, flag id), so no HardEvent token leaks, and event ids
      6 and 7 left alone;
-  2. cross-core SET_INTRA_BLOCK / WAIT_INTRA_BLOCK pairing per flag id, and
-     -- the check that matters -- that no id carries more than one set in
-     the whole run. A reused mode-4 id is not a token a wait consumes: this
-     operator measured a second wait on one id passing 2179 cycles before the
-     announcement it was waiting for. Set and wait counts balance under reuse,
-     so counting alone passes vacuously;
+  2. cross-core SET_INTRA_BLOCK / WAIT_INTRA_BLOCK pairing and census per
+     flag id for the policy the run dispatched, and -- the check that
+     matters -- that in TICK ORDER every wait was released by an announcement
+     that had already issued and no id ever carried two outstanding ones. A
+     recycled mode-4 id is a token a wait consumes -- but only if the
+     announcement was drained to the scalar stream first. Two revisions of
+     this operator that recycled ids without that drain measured a second
+     wait passing 2179 and 1032 cycles before the announcement it was
+     waiting for. Set and wait counts balance under reuse, so counting alone
+     passes vacuously and only the order check can see it;
   3. chunk ownership: the Cube announced CHUNKS panels, half to each Vector
      core, and waited one panel-free flag per chunk from each half plus the two
      priming tokens, so neither Vector core was outrun and neither was skipped;
@@ -75,14 +87,62 @@ LAND_DEPTH = 2      # landing panels per Vector core
 STAGE_DEPTH = 4     # L1 page ring depth, so four columns of pipeline fill
 PER_CORE = CHUNKS // 2
 
-# Flag ids, from the kernel: one id per cross-core event, never reused. Per
-# Vector core, over its PER_CORE chunks j, product-ready is Owner*16 + j, and
+# Flag ids, from the kernel. Two policies, selected by the entry point the run
+# dispatched, so the audit has to be told which one it is looking at.
+#
+# single-shot (--mode4-single-shot): one id per cross-core event, never
+# reused. Per
+# Vector core, over its PER_CORE chunks j, product-ready is Owner*16 + j and
 # panel-free is Owner*16 + 4 + j for the Cube's wait and
-# Owner*16 + 4 + j + LAND_DEPTH for the AIV's release.
+# Owner*16 + 4 + j + LAND_DEPTH for the AIV's release; Owner*16 + 10 carries
+# the inter-wave drain join.
+#
+# recycled (the default): a bounded bilateral two-slot ring, product-ready on
+# Owner*16 + slot, panel-free on Owner*16 + LAND_DEPTH + slot, drain on
+# Owner*16 + 2*LAND_DEPTH. Every id then carries PER_CORE/LAND_DEPTH
+# announcements, so check 2 becomes an ORDER check instead of a count check:
+# the one thing that distinguishes a working ring from the two runs that
+# looked like they refuted it is whether each wait was released by its OWN
+# announcement. Those two were unfenced announcements overtaking their own
+# pipeline (guidelines 6.2a), not a non-consuming latch -- which is why this
+# check, and not a per-id count, is the one that must keep passing.
+PAGE_DRAINED_LOCAL = 4 + PER_CORE + LAND_DEPTH          # 10
 PRODUCT_READY = {core * 16 + j for core in (0, 1) for j in range(PER_CORE)}
 PANEL_FREE = {core * 16 + 4 + i
               for core in (0, 1) for i in range(PER_CORE + LAND_DEPTH)}
-FLAG_OWNER = {flag: flag // 16 for flag in PRODUCT_READY | PANEL_FREE}
+PAGE_DRAINED = {core * 16 + PAGE_DRAINED_LOCAL for core in (0, 1)}
+
+REUSE_PRODUCT_READY = {core * 16 + s for core in (0, 1) for s in range(LAND_DEPTH)}
+REUSE_PANEL_FREE = {core * 16 + LAND_DEPTH + s
+                    for core in (0, 1) for s in range(LAND_DEPTH)}
+REUSE_PAGE_DRAINED = {core * 16 + 2 * LAND_DEPTH for core in (0, 1)}
+
+
+def flag_tables(reuse):
+    """(product-ready, panel-free, page-drained, owner map) for one policy."""
+    if reuse:
+        ready, free, drained = (REUSE_PRODUCT_READY, REUSE_PANEL_FREE,
+                                REUSE_PAGE_DRAINED)
+    else:
+        ready, free, drained = PRODUCT_READY, PANEL_FREE, PAGE_DRAINED
+    owner = {flag: flag // 16 for flag in ready | free | drained}
+    return ready, free, drained, owner
+
+
+# Expected announcements per id. Under the single-shot policy every id carries
+# exactly one; under the recycled policy each landing channel carries one per
+# generation that maps onto it, and the drain channel still carries one.
+def expected_sets(flag, reuse, ready, free, drained):
+    if flag in drained:
+        return 1
+    if not reuse:
+        return 1
+    if flag in ready:
+        return PER_CORE // LAND_DEPTH
+    if flag in free:
+        # One priming set plus one release per generation on that slot.
+        return 1 + PER_CORE // LAND_DEPTH
+    return 1
 
 VECTOR_PIPES = {"RVECEX", "RVECST", "RVECLD", "RVECSU", "RVECLP", "VEC"}
 CUBE_PIPES = {"CUBE", "FIXP", "MTE1", "MTE2"}
@@ -143,6 +203,22 @@ def hard_event_balance(name, records):
     return sets
 
 
+def cross_core_events(records, rebase=0):
+    """[(tick, kind, absolute flag id)] for one core, in tick order.
+
+    Counting cannot see a stale announcement: a reused id balances its sets and
+    waits however early a wait was released. Order can, which is what caught
+    both stale releases, so the order is kept.
+    """
+    out = []
+    for tick, _pipe, operation in records.values():
+        sync = SYNC.search(operation)
+        if sync:
+            kind, _, sync_id = sync.groups()
+            out.append((tick, kind, int(sync_id) + rebase))
+    return sorted(out)
+
+
 def cross_core(records, rebase=0):
     """{(kind, absolute flag id): count} for one core.
 
@@ -197,7 +273,7 @@ def busy(records, complete, keep):
 
 
 def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
-         aic_popped, aic_complete):
+         aic_popped, aic_complete, mode4_reuse=True):
     v0_in, v0_out = read(aiv0_popped), read(aiv0_complete)
     v1_in, v1_out = read(aiv1_popped), read(aiv1_complete)
     c_in, c_out = read(aic_popped), read(aic_complete)
@@ -209,32 +285,73 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
         "AIC": hard_event_balance("AIC", c_in),
     }
 
-    # ---- 2. cross-core pairing, and no flag shared by both cores ------
+    # ---- 2. cross-core pairing, census and ORDER ----------------------
+    ready_ids, free_ids, drained_ids, flag_owner = flag_tables(mode4_reuse)
     per_core_flags = {0: cross_core(v0_in, 0), 1: cross_core(v1_in, INTRA_NUM)}
     aiv = per_core_flags[0] + per_core_flags[1]
     aic = cross_core(c_in, 0)
     ids = {flag for _, flag in list(aiv) + list(aic)}
-    # The check that matters. A reused mode-4 id is not a token a wait
-    # consumes: this operator measured a second wait on one id passing 2179
-    # cycles before the announcement it was waiting for, released by the set
-    # the first wait had supposedly taken (guidelines section 6.2c). Set and
-    # wait counts balance under reuse, so counting cannot see it. The invariant
-    # is that no id carries more than one set in the whole run.
+    print(f"mode-4 channel policy: "
+          f"{'recycled two-slot ring' if mode4_reuse else 'single-shot channels'}, "
+          f"{len(ids)} ids in the trace")
     for flag in sorted(ids):
         sets = aiv[("SET", flag)] + aic[("SET", flag)]
         waits = aiv[("WAIT", flag)] + aic[("WAIT", flag)]
-        if sets != 1 or waits != 1:
+        want = expected_sets(flag, mode4_reuse, ready_ids, free_ids, drained_ids)
+        if sets != want or waits != want:
             raise SystemExit(
-                f"mode-4 flag {flag} carries {sets} sets and {waits} waits: "
-                f"every cross-core event needs its own id, because a reused id "
-                f"releases its second wait early"
+                f"mode-4 flag {flag} carries {sets} sets and {waits} waits, "
+                f"expected {want} of each under the "
+                f"{'recycled' if mode4_reuse else 'single-shot'} policy"
             )
         users = sorted(core for core in (0, 1)
                        if any(k[1] == flag for k in per_core_flags[core]))
-        if users and FLAG_OWNER.get(flag) != users[0]:
+        if users and flag_owner.get(flag) != users[0]:
             raise SystemExit(
                 f"mode-4 flag {flag} is used by AIV{users[0]}, expected "
-                f"AIV{FLAG_OWNER.get(flag)}"
+                f"AIV{flag_owner.get(flag)}"
+            )
+
+    # The check that matters, and the only one that could see the failure that
+    # looked like a refutation of channel recycling twice. A recycled mode-4 id
+    # balances its sets and waits however early a wait was released, so
+    # counting passes vacuously; the invariant is that every wait is released
+    # by an announcement that had already issued, and that no id ever carries
+    # two outstanding ones. Under the single-shot fallback this is implied by
+    # the census above; under the recycled default it IS the audit. It is what
+    # measured a second wait passing 1032 and 2179 cycles before its matching
+    # set, in the two revisions whose announcements were not drained first --
+    # so this check is the standing regression test for that fence.
+    timeline = (cross_core_events(v0_in, 0) + cross_core_events(v1_in, INTRA_NUM)
+                + cross_core_events(c_in, 0))
+    per_id = {}
+    for tick, kind, flag in sorted(timeline):
+        per_id.setdefault(flag, []).append((tick, kind))
+    for flag in sorted(per_id):
+        outstanding = 0
+        for tick, kind in per_id[flag]:
+            if kind == "SET":
+                outstanding += 1
+                if outstanding > 1:
+                    raise SystemExit(
+                        f"mode-4 flag {flag}: a second announcement at CAModel "
+                        f"tick {tick} before the first was consumed, so one of "
+                        f"them is lost"
+                    )
+            else:
+                if outstanding == 0:
+                    raise SystemExit(
+                        f"mode-4 flag {flag}: WAIT at CAModel tick {tick} "
+                        f"released with no outstanding announcement -- a stale "
+                        f"set released it, which is the failure recorded in "
+                        f"guidelines section 6.2c and safe_pipeline.md"
+                    )
+                outstanding -= 1
+        if outstanding != 0:
+            raise SystemExit(
+                f"mode-4 flag {flag} leaves {outstanding} announcement(s) set "
+                f"at the end of the run: the next wave on this physical block "
+                f"inherits them"
             )
     if ids & RESERVED_FLAG_IDS:
         raise SystemExit(
@@ -255,7 +372,7 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
         raise SystemExit(
             f"cross-core total mismatch: {cross_sets} sets, {cross_waits} waits"
         )
-    unknown = sorted(ids - PRODUCT_READY - PANEL_FREE)
+    unknown = sorted(ids - ready_ids - free_ids - drained_ids)
     if unknown:
         raise SystemExit(f"unexpected mode-4 flag ids in the trace: {unknown}")
 
@@ -266,13 +383,13 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
     # two are the priming tokens, drained by the Cube epilogue).
     announced = {
         core: sum(v for k, v in aic.items()
-                  if k[0] == "SET" and k[1] in PRODUCT_READY
-                  and FLAG_OWNER.get(k[1]) == core)
+                  if k[0] == "SET" and k[1] in ready_ids
+                  and flag_owner.get(k[1]) == core)
         for core in (0, 1)
     }
     released = {
         core: sum(v for k, v in per_core_flags[core].items()
-                  if k[0] == "SET" and k[1] in PANEL_FREE)
+                  if k[0] == "SET" and k[1] in free_ids)
         for core in (0, 1)
     }
     for core in (0, 1):
@@ -491,6 +608,13 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 7:
+    args = sys.argv[1:]
+    # The recycled ring is the kernels' default, so it is this script's too; a
+    # trace analysed under the wrong policy fails its census for the wrong
+    # reason, which is worse than refusing to guess.
+    reuse = "--mode4-single-shot" not in args
+    args = [a for a in args
+            if a not in ("--mode4-reuse", "--mode4-single-shot")]
+    if len(args) != 6:
         raise SystemExit(__doc__)
-    main(*sys.argv[1:])
+    main(*args, mode4_reuse=reuse)

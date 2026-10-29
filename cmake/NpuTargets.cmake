@@ -129,8 +129,42 @@ function(add_ascend_micro_npu_targets)
   target_compile_options(bench_turboquant_decode_splitk PRIVATE
       -Wall -Wextra -Werror)
 
+  # ------------------------------------------------- mode-4 research probe
+  # tests/research/kernel_cluster_sync_probe.cpp: one physical AI Core block,
+  # 1 Cube + 2 Vector cores, no data, and a cyclic bilateral handshake over
+  # RECYCLED mode-4 ids 0, 1, 16 and 17 with an x_S drain in front of every
+  # announcement. It is the experiment that settled whether a mode-4 flag
+  # consumes -- guidelines section 6.2c -- and the reason the production
+  # kernels now default to the recycled two-slot ring, so it is a target rather
+  # than a transcript: a toolkit regression that reintroduces the stale release
+  # has to be reproducible here.
+  #
+  # Run it with more than the default two iterations and read the trace, not
+  # the exit status. The probe moves no data, so a sticky latch would make
+  # every wait retire early and the run would still finish and still print
+  # nothing wrong; what distinguishes the two semantics is the tick order of
+  # SET_INTRA_BLOCK against WAIT_INTRA_BLOCK on one id, which only the trace
+  # shows. `add_ascend_micro_sim_targets` registers the CAModel twin that
+  # produces that trace.
+  ascendc_library(cluster_sync_probe_npu SHARED
+      tests/research/kernel_cluster_sync_probe.cpp)
+  ascendc_compile_definitions(cluster_sync_probe_npu PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(cluster_sync_probe_npu PRIVATE
+      -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  add_executable(test_cluster_sync_probe
+      tests/research/test_cluster_sync_probe.cpp)
+  target_include_directories(test_cluster_sync_probe PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_cluster_sync_probe PRIVATE
+      cluster_sync_probe_npu ascendcl)
+  target_compile_options(test_cluster_sync_probe PRIVATE -Wall -Wextra -Werror)
+
   foreach(target test_turboquant_a8_validation test_turboquant_bf16_validation
-      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk)
+      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
+      test_cluster_sync_probe)
     set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
   endforeach()
