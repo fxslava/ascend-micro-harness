@@ -1,0 +1,348 @@
+[ 33%] Creating directories for 'camodel_single_token_decode_aiv_kernel_precompile'
+[ 33%] No download step for 'camodel_single_token_decode_aiv_kernel_precompile'
+[ 33%] No update step for 'camodel_single_token_decode_aiv_kernel_precompile'
+[ 33%] No patch step for 'camodel_single_token_decode_aiv_kernel_precompile'
+[ 33%] Performing configure step for 'camodel_single_token_decode_aiv_kernel_precompile'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    DYNAMIC_MODE
+    INCLUDE_DIR
+
+
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_precompile-prefix/src/camodel_single_token_decode_aiv_kernel_precompile-build
+[ 33%] Performing build step for 'camodel_single_token_decode_aiv_kernel_precompile'
+[100%] Building CXX object CMakeFiles/precompile_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o
+[100%] Built target precompile_obj
+[100%] Built target check_src_template
+[ 33%] No install step for 'camodel_single_token_decode_aiv_kernel_precompile'
+[ 33%] Completed 'camodel_single_token_decode_aiv_kernel_precompile'
+[ 33%] Built target camodel_single_token_decode_aiv_kernel_precompile
+[ 33%] Creating directories for 'camodel_single_token_decode_aiv_kernel_preprocess'
+[ 33%] No download step for 'camodel_single_token_decode_aiv_kernel_preprocess'
+[ 33%] No update step for 'camodel_single_token_decode_aiv_kernel_preprocess'
+[ 33%] No patch step for 'camodel_single_token_decode_aiv_kernel_preprocess'
+[ 33%] Performing configure step for 'camodel_single_token_decode_aiv_kernel_preprocess'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_preprocess-prefix/src/camodel_single_token_decode_aiv_kernel_preprocess-build
+[ 33%] Performing build step for 'camodel_single_token_decode_aiv_kernel_preprocess'
+[ 66%] Building CXX object CMakeFiles/preprocess_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o
+[ 66%] Building CXX object CMakeFiles/aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o
+[100%] Building CXX object CMakeFiles/aic_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o
+[100%] Built target preprocess_obj
+[100%] Built target aic_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_preprocess-prefix/src/camodel_single_token_decode_aiv_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o -o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_preprocess-prefix/src/camodel_single_token_decode_aiv_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o[100%] Built target merge_aic_obj_text
+[100%] Built target aiv_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_preprocess-prefix/src/camodel_single_token_decode_aiv_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o -o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_preprocess-prefix/src/camodel_single_token_decode_aiv_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o[100%] Built target merge_aiv_obj_text
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+[100%] Built target _host_cpp
+[ 33%] No install step for 'camodel_single_token_decode_aiv_kernel_preprocess'
+[ 33%] Completed 'camodel_single_token_decode_aiv_kernel_preprocess'
+[ 33%] Built target camodel_single_token_decode_aiv_kernel_preprocess
+[ 33%] Creating directories for 'camodel_single_token_decode_aiv_kernel_aic_device'
+[ 33%] Creating directories for 'camodel_single_token_decode_aiv_kernel_host'
+[ 33%] Creating directories for 'camodel_single_token_decode_aiv_kernel_aiv_device'
+[ 33%] No download step for 'camodel_single_token_decode_aiv_kernel_aic_device'
+[ 33%] No download step for 'camodel_single_token_decode_aiv_kernel_host'
+[ 33%] No download step for 'camodel_single_token_decode_aiv_kernel_aiv_device'
+[ 33%] No update step for 'camodel_single_token_decode_aiv_kernel_aic_device'
+[ 33%] No update step for 'camodel_single_token_decode_aiv_kernel_host'
+[ 33%] No update step for 'camodel_single_token_decode_aiv_kernel_aiv_device'
+[ 33%] No patch step for 'camodel_single_token_decode_aiv_kernel_aic_device'
+[ 33%] No patch step for 'camodel_single_token_decode_aiv_kernel_host'
+[ 33%] No patch step for 'camodel_single_token_decode_aiv_kernel_aiv_device'
+[ 33%] Performing configure step for 'camodel_single_token_decode_aiv_kernel_host'
+[ 33%] Performing configure step for 'camodel_single_token_decode_aiv_kernel_aic_device'
+[ 33%] Performing configure step for 'camodel_single_token_decode_aiv_kernel_aiv_device'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ASCEND_PYTHON_EXECUTABLE
+
+
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_host-prefix/src/camodel_single_token_decode_aiv_kernel_host-build
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+[ 33%] Performing build step for 'camodel_single_token_decode_aiv_kernel_host'
+-- Generating done
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_aiv_device-prefix/src/camodel_single_token_decode_aiv_kernel_aiv_device-build
+[ 33%] Performing build step for 'camodel_single_token_decode_aiv_kernel_aiv_device'
+[100%] Building CXX object CMakeFiles/host_bisheng_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o
+[100%] Building CXX object CMakeFiles/device_aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/build/auto_gen/camodel_single_token_decode_aiv_kernel/auto_gen_turboquant_single_token_decode_aiv.cpp.o
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    BUILD_MODE
+
+
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_aic_device-prefix/src/camodel_single_token_decode_aiv_kernel_aic_device-build
+[ 33%] Performing build step for 'camodel_single_token_decode_aiv_kernel_aic_device'
+[ 33%] No install step for 'camodel_single_token_decode_aiv_kernel_aic_device'
+[100%] Built target host_bisheng_obj
+[ 33%] Completed 'camodel_single_token_decode_aiv_kernel_aic_device'
+[ 66%] Performing install step for 'camodel_single_token_decode_aiv_kernel_host'
+[ 66%] Built target camodel_single_token_decode_aiv_kernel_aic_device
+Consolidate compiler generated dependencies of target host_bisheng_obj
+[100%] Built target host_bisheng_obj
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_host_dir/./objects-Release/host_bisheng_obj/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o
+[ 66%] Completed 'camodel_single_token_decode_aiv_kernel_host'
+[ 66%] Built target camodel_single_token_decode_aiv_kernel_host
+[100%] Built target device_aiv_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_aiv_device-prefix/src/camodel_single_token_decode_aiv_kernel_aiv_device-build/CMakeFiles/device_aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/build/auto_gen/camodel_single_token_decode_aiv_kernel/auto_gen_turboquant_single_token_decode_aiv.cpp.o -static -o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_aiv_device_dir/device_aiv.o
+[100%] Built target merge_aiv_device_obj
+[ 66%] No install step for 'camodel_single_token_decode_aiv_kernel_aiv_device'
+[100%] Completed 'camodel_single_token_decode_aiv_kernel_aiv_device'
+[100%] Built target camodel_single_token_decode_aiv_kernel_aiv_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_aiv_device_dir/device_aiv.o -static -o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_merge_obj_dir/device_aiv.o
+[100%] Built target camodel_single_token_decode_aiv_kernel_merge_obj
+[100%] Building CXX object CMakeFiles/camodel_single_token_decode_aiv_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_aiv_kernel/host_stub.cpp.o
+[100%] Built target camodel_single_token_decode_aiv_kernel_host_stub_obj
+[100%] Linking CXX shared library lib/libcamodel_single_token_decode_aiv_kernel.so
+/usr/local/Ascend/cann-9.2.0-beta.2/bin/ascendc_pack_kernel /tmp/ascend-decode-ring.9MUIFm/build/CMakeFiles/camodel_single_token_decode_aiv_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_aiv_kernel/host_stub.cpp.o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_merge_obj_dir/device_aiv.o 1 /tmp/ascend-decode-ring.9MUIFm/build/CMakeFiles/camodel_single_token_decode_aiv_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_aiv_kernel/host_stub.cpp.o
+recompile: /usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s -shared -Wl,-soname,libcamodel_single_token_decode_aiv_kernel.so -o lib/libcamodel_single_token_decode_aiv_kernel.so CMakeFiles/camodel_single_token_decode_aiv_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_aiv_kernel/host_stub.cpp.o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_aiv_kernel_host_dir/objects-Release/host_bisheng_obj/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp.o    -L/usr/local/Ascend/cann-9.2.0-beta.2/lib64  -L/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib  -Wl,-rpath,/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib: /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendc_runtime.a -lascend_dump -lc_sec
+[100%] Built target camodel_single_token_decode_aiv_kernel
+[100%] Building CXX object CMakeFiles/test_camodel_single_token_decode_aiv.dir/tests/camodel/test_camodel_single_token_decode_aiv.cpp.o
+[100%] Linking CXX executable lib/test_camodel_single_token_decode_aiv
+[100%] Built target test_camodel_single_token_decode_aiv
+[  0%] Creating directories for 'camodel_single_token_decode_splitk_kernel_precompile'
+[  0%] No download step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[  0%] No update step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[  0%] No patch step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[  0%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_precompile'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    DYNAMIC_MODE
+    INCLUDE_DIR
+
+
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_precompile-prefix/src/camodel_single_token_decode_splitk_kernel_precompile-build
+[  0%] Performing build step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[100%] Building CXX object CMakeFiles/precompile_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target precompile_obj
+[100%] Built target check_src_template
+[  0%] No install step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[  0%] Completed 'camodel_single_token_decode_splitk_kernel_precompile'
+[  0%] Built target camodel_single_token_decode_splitk_kernel_precompile
+[  0%] Creating directories for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[  0%] No download step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[  0%] No update step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[  0%] No patch step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 25%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build
+[ 25%] Performing build step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 33%] Building CXX object CMakeFiles/aic_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Building CXX object CMakeFiles/preprocess_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Building CXX object CMakeFiles/aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target preprocess_obj
+[100%] Built target aic_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o -o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o[100%] Built target merge_aic_obj_text
+[100%] Built target aiv_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o -o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o[100%] Built target merge_aiv_obj_text
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+[100%] Built target _host_cpp
+[ 25%] No install step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 25%] Completed 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 25%] Built target camodel_single_token_decode_splitk_kernel_preprocess
+[ 25%] Creating directories for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 25%] Creating directories for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 25%] Creating directories for 'camodel_single_token_decode_splitk_kernel_host'
+[ 25%] No download step for 'camodel_single_token_decode_splitk_kernel_host'
+[ 25%] No download step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 25%] No download step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 25%] No update step for 'camodel_single_token_decode_splitk_kernel_host'
+[ 25%] No update step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 25%] No update step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 25%] No patch step for 'camodel_single_token_decode_splitk_kernel_host'
+[ 25%] No patch step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 25%] No patch step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 25%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_host'
+[ 25%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 25%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compiler ABI info
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting C compile features - done
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Detecting CXX compiler ABI info
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    BUILD_MODE
+
+
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_aic_device-prefix/src/camodel_single_token_decode_splitk_kernel_aic_device-build
+[ 25%] Performing build step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ASCEND_PYTHON_EXECUTABLE
+
+
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_host-prefix/src/camodel_single_token_decode_splitk_kernel_host-build
+[ 25%] No install step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 25%] Performing build step for 'camodel_single_token_decode_splitk_kernel_host'
+[ 50%] Completed 'camodel_single_token_decode_splitk_kernel_aic_device'
+[100%] Building CXX object CMakeFiles/host_bisheng_obj.dir/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[ 50%] Built target camodel_single_token_decode_splitk_kernel_aic_device
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_aiv_device-prefix/src/camodel_single_token_decode_splitk_kernel_aiv_device-build
+[ 50%] Performing build step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[100%] Building CXX object CMakeFiles/device_aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/build/auto_gen/camodel_single_token_decode_splitk_kernel/auto_gen_turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target host_bisheng_obj
+[ 50%] Performing install step for 'camodel_single_token_decode_splitk_kernel_host'
+Consolidate compiler generated dependencies of target host_bisheng_obj
+[100%] Built target host_bisheng_obj
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_host_dir/./objects-Release/host_bisheng_obj/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[ 50%] Completed 'camodel_single_token_decode_splitk_kernel_host'
+[ 50%] Built target camodel_single_token_decode_splitk_kernel_host
+[100%] Built target device_aiv_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_aiv_device-prefix/src/camodel_single_token_decode_splitk_kernel_aiv_device-build/CMakeFiles/device_aiv_obj.dir/tmp/ascend-decode-ring.9MUIFm/build/auto_gen/camodel_single_token_decode_splitk_kernel/auto_gen_turboquant_single_token_decode_splitk_aiv.cpp.o -static -o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_aiv_device_dir/device_aiv.o
+[100%] Built target merge_aiv_device_obj
+[ 75%] No install step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 75%] Completed 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 75%] Built target camodel_single_token_decode_splitk_kernel_aiv_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_aiv_device_dir/device_aiv.o -static -o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_merge_obj_dir/device_aiv.o
+[ 75%] Built target camodel_single_token_decode_splitk_kernel_merge_obj
+[100%] Building CXX object CMakeFiles/camodel_single_token_decode_splitk_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_splitk_kernel/host_stub.cpp.o
+[100%] Built target camodel_single_token_decode_splitk_kernel_host_stub_obj
+[100%] Linking CXX shared library lib/libcamodel_single_token_decode_splitk_kernel.so
+/usr/local/Ascend/cann-9.2.0-beta.2/bin/ascendc_pack_kernel /tmp/ascend-decode-ring.9MUIFm/build/CMakeFiles/camodel_single_token_decode_splitk_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_splitk_kernel/host_stub.cpp.o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_merge_obj_dir/device_aiv.o 1 /tmp/ascend-decode-ring.9MUIFm/build/CMakeFiles/camodel_single_token_decode_splitk_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_splitk_kernel/host_stub.cpp.o
+recompile: /usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s -shared -Wl,-soname,libcamodel_single_token_decode_splitk_kernel.so -o lib/libcamodel_single_token_decode_splitk_kernel.so CMakeFiles/camodel_single_token_decode_splitk_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_splitk_kernel/host_stub.cpp.o /tmp/ascend-decode-ring.9MUIFm/build/camodel_single_token_decode_splitk_kernel_host_dir/objects-Release/host_bisheng_obj/tmp/ascend-decode-ring.9MUIFm/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o    -L/usr/local/Ascend/cann-9.2.0-beta.2/lib64  -L/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib  -Wl,-rpath,/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib: /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendc_runtime.a -lascend_dump -lc_sec
+[100%] Built target camodel_single_token_decode_splitk_kernel
+[100%] Building CXX object CMakeFiles/test_camodel_decode_splitk_boundary.dir/tests/camodel/test_camodel_decode_splitk_boundary.cpp.o
+[100%] Linking CXX executable lib/test_camodel_decode_splitk_boundary
+[100%] Built target test_camodel_decode_splitk_boundary

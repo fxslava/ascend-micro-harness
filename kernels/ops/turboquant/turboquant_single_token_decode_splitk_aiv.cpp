@@ -40,10 +40,14 @@ constexpr std::uint32_t kVecLanes = kGemvVecLanes;                      // 64
 // per-row egress panels alone to serve a regime that never reaches here.
 constexpr std::uint32_t kMaxRows = 8;
 // ------------------------------------------------------- UB layout, AKA3003
+constexpr std::uint32_t kStageDepth = 2;
 constexpr std::uint32_t kBlock = 32;
 constexpr std::uint32_t kBankSkew = 32;
 constexpr std::uint32_t kVecReg = 256;  // VECTOR_REG_WIDTH on dav-3510
+// A scale instruction reads a full register, even for 16 active lanes.
+constexpr std::uint32_t kScaleLandingBytes = kVecReg;
 constexpr std::uint32_t kUbWindow = 192u * 1024u;
+static_assert(kStageDepth == 2u && kUbWindow <= 192u * 1024u, "decode ring/window contract");
 
 constexpr std::uint32_t RoundUpBlock(std::uint32_t bytes)
 {
@@ -55,29 +59,37 @@ constexpr std::uint32_t NextSlot(std::uint32_t prev_base, std::uint32_t prev_byt
 }
 
 // ---- the strip ingress and its dequantised pages ----
-constexpr std::uint32_t kUbPackedKey = 0;                                   // int8
-constexpr std::uint32_t kUbPackedVal = NextSlot(kUbPackedKey, kPackedBytes); // int8
-constexpr std::uint32_t kUbNib16 = NextSlot(kUbPackedVal, kPackedBytes);     // int16
-constexpr std::uint32_t kUbKeyPage = NextSlot(kUbNib16, kPanelElems * 2u);   // fp32
-constexpr std::uint32_t kUbValuePage = NextSlot(kUbKeyPage, kPanelElems * 4u);
+constexpr std::uint32_t kUbPackedKey[kStageDepth] = {
+    0, NextSlot(kUbPackedKey[0], kPackedBytes)};
+constexpr std::uint32_t kUbPackedVal[kStageDepth] = {
+    NextSlot(kUbPackedKey[1], kPackedBytes), NextSlot(kUbPackedVal[0], kPackedBytes)};
+// V-only scratch: FIFO/barriers serialize both slots; no DMA writer.
+constexpr std::uint32_t kUbNib16 = NextSlot(kUbPackedVal[1], kPackedBytes);     // int16
+constexpr std::uint32_t kUbKeyPage[kStageDepth] = {
+    NextSlot(kUbNib16, kPanelElems * 2u), NextSlot(kUbKeyPage[0], kPanelElems * 4u)};
+constexpr std::uint32_t kUbValuePage[kStageDepth] = {
+    NextSlot(kUbKeyPage[1], kPanelElems * 4u), NextSlot(kUbValuePage[0], kPanelElems * 4u)};
 // ---- the score GEMV ----
-constexpr std::uint32_t kUbProducts = NextSlot(kUbValuePage, kPanelElems * 4u);
+constexpr std::uint32_t kUbProducts = NextSlot(kUbValuePage[1], kPanelElems * 4u);
 constexpr std::uint32_t kUbPartials = NextSlot(kUbProducts, kGemvProductElems * 4u);
 constexpr std::uint32_t kUbFold = NextSlot(kUbPartials, kGemvPartials * 4u);
-constexpr std::uint32_t kUbPanel = NextSlot(kUbFold, kGemvPartials * 4u);
+constexpr std::uint32_t kUbPanel[kStageDepth] = {
+    NextSlot(kUbFold, kGemvPartials * 4u), NextSlot(kUbPanel[0], kMaxRows * kKeys * 4u)};
 // ---- the rotated query panel, live for the whole task ----
 // It arrives as bf16 -- kernel No.5 writes it, and RFC section 4 types the
 // operand `uint16_t`, so No.3 and No.4 take the same tensor at the same call
 // site -- and is converted once per task into the FP32 panel the GEMV reads.
 // bf16 -> float is a listed Cast pair and exact, so the conversion costs one
 // instruction and no accuracy.
-constexpr std::uint32_t kUbQueryRaw = NextSlot(kUbPanel, kMaxRows * kKeys * 4u);
+constexpr std::uint32_t kUbQueryRaw = NextSlot(kUbPanel[1], kMaxRows * kKeys * 4u);
 constexpr std::uint32_t kUbQuery = NextSlot(kUbQueryRaw, kMaxRows * kHeadSize * 2u);
 // ---- the two scale slices ----
-constexpr std::uint32_t kUbKeyScale = NextSlot(kUbQuery, kMaxRows * kHeadSize * 4u);
-constexpr std::uint32_t kUbValueScale = NextSlot(kUbKeyScale, kKeys * 4u);
+constexpr std::uint32_t kUbKeyScale[kStageDepth] = {
+    NextSlot(kUbQuery, kMaxRows * kHeadSize * 4u), NextSlot(kUbKeyScale[0], kScaleLandingBytes)};
+constexpr std::uint32_t kUbValueScale[kStageDepth] = {
+    NextSlot(kUbKeyScale[1], kScaleLandingBytes), NextSlot(kUbValueScale[0], kScaleLandingBytes)};
 // ---- the carried state ----
-constexpr std::uint32_t kUbMPrev = NextSlot(kUbValueScale, kKeys * 4u);
+constexpr std::uint32_t kUbMPrev = NextSlot(kUbValueScale[1], kScaleLandingBytes);
 constexpr std::uint32_t kUbLPrev = NextSlot(kUbMPrev, kMaxRows * kStateLanes * 4u);
 constexpr std::uint32_t kUbAcc = NextSlot(kUbLPrev, kMaxRows * kStateLanes * 4u);
 // ---- the recurrence's per-row scratch ----
@@ -113,13 +125,13 @@ constexpr std::uint32_t kProbeLanes = 32;
 constexpr std::uint32_t kUbProbe = NextSlot(kUbContext, kMaxRows * kHeadSize * 2u);
 constexpr std::uint32_t kArenaEnd = kUbProbe + kProbeLanes * 4u;
 
-static_assert(kUbPackedKey % kBlock == 0u && kUbPackedVal % kBlock == 0u &&
-                  kUbNib16 % kBlock == 0u && kUbKeyPage % kBlock == 0u &&
-                  kUbValuePage % kBlock == 0u && kUbProducts % kBlock == 0u &&
+static_assert(kUbPackedKey[1] % kBlock == 0u && kUbPackedVal[1] % kBlock == 0u &&
+                  kUbNib16 % kBlock == 0u && kUbKeyPage[1] % kBlock == 0u &&
+                  kUbValuePage[1] % kBlock == 0u && kUbProducts % kBlock == 0u &&
                   kUbPartials % kBlock == 0u && kUbFold % kBlock == 0u &&
-                  kUbPanel % kBlock == 0u && kUbQueryRaw % kBlock == 0u &&
-                  kUbQuery % kBlock == 0u && kUbKeyScale % kBlock == 0u &&
-                  kUbValueScale % kBlock == 0u && kUbMPrev % kBlock == 0u &&
+                  kUbPanel[1] % kBlock == 0u && kUbQueryRaw % kBlock == 0u &&
+                  kUbQuery % kBlock == 0u && kUbKeyScale[1] % kBlock == 0u &&
+                  kUbValueScale[1] % kBlock == 0u && kUbMPrev % kBlock == 0u &&
                   kUbLPrev % kBlock == 0u && kUbAcc % kBlock == 0u &&
                   kUbNorm % kBlock == 0u && kUbRotated % kBlock == 0u &&
                   kUbGate % kBlock == 0u && kUbGateA % kBlock == 0u &&
@@ -158,11 +170,46 @@ static_assert(kPackedBytes % kBlock == 0u && kKeys * 4u % kBlock == 0u &&
 static_assert(kMaxRows * kKeys * 4u % kBlock == 0u,
               "an archived panel must be whole 32-byte bursts");
 
+
+static_assert(kUbPackedKey[0] % kBlock == 0u && kUbPackedKey[1] % kBlock == 0u &&
+    kUbPackedKey[1] == kUbPackedKey[0] + kPackedBytes + kBankSkew &&
+    ((kUbPackedKey[1] - kUbPackedKey[0]) / kBlock) % 16u != 0u,
+    "AKA1002/1003/3003: aligned, disjoint, bank-skew ring slots");
+static_assert(kUbPackedVal[0] % kBlock == 0u && kUbPackedVal[1] % kBlock == 0u &&
+    kUbPackedVal[1] == kUbPackedVal[0] + kPackedBytes + kBankSkew &&
+    ((kUbPackedVal[1] - kUbPackedVal[0]) / kBlock) % 16u != 0u,
+    "AKA1002/1003/3003: aligned, disjoint, bank-skew ring slots");
+static_assert(kUbKeyPage[0] % kBlock == 0u && kUbKeyPage[1] % kBlock == 0u &&
+    kUbKeyPage[1] == kUbKeyPage[0] + kPanelElems * 4u + kBankSkew &&
+    ((kUbKeyPage[1] - kUbKeyPage[0]) / kBlock) % 16u != 0u,
+    "AKA1002/1003/3003: aligned, disjoint, bank-skew ring slots");
+static_assert(kUbValuePage[0] % kBlock == 0u && kUbValuePage[1] % kBlock == 0u &&
+    kUbValuePage[1] == kUbValuePage[0] + kPanelElems * 4u + kBankSkew &&
+    ((kUbValuePage[1] - kUbValuePage[0]) / kBlock) % 16u != 0u,
+    "AKA1002/1003/3003: aligned, disjoint, bank-skew ring slots");
+static_assert(kUbPanel[0] % kBlock == 0u && kUbPanel[1] % kBlock == 0u &&
+    kUbPanel[1] == kUbPanel[0] + kMaxRows * kKeys * 4u + kBankSkew &&
+    ((kUbPanel[1] - kUbPanel[0]) / kBlock) % 16u != 0u,
+    "AKA1002/1003/3003: aligned, disjoint, bank-skew ring slots");
+static_assert(kUbKeyScale[0] % kBlock == 0u && kUbKeyScale[1] % kBlock == 0u &&
+    kUbKeyScale[1] == kUbKeyScale[0] + kScaleLandingBytes + kBankSkew &&
+    ((kUbKeyScale[1] - kUbKeyScale[0]) / kBlock) % 16u != 0u,
+    "AKA1002/1003/3003: aligned, disjoint, bank-skew ring slots");
+static_assert(kUbValueScale[0] % kBlock == 0u && kUbValueScale[1] % kBlock == 0u &&
+    kUbValueScale[1] == kUbValueScale[0] + kScaleLandingBytes + kBankSkew &&
+    ((kUbValueScale[1] - kUbValueScale[0]) / kBlock) % 16u != 0u,
+    "AKA1002/1003/3003: aligned, disjoint, bank-skew ring slots");
+static_assert(kUbKeyScale[0] + kVecReg <= kUbKeyScale[1] &&
+              kUbKeyScale[1] + kVecReg <= kUbValueScale[0] &&
+              kUbValueScale[0] + kVecReg <= kUbValueScale[1] &&
+              kUbValueScale[1] + kVecReg <= kUbMPrev,
+              "scale register overreads must not reach another DMA landing");
+
 // Event ids, static code 0..5 (6 and 7 reserved). One token in flight per
 // (route, id).
 constexpr std::int32_t kEvtIngressReady = 0;  // MTE2_V
 constexpr std::int32_t kEvtPackedFree = 0;    // V_MTE2
-constexpr std::int32_t kEvtScaleFree = 1;     // V_MTE2
+constexpr std::int32_t kEvtScaleFree = 2;     // V_MTE2
 constexpr std::int32_t kEvtEgressReady = 1;   // V_MTE3
 constexpr std::int32_t kEvtDrain = 0;         // MTE3_S
 
@@ -225,26 +272,26 @@ __aicore__ inline std::uint64_t ScaleOffset(std::uint32_t plane, std::uint32_t p
 
 // ---------------------------------------------------------- the strip body
 // MTE2: the strip's four landings. Two 2 KiB packed pages and two 64-byte
-// scale slices, with the packed and the scale waits SEPARATED so the packed
-// refill of strip s + 1 can issue while strip s is still in its recurrence.
+// scale slices per ring slot. Packed and scale credits have different last
+// readers, so separate route IDs guard their reuse.
 __aicore__ inline void LoadStrip(const AscendC::GlobalTensor<std::int8_t>& key_cache,
                                  const AscendC::GlobalTensor<std::int8_t>& value_cache,
                                  const AscendC::GlobalTensor<float>& scale_cache,
                                  std::uint32_t page, std::uint32_t head,
-                                 std::uint32_t strip, const Geometry& geom)
+                                 std::uint32_t strip, const Geometry& geom, std::uint32_t slot)
 {
     const std::uint64_t strip_base = StripByteOffset(page, head, strip, geom);
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree);
-    AscendC::DataCopy(View<std::int8_t>(kUbPackedKey, kPackedBytes),
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree + slot);
+    AscendC::DataCopy(View<std::int8_t>(kUbPackedKey[slot], kPackedBytes),
                       key_cache[strip_base], kPackedBytes);
-    AscendC::DataCopy(View<std::int8_t>(kUbPackedVal, kPackedBytes),
+    AscendC::DataCopy(View<std::int8_t>(kUbPackedVal[slot], kPackedBytes),
                       value_cache[strip_base], kPackedBytes);
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree);
-    AscendC::DataCopy(View<float>(kUbKeyScale, kKeys),
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
+    AscendC::DataCopy(View<float>(kUbKeyScale[slot], kKeys),
                       scale_cache[ScaleOffset(0u, page, head, strip, geom)], kKeys);
-    AscendC::DataCopy(View<float>(kUbValueScale, kKeys),
+    AscendC::DataCopy(View<float>(kUbValueScale[slot], kKeys),
                       scale_cache[ScaleOffset(1u, page, head, strip, geom)], kKeys);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady + slot);
 }
 
 // int4 -> fp32 for both planes, through the only listed conversion route
@@ -256,19 +303,19 @@ __aicore__ inline void LoadStrip(const AscendC::GlobalTensor<std::int8_t>& key_c
 // with the 16-token axis contiguous, which is what the recurrence's
 // `ReduceRepeat` over 16 lanes and its `p_x4` broadcast address. Neither needs
 // a transpose: both are the cache's own order.
-__aicore__ inline void DequantStrip()
+__aicore__ inline void DequantStrip(std::uint32_t slot)
 {
     ascend_micro::NativeDequant4Engine<float> key_dq;
-    key_dq.packed = View<std::int8_t>(kUbPackedKey, kPackedBytes);
+    key_dq.packed = View<std::int8_t>(kUbPackedKey[slot], kPackedBytes);
     key_dq.signed_nibbles = View<std::int16_t>(kUbNib16, kPanelElems);
-    key_dq.output = View<float>(kUbKeyPage, kPanelElems);
+    key_dq.output = View<float>(kUbKeyPage[slot], kPanelElems);
     ascend_micro::turboquant_dequant4_signed(key_dq, kPanelElems);
     AscendC::PipeBarrier<PIPE_V>();
 
     ascend_micro::NativeDequant4Engine<float> value_dq;
-    value_dq.packed = View<std::int8_t>(kUbPackedVal, kPackedBytes);
+    value_dq.packed = View<std::int8_t>(kUbPackedVal[slot], kPackedBytes);
     value_dq.signed_nibbles = View<std::int16_t>(kUbNib16, kPanelElems);
-    value_dq.output = View<float>(kUbValuePage, kPanelElems);
+    value_dq.output = View<float>(kUbValuePage[slot], kPanelElems);
     ascend_micro::turboquant_dequant4_signed(value_dq, kPanelElems);
 }
 
@@ -484,7 +531,7 @@ __aicore__ inline void FinishMetric(
 {
     // The caller has retired the unlock VF or the out_context MTE3 burst.
     const auto stamp = static_cast<std::uint64_t>(AscendC::GetSystemCycle());
-    auto buf = View<std::uint32_t>(kUbPackedKey, 48);
+    auto buf = View<std::uint32_t>(kUbPackedKey[0], 48);
     AscendC::Duplicate(buf, static_cast<std::uint32_t>(stamp >> 32), 8);
     AscendC::Duplicate(buf[8], static_cast<std::uint32_t>(stamp), 8);
     AscendC::Duplicate(buf[16], static_cast<std::uint32_t>(tail), 8);
@@ -512,7 +559,7 @@ __aicore__ inline void ReduceAndFinish(
     // Pack the local state before entering the critical section. Strip
     // scratch is dead; both full-head packed buffers fit in existing slots.
     PackHeadState(
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbValuePage, geom.rows * turboquant_splitk::kRecordFloats).GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(View<float>(kUbValuePage[0], geom.rows * turboquant_splitk::kRecordFloats).GetPhyAddr()),
         reinterpret_cast<__ubuf__ float*>(View<float>(kUbMPrev, 64).GetPhyAddr()),
         reinterpret_cast<__ubuf__ float*>(View<float>(kUbLPrev, 64).GetPhyAddr()),
         reinterpret_cast<__ubuf__ float*>(View<float>(kUbAcc, geom.rows * kHeadSize).GetPhyAddr()),
@@ -538,12 +585,12 @@ __aicore__ inline void ReduceAndFinish(
     }
     const bool tail = arrival == splits;
     const std::uint32_t state_lanes = geom.rows * turboquant_splitk::kRecordFloats;
-    auto packed = View<float>(kUbValuePage, state_lanes);
+    auto packed = View<float>(kUbValuePage[0], state_lanes);
     if (arrival > 1u) {
         // One contiguous 6x272-float MTE2 burst for the entire head state.
         AscendC::GlobalTensor<float> state;
         state.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(slot->row));
-        packed = View<float>(kUbKeyPage, state_lanes);
+        packed = View<float>(kUbKeyPage[0], state_lanes);
         AscendC::DataCopy(packed, state, state_lanes);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(3);
@@ -642,21 +689,21 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
 
     // ---- the two engines, built once and reused across every strip -------
     ascend_micro::NativeDecodeGemvEngine gemv;
-    gemv.key_page = View<float>(kUbKeyPage, kPanelElems);
+    gemv.key_page = View<float>(kUbKeyPage[0], kPanelElems);
     gemv.query = View<float>(kUbQuery, kMaxRows * kHeadSize);
     gemv.products = View<float>(kUbProducts, kGemvProductElems);
     gemv.partials = View<float>(kUbPartials, kGemvPartials);
     gemv.fold = View<float>(kUbFold, kGemvPartials);
-    gemv.panel = View<float>(kUbPanel, kMaxRows * kKeys);
+    gemv.panel = View<float>(kUbPanel[0], kMaxRows * kKeys);
     gemv.query_base = kUbQuery;
-    gemv.panel_base = kUbPanel;
+    gemv.panel_base = kUbPanel[0];
     gemv.position = kUb;
 
     ascend_micro::NativeDecodeRecurrenceEngine rec;
-    rec.panel = View<float>(kUbPanel, kMaxRows * kKeys);
-    rec.key_scale = View<float>(kUbKeyScale, kKeys);
-    rec.value_scale = View<float>(kUbValueScale, kKeys);
-    rec.value_page = View<float>(kUbValuePage, kPanelElems);
+    rec.panel = View<float>(kUbPanel[0], kMaxRows * kKeys);
+    rec.key_scale = View<float>(kUbKeyScale[0], kKeys);
+    rec.value_scale = View<float>(kUbValueScale[0], kKeys);
+    rec.value_page = View<float>(kUbValuePage[0], kPanelElems);
     rec.m_prev = View<float>(kUbMPrev, kMaxRows * kStateLanes);
     rec.l_prev = View<float>(kUbLPrev, kMaxRows * kStateLanes);
     rec.acc = View<float>(kUbAcc, kMaxRows * kHeadSize);
@@ -679,50 +726,64 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
     rec.weighted = View<float>(kUbWeighted, kPanelElems);
     rec.weighted_sum = View<float>(kUbWeightedSum, kHeadSize);
     rec.acc_scaled = View<float>(kUbAccScaled, kHeadSize);
-    rec.panel_base = kUbPanel;
+    rec.panel_base = kUbPanel[0];
     rec.m_base = kUbMPrev;
     rec.l_base = kUbLPrev;
     rec.acc_base = kUbAcc;
     rec.position = kUb;
 
-    // ---- prime the reuse routes ------------------------------------------
-    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree);
-    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree);
-
-    // ---- the straight-line strip loop ------------------------------------
-    // Pages outside, strips inside. The physical page comes from the block
-    // table, which is deliberately not the identity, so a kernel that indexed
-    // the cache by its own loop counter would read the wrong page -- and under
-    // the canary protocol the wrong page is a quiet NaN.
-    for (std::uint32_t page_idx = 0; page_idx < geom.seq_pages; ++page_idx) {
-        const std::uint32_t page = block_table[request * geom.table_stride + geom.page_begin + page_idx];
-        for (std::uint32_t i = 0; i < geom.strips; ++i) {
-            const std::uint32_t strip = geom.strip_begin + i;
-
-            LoadStrip(key_cache, value_cache, scale_cache, page, head, strip, geom);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
-
-            DequantStrip();
+    // Capacity-one feedback places, including unused slots (N=0/1).
+    for (std::uint32_t slot = 0; slot < kStageDepth; ++slot) {
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree + slot);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
+    }
+    const std::uint32_t count = geom.seq_pages * geom.strips;
+    // Prefill both landings before the first Vector wait. Refill is issued
+    // only after retiring that slot's recurrence, never ahead of its credit.
+    for (std::uint32_t index = 0; index < count && index < kStageDepth; ++index) {
+        const auto page = block_table[request * geom.table_stride + geom.page_begin + index / geom.strips];
+        LoadStrip(key_cache, value_cache, scale_cache, page, head,
+                  geom.strip_begin + index % geom.strips, geom, index % kStageDepth);
+    }
+    // Prepare strip i before recurring i-1. The score/value/scale pages stay
+    // live in separate slots; all arithmetic and recurrence state stay on V.
+    for (std::uint32_t tick = 0; tick <= count; ++tick) {
+        if (tick < count) {
+            const std::uint32_t slot = tick % kStageDepth;
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady + slot);
+            DequantStrip(slot);
             AscendC::PipeBarrier<PIPE_V>();
-            // The packed pages have been read; their refill may start now,
-            // and will overlap the GEMV and the recurrence below. The SCALE
-            // slices have NOT been read yet -- the recurrence reads them --
-            // which is why they are a separate route released at the bottom.
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree);
-
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree + slot);
+            gemv.key_page = View<float>(kUbKeyPage[slot], kPanelElems);
+            gemv.panel = View<float>(kUbPanel[slot], kMaxRows * kKeys);
+            gemv.panel_base = kUbPanel[slot];
             ascend_micro::vector_decode_gemv_strip(gemv, rows);
             AscendC::PipeBarrier<PIPE_V>();
-
+        }
+        if (tick > 0u) {
+            const std::uint32_t slot = (tick - 1u) % kStageDepth;
+            rec.panel = View<float>(kUbPanel[slot], kMaxRows * kKeys);
+            rec.panel_base = kUbPanel[slot];
+            rec.key_scale = View<float>(kUbKeyScale[slot], kKeys);
+            rec.value_scale = View<float>(kUbValueScale[slot], kKeys);
+            rec.value_page = View<float>(kUbValuePage[slot], kPanelElems);
             ascend_micro::vector_decode_recur_rows(rec, rows);
             AscendC::PipeBarrier<PIPE_V>();
-            // The recurrence was the scale slices' last reader.
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
+            const std::uint32_t index = tick - 1u + kStageDepth;
+            if (index < count) {
+                const auto page = block_table[request * geom.table_stride + geom.page_begin + index / geom.strips];
+                LoadStrip(key_cache, value_cache, scale_cache, page, head,
+                          geom.strip_begin + index % geom.strips, geom, slot);
+            }
         }
     }
-
-    // ---- drain the primed tokens before the epilogue ---------------------
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree);
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree);
+    // Consume exactly the final credit in every reuse place. Ready places
+    // are empty already. This also orders scratch reuse in Split-K reduction.
+    for (std::uint32_t slot = 0; slot < kStageDepth; ++slot) {
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree + slot);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
+    }
 
     ReduceAndFinish(slots, metrics, out_context, item,
                     request * geom.num_kv_heads + head, splits, max_attempts, geom);
@@ -773,6 +834,41 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
                 head_item / heads, head_item % heads, geom);
 }
 
+// Diagnostic entry uses the production ProcessItem and reduction unchanged.
+// Selects one logical-page/strip window without rebasing the block table.
+extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
+    __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
+    __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
+    __gm__ float* signs, __gm__ turboquant_splitk::AtomicHeadSlot* slots,
+    __gm__ turboquant_splitk::WorkerMetrics* metrics, __gm__ bfloat16_t* out,
+    uint32_t head, uint32_t rows, uint32_t page_begin, uint32_t page_count,
+    uint32_t strips, uint32_t strip_begin)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::InitSocState();
+    using namespace turboquant_splitk_device;
+    if (head >= 4u || rows == 0u || rows > kMaxRows || page_begin >= 8u ||
+        page_count == 0u || page_count > 8u - page_begin || strips == 0u ||
+        strips > 8u || strip_begin > 8u - strips) return;
+    Geometry geom{4u, rows, kHeadSize, 128u, 9u, 8u, page_count, strips,
+                  page_begin, 8u, strip_begin};
+    AscendC::GlobalTensor<bfloat16_t> q, context;
+    AscendC::GlobalTensor<std::int8_t> keys, values;
+    AscendC::GlobalTensor<float> scale_tensor, gates, sign_tensor;
+    q.SetGlobalBuffer(q_rot);
+    context.SetGlobalBuffer(out);
+    keys.SetGlobalBuffer(key);
+    values.SetGlobalBuffer(value);
+    scale_tensor.SetGlobalBuffer(scales);
+    gates.SetGlobalBuffer(gate);
+    sign_tensor.SetGlobalBuffer(signs);
+    AscendC::DataCopy(View<float>(kUbSign, kHeadSize), sign_tensor, kHeadSize);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+    ProcessItem(q, keys, values, scale_tensor, table, gates, slots, metrics,
+                context, 1u, 10000u, head, 0u, head, geom);
+}
+
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 
 extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
@@ -796,5 +892,25 @@ extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
         reinterpret_cast<bfloat16_t*>(q_rot), key, value, scales, table, gate, signs,
         slots, metrics, reinterpret_cast<bfloat16_t*>(out), requests, heads, rows,
         block_size, cache_pages, pages, splits, max_attempts);
+}
+extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
+    __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
+    __gm__ uint32_t*, __gm__ float*, __gm__ float*,
+    __gm__ turboquant_splitk::AtomicHeadSlot*,
+    __gm__ turboquant_splitk::WorkerMetrics*, __gm__ bfloat16_t*,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+
+extern "C" void launch_turboquant_splitk_boundary_aiv(
+    void* stream, std::uint16_t* q, std::int8_t* key, std::int8_t* value,
+    float* scales, std::uint32_t* table, float* gate, float* signs,
+    turboquant_splitk::AtomicHeadSlot* slots, turboquant_splitk::WorkerMetrics* metrics,
+    std::uint16_t* out, std::uint32_t head, std::uint32_t rows,
+    std::uint32_t begin, std::uint32_t count, std::uint32_t strips,
+    std::uint32_t strip_begin)
+{
+    turboquant_splitk_boundary_aiv<<<1, nullptr, stream>>>(
+        reinterpret_cast<bfloat16_t*>(q), key, value, scales, table, gate, signs,
+        slots, metrics, reinterpret_cast<bfloat16_t*>(out), head, rows, begin,
+        count, strips, strip_begin);
 }
 #endif

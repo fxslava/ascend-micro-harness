@@ -1,0 +1,17 @@
+single-token decode (No.3) Tier-1 host probe
+  geometry: 6 rows, d = 256, 16 tokens per strip, 8 strips per page, 4 KV heads
+ok   check 2: every one of the 4096 product slots is written exactly once
+ok   check 1: the replayed four-Mul / one-Reduce / two-Add panel is bit-exact against the direct dot product
+ok   check 3: the host loop, the in-repeat binary tree and the quarter fold agree to the bit on every entry
+ok   check 4: the roadmap's over-range mask, clamped to 64 lanes as the reference says it is, gives a different panel
+     clamped-mask panel: 13/3072 entries coincide with the correct one (0.42%)
+ok   check 5: the eight-stage egress butterfly agrees with the dense 256x256 right-multiplication by Pi
+     egress: max|butterfly - dense| = 4.657e-09 vs budget 2.833e-07 (largest |rot| 0.074014)
+ok   check 6: a single-strip golden state is reproducible
+ok   check 6: the eight single-strip states of a head are pairwise distinguishable
+     head 0: |Q_rot| <= 0.6250, max partial sum 229.9 (bound 1048576), score [-0.2773, 1.5967], rescale 11/32 strips, carried 24/32, min l 107.2120, closest panels differ in 16/96 entries (1 page: 40)
+     head 1: |Q_rot| <= 0.6250, max partial sum 235.1 (bound 1048576), score [-0.2490, 1.5127], rescale 11/32 strips, carried 24/32, min l 116.8977, closest panels differ in 8/96 entries (1 page: 40)
+     head 2: |Q_rot| <= 0.6250, max partial sum 217.2 (bound 1048576), score [-0.1934, 1.5059], rescale 10/32 strips, carried 24/32, min l 118.0562, closest panels differ in 8/96 entries (1 page: 40)
+     head 3: |Q_rot| <= 0.6250, max partial sum 229.9 (bound 1048576), score [-0.2910, 1.3945], rescale 10/32 strips, carried 24/32, min l 131.9603, closest panels differ in 12/96 entries (1 page: 36)
+ok   check 7: every fixture property holds for all four heads at one page and at four, and the one-page fixture is the Cube operator's byte for byte
+PASS single-token decode Tier-1 probe

@@ -152,8 +152,10 @@ struct Events {
     aclrtEvent start = nullptr, end = nullptr;
     Events()
     {
+#if !defined(ASCEND_MICRO_BENCH_SIM)
         check(aclrtCreateEvent(&start), "aclrtCreateEvent start");
         check(aclrtCreateEvent(&end), "aclrtCreateEvent end");
+#endif
     }
     Events(const Events&) = delete;
     Events& operator=(const Events&) = delete;
@@ -366,6 +368,11 @@ struct Measurement {
 template<class D>
 Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& events)
 {
+#if defined(ASCEND_MICRO_BENCH_SIM)
+    // The simulator reports no device-event timing. Allocating/recording ACL
+    // timing events asks its stub driver for unsupported resource type 5.
+    (void)events;
+#endif
     Measurement result;
     result.present = true;
     for (int i = 0; i < o.warmup; ++i) {
@@ -381,14 +388,21 @@ Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& e
     for (int i = 0; i < o.iters; ++i) {
         d.Reset();
         check(aclrtSynchronizeStream(stream), "pre-launch synchronize");
+#if !defined(ASCEND_MICRO_BENCH_SIM)
         check(aclrtRecordEvent(events.start, stream), "record start");
+#endif
         d.Launch(stream, k, o.watchdog);
+#if defined(ASCEND_MICRO_BENCH_SIM)
+        check(aclrtSynchronizeStream(stream), "CAModel post-launch synchronize");
+        const float ms = 0.0f;
+#else
         check(aclrtRecordEvent(events.end, stream), "record end");
         if (o.single) check(aclrtSynchronizeStream(stream), "single post-launch synchronize");
         else check(aclrtSynchronizeEvent(events.end), "synchronize end event");
-        ++result.launches;
         float ms = 0;
         check(aclrtEventElapsedTime(&ms, events.start, events.end), "event elapsed time");
+#endif
+        ++result.launches;
         require(std::isfinite(ms) && ms >= 0, "invalid event duration");
         valid_events = valid_events && ms > 0;
         const auto census = d.Validate(k);

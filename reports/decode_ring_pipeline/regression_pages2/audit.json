@@ -1,0 +1,70 @@
+{
+  "status": "PASS",
+  "case": "regression_pages2",
+  "strips_per_active_core": 4,
+  "model_ticks": 30100,
+  "observations": [
+    "guard bands: all 13 buffers intact, head and tail",
+    "inputs: 0 word(s) changed across the caches, the query panel and the scale plane",
+    "scores:   0/64 panel entries wrong (bit-exact check)",
+    "numerics: m bit-exact, l <= 0 ULP, acc err 4.172e-07 vs budget 3.824e-04 (7 ULP, largest |acc| 1.565807)",
+    "egress:   rotation err 1.118e-08 vs budget 7.253e-05 (largest |rot| 0.074169), context err 0.000e+00 vs budget 7.783e-04 (largest |ctx| 0.049805)",
+    "isolation: 57008/57008 unassigned and guard-band output words still canary"
+  ],
+  "idle_cores": 95,
+  "cores": [
+    {
+      "core": "core0.veccore0.instr_popped_log.dump",
+      "instructions": 16728,
+      "active": true,
+      "routes": {
+        "('MTE2', 'VEC', 0)": 4,
+        "('MTE2', 'VEC', 1)": 2,
+        "('MTE3', 'SCALAR', 0)": 2,
+        "('MTE3', 'VEC', 0)": 3,
+        "('MTE3', 'VEC', 1)": 3,
+        "('VEC', 'MTE2', 0)": 3,
+        "('VEC', 'MTE2', 1)": 3,
+        "('VEC', 'MTE2', 2)": 3,
+        "('VEC', 'MTE2', 3)": 3,
+        "('VEC', 'MTE3', 0)": 2,
+        "('VEC', 'MTE3', 1)": 4
+      },
+      "residual_tokens": 0,
+      "mte2_vector_intersections": 1090,
+      "overlap_examples": [
+        [
+          5481,
+          6040,
+          5491,
+          5500
+        ],
+        [
+          5481,
+          6040,
+          5491,
+          5500
+        ],
+        [
+          5481,
+          6040,
+          5492,
+          5507
+        ]
+      ],
+      "engines": {
+        "SCALAR": 2950,
+        "PUSHQ": 191,
+        "MTE3": 25,
+        "MTE2": 38,
+        "FLOWCTRL": 314,
+        "VEC": 30,
+        "RVECLP": 125,
+        "RVECSU": 259,
+        "RVECEX": 4761,
+        "RVECST": 3824,
+        "RVECLD": 4211
+      }
+    }
+  ]
+}

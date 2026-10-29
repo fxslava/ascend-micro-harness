@@ -1,0 +1,124 @@
+{
+  "status": "PASS",
+  "case": "regression_splitk2",
+  "strips_per_active_core": null,
+  "model_ticks": 46089,
+  "observations": [
+    "PASS: CPU references matched. Kernel launches: AIV=1 AIC=0."
+  ],
+  "idle_cores": 94,
+  "cores": [
+    {
+      "core": "core0.veccore0.instr_popped_log.dump",
+      "instructions": 18061,
+      "active": true,
+      "routes": {
+        "('MTE2', 'VEC', 0)": 5,
+        "('MTE2', 'VEC', 1)": 2,
+        "('MTE3', 'SCALAR', 2)": 1,
+        "('MTE3', 'VEC', 5)": 1,
+        "('VEC', 'MTE2', 0)": 4,
+        "('VEC', 'MTE2', 1)": 3,
+        "('VEC', 'MTE2', 2)": 4,
+        "('VEC', 'MTE2', 3)": 3,
+        "('VEC', 'MTE3', 2)": 1,
+        "('VEC', 'MTE3', 3)": 1,
+        "('VEC', 'SCALAR', 3)": 1,
+        "('VEC', 'SCALAR', 4)": 1,
+        "('VEC', 'SCALAR', 5)": 1
+      },
+      "residual_tokens": 0,
+      "mte2_vector_intersections": 1071,
+      "overlap_examples": [
+        [
+          4101,
+          4653,
+          4103,
+          4112
+        ],
+        [
+          4101,
+          4653,
+          4103,
+          4112
+        ],
+        [
+          4101,
+          4653,
+          4104,
+          4119
+        ]
+      ],
+      "engines": {
+        "SCALAR": 2913,
+        "PUSHQ": 230,
+        "MTE2": 45,
+        "MTE3": 7,
+        "FLOWCTRL": 379,
+        "VEC": 27,
+        "RVECLP": 161,
+        "RVECSU": 347,
+        "RVECLD": 4951,
+        "RVECEX": 4533,
+        "RVECST": 4468
+      }
+    },
+    {
+      "core": "core0.veccore1.instr_popped_log.dump",
+      "instructions": 20269,
+      "active": true,
+      "routes": {
+        "('MTE2', 'VEC', 0)": 5,
+        "('MTE2', 'VEC', 1)": 2,
+        "('MTE2', 'VEC', 3)": 1,
+        "('MTE3', 'SCALAR', 0)": 1,
+        "('MTE3', 'SCALAR', 2)": 1,
+        "('MTE3', 'VEC', 5)": 1,
+        "('VEC', 'MTE2', 0)": 4,
+        "('VEC', 'MTE2', 1)": 3,
+        "('VEC', 'MTE2', 2)": 4,
+        "('VEC', 'MTE2', 3)": 3,
+        "('VEC', 'MTE3', 1)": 1,
+        "('VEC', 'MTE3', 2)": 1,
+        "('VEC', 'SCALAR', 3)": 1,
+        "('VEC', 'SCALAR', 4)": 1,
+        "('VEC', 'SCALAR', 5)": 1
+      },
+      "residual_tokens": 0,
+      "mte2_vector_intersections": 556,
+      "overlap_examples": [
+        [
+          3975,
+          4546,
+          3977,
+          3986
+        ],
+        [
+          3975,
+          4546,
+          3977,
+          3986
+        ],
+        [
+          3975,
+          4546,
+          3978,
+          3993
+        ]
+      ],
+      "engines": {
+        "SCALAR": 3166,
+        "PUSHQ": 247,
+        "MTE2": 47,
+        "MTE3": 8,
+        "FLOWCTRL": 387,
+        "VEC": 28,
+        "RVECLP": 175,
+        "RVECSU": 446,
+        "RVECLD": 5238,
+        "RVECEX": 5785,
+        "RVECST": 4742
+      }
+    }
+  ]
+}

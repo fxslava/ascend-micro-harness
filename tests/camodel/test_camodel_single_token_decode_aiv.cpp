@@ -61,6 +61,7 @@
 
 #include "camodel_common.hpp"
 #include "../common/single_token_decode_oracle.hpp"
+#include "../common/decode_boundary_fixture.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -71,6 +72,14 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+
+extern "C" void launch_turboquant_single_token_decode_boundary_aiv(
+    void*, std::uint32_t, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
+    std::uint32_t*,
+    float*, float*, float*, float*, float*, float*, std::uint16_t*, std::int32_t*,
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t);
 
 extern "C" void launch_turboquant_single_token_decode_aiv(
     void*, std::uint32_t, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
@@ -143,9 +152,11 @@ struct CanarySweep {
 struct Options {
     std::uint32_t head = 0;
     std::uint32_t pages = 1;
+    std::uint32_t page_begin = 0;
     std::uint32_t strips = static_cast<std::uint32_t>(kStripsPerPage);
     std::uint32_t strip_begin = 0;
     std::uint32_t rows = static_cast<std::uint32_t>(kRows);
+    bool exact_boundary = false;
     bool all = false;
     bool fixture_check = true;
 };
@@ -172,12 +183,16 @@ Options parse(int argc, char** argv)
             options.head = parse_u32(next("--head"), "--head");
         } else if (flag == "--pages") {
             options.pages = parse_u32(next("--pages"), "--pages");
+        } else if (flag == "--page-begin") {
+            options.page_begin = parse_u32(next("--page-begin"), "--page-begin");
         } else if (flag == "--strips") {
             options.strips = parse_u32(next("--strips"), "--strips");
         } else if (flag == "--strip-begin") {
             options.strip_begin = parse_u32(next("--strip-begin"), "--strip-begin");
         } else if (flag == "--rows") {
             options.rows = parse_u32(next("--rows"), "--rows");
+        } else if (flag == "--exact-boundary") {
+            options.exact_boundary = true;
         } else if (flag == "--all") {
             options.all = true;
         } else if (flag == "--no-fixture-check") {
@@ -188,14 +203,33 @@ Options parse(int argc, char** argv)
     }
     if (options.head >= static_cast<std::uint32_t>(kItems))
         throw std::invalid_argument("--head out of range");
-    if (options.pages < 1 || options.pages > static_cast<std::uint32_t>(kMaxPages))
+    if (options.pages < 1 || options.page_begin >= static_cast<std::uint32_t>(kMaxPages) ||
+        options.pages > static_cast<std::uint32_t>(kMaxPages) - options.page_begin)
         throw std::invalid_argument("--pages out of range");
     if (options.strips < 1 ||
         options.strip_begin + options.strips >
             static_cast<std::uint32_t>(kStripsPerPage))
         throw std::invalid_argument("strips window out of range");
-    if (options.rows < 1 || options.rows > static_cast<std::uint32_t>(kMaxRows))
-        throw std::invalid_argument("--rows out of range");
+    // Against `kRows`, the ORACLE's domain, and not against the kernel's
+    // `kMaxRows` buffer bound of 8.
+    //
+    // The two are different numbers for a reason, and conflating them cost a
+    // 822-second run. `kMaxRows` is how wide the kernel's Unified Buffer
+    // panels are; `kRows` is how many rows this fixture models, and it is 6
+    // because that is H_q / H_kv for the model — at 8 rows per KV head H_q
+    // would be 32, which is not a shape this oracle describes. The oracle's
+    // panel is kRows * kKeys floats and its `m`, `l` and `acc` are kRows
+    // entries, so a run at `--rows 8` drove the device correctly and then
+    // compared it against host memory past the end of three std::vectors:
+    // 256 of 1024 panel entries "wrong" (exactly rows 6 and 7 over 8 strips)
+    // and a largest |acc| of 1.7e35 read out of whatever followed the
+    // allocation. The device was never at fault and the run established
+    // nothing, which is the worst kind of failure to look at.
+    if (options.rows < 1 || options.rows > static_cast<std::uint32_t>(kRows))
+        throw std::invalid_argument(
+            "--rows must be 1..6: the oracle models H_q / H_kv = 6 rows per "
+            "(request, kv_head), and the kernel's kMaxRows = 8 is a Unified "
+            "Buffer bound, not a shape this fixture can check");
     return options;
 }
 
@@ -209,7 +243,7 @@ int main(int argc, char** argv)
     } catch (const std::exception& error) {
         std::fprintf(stderr, "usage error: %s\n", error.what());
         std::fprintf(stderr,
-                     "usage: %s [--head H] [--pages P] [--strips N] [--strip-begin T]\n"
+                     "usage: %s [--page-begin P] [--exact-boundary] [--head H] [--pages P] [--strips N] [--strip-begin T]\n"
                      "          [--rows R] [--all] [--no-fixture-check]\n",
                      argv[0]);
         return 2;
@@ -229,7 +263,7 @@ int main(int argc, char** argv)
     std::vector<int> window;
     for (std::uint32_t page = 0; page < options.pages; ++page)
         for (std::uint32_t i = 0; i < options.strips; ++i)
-            window.push_back(static_cast<int>(page * kStripsPerPage +
+            window.push_back(static_cast<int>((options.page_begin + page) * kStripsPerPage +
                                               options.strip_begin + i));
 
     try {
@@ -281,6 +315,8 @@ int main(int argc, char** argv)
         fill_payload(scale_cache, kTileCanary);
         fill_payload(q_rot, kTileCanary);
         fill_payload(gate, kTileCanary);
+        fill_payload(block_table, kTileCanary);
+        fill_payload(pi_sign_buffer, kTileCanary);
 
         auto* key_bytes = static_cast<std::uint8_t*>(key_cache.host_payload());
         auto* value_bytes = static_cast<std::uint8_t*>(value_cache.host_payload());
@@ -308,20 +344,21 @@ int main(int argc, char** argv)
                     for (int channel = 0; channel < kHeadSize; ++channel)
                         paged_decode::PackNibble(
                             key_strip, paged_decode::KeyNibbleIndex(token, channel),
-                            KeyNibbleAt(head, strip, token, channel));
+                            options.exact_boundary ? 3 : KeyNibbleAt(head, strip, token, channel));
                 for (int channel = 0; channel < kHeadSize; ++channel)
                     for (int token = 0; token < kKeys; ++token)
                         paged_decode::PackNibble(
                             value_strip, paged_decode::ValueNibbleIndex(channel, token),
-                            ValueNibbleAt(head, strip, channel, token));
+                            options.exact_boundary ? decode_boundary::Value(strip, channel) :
+                                ValueNibbleAt(head, strip, channel, token));
                 for (int token = 0; token < kKeys; ++token) {
                     const int in_page = where.strip * kKeys + token;
                     scale_floats[paged_decode::ScaleOffset(0, where.block, where.head,
                                                            in_page)] =
-                        KeyScale(head, strip, token);
+                        options.exact_boundary ? 1.0f : KeyScale(head, strip, token);
                     scale_floats[paged_decode::ScaleOffset(1, where.block, where.head,
                                                            in_page)] =
-                        ValueScaleAt(head, strip, token);
+                        options.exact_boundary ? 1.0f : ValueScaleAt(head, strip, token);
                 }
                 ++slices_written;
             }
@@ -330,14 +367,14 @@ int main(int argc, char** argv)
                 for (int c = 0; c < kHeadSize; ++c) {
                     const std::size_t at =
                         (static_cast<std::size_t>(head) * rows + row) * kHeadSize + c;
-                    qrot_values[at] = float_to_bfloat16_rne(QRotEntry(head, row, c));
-                    gate_values[at] = GateEntry(head, QueryRowOf(head, row), c);
+                    qrot_values[at] = float_to_bfloat16_rne(options.exact_boundary ? 1.0f / 256.0f : QRotEntry(head, row, c));
+                    gate_values[at] = options.exact_boundary ? 0.0f : GateEntry(head, QueryRowOf(head, row), c);
                 }
         }
 
         // Read whole by whichever block runs, so always real.
         auto* table_words = static_cast<std::uint32_t*>(block_table.host_payload());
-        for (int page = 0; page < kMaxPages; ++page)
+        for (unsigned page = options.page_begin; page < options.page_begin + options.pages; ++page)
             table_words[page] =
                 static_cast<std::uint32_t>(paged_decode::BlockTableEntry(page));
         auto* pi_signs = static_cast<float*>(pi_sign_buffer.host_payload());
@@ -362,6 +399,11 @@ int main(int argc, char** argv)
                     "everything else canary 0x%08X\n",
                     slices_written, options.all ? rows * kKvHeads : rows, kTileCanary);
 
+        const std::vector<camodel::GuardedDeviceBuffer*> read_only = {
+            &q_rot, &key_cache, &value_cache, &scale_cache, &gate, &block_table, &pi_sign_buffer};
+        std::vector<std::vector<std::uint32_t>> input_images;
+        for (auto* buffer : read_only) input_images.push_back(buffer->host);
+
         // Snapshot the read-only inputs BEFORE the launch: the download below
         // overwrites the same host buffers, so a comparison taken afterwards
         // would compare the device's bytes with themselves.
@@ -384,7 +426,8 @@ int main(int argc, char** argv)
         const std::uint32_t item_count =
             options.all ? static_cast<std::uint32_t>(kItems) : 1u;
         const std::uint32_t block_dim = item_count;
-        launch_turboquant_single_token_decode_aiv(
+        const auto launch = [&](auto launch_fn, auto... extra) {
+            launch_fn(
             session.stream, block_dim, static_cast<std::uint16_t*>(q_rot.payload()),
             static_cast<std::int8_t*>(key_cache.payload()),
             static_cast<std::int8_t*>(value_cache.payload()),
@@ -402,7 +445,12 @@ int main(int argc, char** argv)
             static_cast<std::uint32_t>(kKvHeads), options.rows,
             static_cast<std::uint32_t>(kHeadSize), static_cast<std::uint32_t>(kBlockSize),
             static_cast<std::uint32_t>(kCachePages), options.pages, options.strips,
-            options.strip_begin, item_begin, item_count);
+            options.strip_begin, item_begin, item_count, extra...);
+        };
+        if (options.page_begin == 0u && !options.exact_boundary)
+            launch(&launch_turboquant_single_token_decode_aiv);
+        else
+            launch(&launch_turboquant_single_token_decode_boundary_aiv, options.page_begin);
         camodel::check(aclrtSynchronizeStream(session.stream), "aclrtSynchronizeStream");
 
         for (auto* buffer : {&out_scores, &out_state, &out_acc, &out_rotated,
@@ -416,6 +464,9 @@ int main(int argc, char** argv)
                              &scale_cache, &q_rot, &gate, &block_table, &pi_sign_buffer})
             buffer->assert_guards();
         std::printf("  guard bands: all 13 buffers intact, head and tail\n");
+
+        for (std::size_t i = 0; i < read_only.size(); ++i)
+            expect(read_only[i]->host == input_images[i], "ASSERT_CANARY_INTACT: all input bytes unchanged");
 
         // ---------------------------------------- the launch observation
         {
@@ -466,6 +517,7 @@ int main(int argc, char** argv)
         std::size_t m_bad = 0;
         std::uint64_t worst_l_ulp = 0;
         std::uint64_t worst_acc_ulp = 0;
+        double worst_acc_abs = 0.0;
         double worst_rotated_abs = 0.0;
         double worst_context_abs = 0.0;
         double largest_acc = 0.0;
@@ -477,11 +529,12 @@ int main(int argc, char** argv)
 
         for (int item = first_item; item < last_item; ++item) {
             const int head = item % kKvHeads;
-            const GoldenState golden = GoldenDecode(head, window);
+            const GoldenState golden = options.exact_boundary ? decode_boundary::Oracle(window) : GoldenDecode(head, window);
 
             // 1. every raw score panel, bit-exactly
             for (std::size_t i = 0; i < window.size(); ++i) {
-                const std::vector<float> raw = GoldenRawPanel(head, window[i]);
+                const std::vector<float> raw = options.exact_boundary ?
+                    std::vector<float>(kRows * kKeys, 3.0f) : GoldenRawPanel(head, window[i]);
                 for (int row = 0; row < rows; ++row)
                     for (int t = 0; t < kKeys; ++t) {
                         const float got =
@@ -516,6 +569,10 @@ int main(int argc, char** argv)
                     worst_acc_ulp = std::max(
                         worst_acc_ulp,
                         ulp_distance(acc_out[panel_base + at], golden.acc[at]));
+                    worst_acc_abs = std::max(
+                        worst_acc_abs,
+                        static_cast<double>(std::fabs(acc_out[panel_base + at] -
+                                                      golden.acc[at])));
                     largest_acc = std::max(largest_acc,
                                            static_cast<double>(std::fabs(golden.acc[at])));
                 }
@@ -535,6 +592,22 @@ int main(int argc, char** argv)
                         std::max(largest_rotated,
                                  static_cast<double>(std::fabs(golden.rotated[at])));
                 }
+
+            if (options.exact_boundary) {
+                for (int row = 0; row < rows; ++row) {
+                    const auto state_base = static_cast<std::size_t>(item) * 2 * kMaxRows * kStateLanes;
+                    for (int lane = 0; lane < kStateLanes; ++lane) {
+                        expect(bits_of(state_out[state_base + row * kStateLanes + lane]) == bits_of(golden.m[row]), "exact boundary replicated m");
+                        expect(bits_of(state_out[state_base + (kMaxRows + row) * kStateLanes + lane]) == bits_of(golden.l[row]), "exact boundary replicated l");
+                    }
+                    for (int c = 0; c < kHeadSize; ++c) {
+                        const auto at = row * kHeadSize + c;
+                        expect(bits_of(acc_out[panel_base + at]) == bits_of(golden.acc[at]), "exact boundary acc");
+                        expect(bits_of(rotated_out[panel_base + at]) == bits_of(golden.rotated[at]), "exact boundary dense rotation");
+                        expect(context_out[panel_base + at] == float_to_bfloat16_rne(golden.context[at]), "exact boundary BF16 context");
+                    }
+                }
+            }
 
             // 5. the gated bf16 context
             for (int row = 0; row < rows; ++row)
@@ -619,26 +692,48 @@ int main(int argc, char** argv)
         // an absolute budget on the egress would be meaningless, because the
         // Hadamard cancels `acc` down to a small fraction of its intermediates.
         constexpr std::uint64_t kLUlpBudget = 64;
-        constexpr std::uint64_t kAccUlpBudget = 256;
+        // `acc` is gated RELATIVE to the largest value in the panel, not in
+        // ULP, and the four-page rung is what settled that. A ULP gate on a
+        // cancelling reduction measures the wrong thing: symmetric int4 values
+        // make `acc` a signed sum, so individual channels land arbitrarily
+        // close to zero, and the ULP distance at such a channel is enormous
+        // while the absolute error there is negligible. At 32 strips the worst
+        // entry reached 1280 ULP against a 256 ULP budget while every
+        // downstream quantity built from `acc` -- the egress rotation and the
+        // gated context -- sat three orders of magnitude INSIDE its own
+        // relative budget, which is not what an accumulator fault looks like.
+        // Guidelines section 5 asks for a budget against the largest
+        // intermediate for exactly this shape of computation, and the two
+        // egress checks below already follow it.
+        //
+        // The divisor is derived, not fitted. `acc` sums at most
+        // 8 strips/page x 8 pages x 16 keys = 1024 exp-weighted products, each
+        // carrying up to 1 ULP from `Exp` plus FP32 rounding, so the
+        // accumulated error is of order 2^10 x 2^-24 = 2^-14 of the largest
+        // term. 2^-12 of the largest magnitude leaves four times that.
+        const double acc_budget = largest_acc / 4096.0 + 1.0e-7;
         const double rotated_budget = largest_rotated / 1024.0 + 1.0e-7;
         // bf16 carries 8 mantissa bits, so 2^-6 of the largest magnitude
         // leaves two bits of headroom for the Exp and the Div in front of it.
         const double context_budget = largest_context / 64.0 + 1.0e-7;
 
         expect(worst_l_ulp <= kLUlpBudget, "l within the ULP budget");
-        expect(worst_acc_ulp <= kAccUlpBudget, "acc within the ULP budget");
+        expect(worst_acc_abs <= acc_budget, "acc within its relative budget");
         expect(worst_rotated_abs <= rotated_budget,
                "the egress rotation, before the gate, within its relative budget");
         expect(worst_context_abs <= context_budget,
                "the gated bf16 context within the relative budget");
-        std::printf("  numerics: m bit-exact, l <= %llu ULP, acc <= %llu ULP "
-                    "(largest |acc| %.6f)\n",
-                    static_cast<unsigned long long>(worst_l_ulp),
-                    static_cast<unsigned long long>(worst_acc_ulp), largest_acc);
+        std::printf("  numerics: m bit-exact, l <= %llu ULP, acc err %.3e vs "
+                    "budget %.3e (%llu ULP, largest |acc| %.6f)\n",
+                    static_cast<unsigned long long>(worst_l_ulp), worst_acc_abs,
+                    acc_budget, static_cast<unsigned long long>(worst_acc_ulp),
+                    largest_acc);
         std::printf("  egress:   rotation err %.3e vs budget %.3e (largest |rot| "
                     "%.6f), context err %.3e vs budget %.3e (largest |ctx| %.6f)\n",
                     worst_rotated_abs, rotated_budget, largest_rotated,
                     worst_context_abs, context_budget, largest_context);
+
+        if (options.exact_boundary) std::printf("  byte-exact boundary oracle checked (scores, m/l replicas, acc, rotation, BF16)\n");
 
         // ------------------------------------------------ the canary sweep
         CanarySweep sweep;
@@ -693,8 +788,7 @@ int main(int argc, char** argv)
                     check_word(rotated_raw[at]);
                     // bf16: two canary halves per 32-bit canary word.
                     ++sweep.checked;
-                    if (context_raw[at] != (kTileCanary & 0xFFFFu) &&
-                        context_raw[at] != static_cast<std::uint16_t>(kTileCanary >> 16))
+                    if (context_raw[at] != static_cast<std::uint16_t>(kTileCanary >> (16u * (at % 2u))))
                         ++sweep.mutated;
                 }
         }

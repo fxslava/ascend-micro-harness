@@ -1,0 +1,101 @@
+ok   check 0: the audited core issued vector instructions
+ok   check 0: the audited core issued MTE2 bursts
+ok   check 0: the audited core issued MTE3 bursts
+ok   check 1: no cross-core flag instruction was issued (none)
+ok   check 2: no Cube instruction was issued (none)
+ok   check 2: no Cube or MTE1 engine appears in the dump (none)
+ok   check 2: no data mover touched L1 (0)
+ok   check 3: SET_FLAG == WAIT_FLAG per (pipe, trigger, id) ([])
+     routes: [(('MTE2', 'VEC', 0), 3), (('MTE2', 'VEC', 1), 1), (('MTE3', 'SCALAR', 0), 2), (('MTE3', 'VEC', 0), 2), (('MTE3', 'VEC', 1), 2), (('VEC', 'MTE2', 0), 2), (('VEC', 'MTE2', 1), 2), (('VEC', 'MTE2', 2), 2), (('VEC', 'MTE2', 3), 2), (('VEC', 'MTE3', 0), 1), (('VEC', 'MTE3', 1), 3)]
+ok   check 3: no reserved flag id 6 or 7 is used ([])
+ok   check 3b: every intra-core SET precedes its WAIT in program order ([])
+ok   check 4: skipped, no companion dump given
+ok   check 5: RV_VSELR 24 == 6 stages x 4 regs x 1 rows x 1 item(s) = 24
+ok   check 5: RV_VMULA 48 == 24 butterfly + 3 x 8 divide registers = 48
+     register traffic, reported not gated: RV_VLD 1669, RV_VST 740 (the level-2 APIs lower to VF code too, so this total is not attributable to the butterfly leaf)
+ok   check 6: the core both read and wrote Global Memory
+ok   check 6: 11 GM loads == 1 pi_signs + 1 x (2 panels + 4 x 2 strip operands) = 11
+ok   check 6: 8 GM stores == 1 probe + 1 x (2 archived panels + 5 epilogue bursts) = 8
+
+engine        instr      first       last       span
+RVECEX         2979       1755      18114      16359
+RVECLD         2237       1769      18109      16340
+RVECST         2054       1761      18126      16365
+SCALAR         1979        699      18989      18290
+FLOWCTRL        180       1172      18992      17820
+RVECSU          141       1752      17972      16220
+PUSHQ           107       1169      16401      15232
+RVECLP           69       1751      17832      16081
+MTE2             24       1171       6733       5562
+VEC              20       1292       7379       6087
+MTE3             19       1171      18150      16979
+
+vector and DMA mnemonic census (dispatch):
+  RV_VLDI                 929
+  RV_SMEM_BAR             908
+  RV_VLD                  740
+  RV_VST                  732
+  RV_VSTUI                644
+  RV_VCADD                642
+  RV_PLT                  475
+  RV_VMUL                 306
+  RV_VCVT_I2F             256
+  RV_SEND                 220
+  RV_VSEL                 160
+  RV_VDUPS                144
+  RV_VCVT_I2I             128
+  RV_PLDI                  72
+  RV_PAND                  72
+  RV_PSTI                  72
+  RV_VLOOP                 69
+  RV_SMOVI                 68
+  RV_VADD                  66
+  RV_VABS_FP               56
+  RV_PNOT                  56
+  RV_VMULS                 56
+  RV_VAND                  54
+  RV_VADDS                 48
+  RV_VCMP_EQ               48
+  RV_VMULA                 48
+  VF                       44
+  RV_VSUB                  40
+  RV_VCMP_LT               40
+  RV_POR                   40
+  RV_SMOV                  26
+  RV_VSHRI                 24
+  RV_VSELR                 24
+  SET_FLAG                 22
+  WAIT_FLAG                22
+  MOV_SRC_TO_DST_ALIGN     19
+  RV_VMOV                  16
+  RV_VCMP_NE               16
+  RV_VCMP_GT               16
+  RV_VSHLI                 14
+  RV_VOR                   14
+  RV_PSET                  13
+  RV_VSTAI                 10
+  RV_VMAX                  10
+  RV_VCVT_F2F               8
+  RV_VSTI                   8
+  RV_VEXP                   8
+  RV_VDIV                   8
+  RV_VCMPS_LT               8
+  RV_VCMP_LE                8
+  RV_VCMPS_GE               8
+  RV_VCMPS_EQ               8
+  RV_VSHLS                  8
+  RV_VABS_INT               8
+  RV_VSHR                   8
+  RV_VBR                    7
+  RV_VXOR                   6
+  RV_VCMAX                  2
+  RV_SMOVK                  2
+  RV_VDUP                   1
+  RV_VCI                    1
+  RV_SCBZI                  1
+
+whole-dump dispatch span: 18293 model ticks -- fill plus drain over every launch, NOT a throughput figure
+per-strip dispatch interval: 9146 ticks over 2 strip(s), epilogue included
+completed-log instructions: 9267
+
+single-token decode trace audit: PASS

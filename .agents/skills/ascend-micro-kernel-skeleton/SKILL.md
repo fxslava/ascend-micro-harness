@@ -1,6 +1,6 @@
 ---
 name: ascend-micro-kernel-skeleton
-description: Create or revise diagnostic Ascend C kernel skeletons in the ascend-micro-harness repository, with lightweight stage work, explicit synchronization, and host or CAModel validation. Use for skeleton and pipeline-probe tasks in this repository, not production kernels in vllm-ascend.
+description: Create or revise diagnostic Ascend C kernel skeletons in the ascend-micro-harness repository, with lightweight stage work, capacity-one token modeling, logical-page boundary canaries, explicit synchronization, and host or CAModel validation. Use for skeleton and pipeline-probe tasks in this repository, not production kernels in vllm-ascend.
 ---
 
 # Ascend micro-harness kernel skeletons
@@ -8,6 +8,11 @@ description: Create or revise diagnostic Ascend C kernel skeletons in the ascend
 Work in `C:\Ascend\ascend-micro-harness`. A skeleton proves a specific launch, memory, or scheduling property with the smallest useful device operations. It is not evidence that omitted production arithmetic is correct or fast.
 
 Follow `SKELETON_KERNEL_WORKFLOW.md` for the end-to-end procedure and the five verification stages (V0 compile-time, V1 Tier-1 host, V2 CAModel at the ring depth, V3 CAModel past the ring depth for steady state, V4 trace audit, V5 report). `MICROROUTINE_DESIGN_GUIDELINES.md` holds the rules those stages enforce. The sections below summarise the same ground; where they differ, the two documents in the repository are current.
+
+For pipeline/buffer refactors of real operators in this repository, use
+`REFINEMENT_OF_COMBAT_KERNELS.md` and the `ascend-combat-kernel-refinement`
+project skill. Isolated head/middle/tail CAModel canaries precede full-depth
+and wrap validation; host-only evidence never replaces the boundary gate.
 
 ## Choose the artifact
 

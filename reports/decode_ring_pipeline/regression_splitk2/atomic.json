@@ -1,0 +1,20 @@
+[
+  {
+    "core": "core0.veccore0.instr_log.dump",
+    "begin": 31015,
+    "end": 34889,
+    "hold_ticks": 3874,
+    "failed_exchanges": 0,
+    "state_reads": 0,
+    "state_writes": 1
+  },
+  {
+    "core": "core0.veccore1.instr_log.dump",
+    "begin": 35341,
+    "end": 39360,
+    "hold_ticks": 4019,
+    "failed_exchanges": 7,
+    "state_reads": 1,
+    "state_writes": 0
+  }
+]

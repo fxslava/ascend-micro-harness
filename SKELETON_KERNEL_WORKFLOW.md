@@ -1,5 +1,10 @@
 # Writing a skeleton kernel, and every stage of verifying it
 
+Pipeline and buffer-lifetime refactors of real operators follow the primary
+[combat kernel refinement baseline](REFINEMENT_OF_COMBAT_KERNELS.md): token model,
+UB checks, isolated logical-page head/middle/tail canaries, ring wrap, trace audit.
+
+
 Ascend 950PR / arch35 / `dav-3510` / CANN 9.2.0-beta.2, `Ascend950PR_9599`
 CAModel.
 

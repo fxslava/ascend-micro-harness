@@ -1,0 +1,156 @@
+{
+  "status": "PASS",
+  "case": "regression_splitk4",
+  "strips_per_active_core": null,
+  "model_ticks": 29645,
+  "observations": [
+    "PASS: CPU references matched. Kernel launches: AIV=1 AIC=0."
+  ],
+  "idle_cores": 92,
+  "cores": [
+    {
+      "core": "core0.veccore0.instr_popped_log.dump",
+      "instructions": 4668,
+      "active": true,
+      "routes": {
+        "('MTE2', 'VEC', 0)": 3,
+        "('MTE2', 'VEC', 3)": 1,
+        "('MTE3', 'SCALAR', 2)": 1,
+        "('MTE3', 'VEC', 5)": 1,
+        "('VEC', 'MTE2', 0)": 2,
+        "('VEC', 'MTE2', 1)": 1,
+        "('VEC', 'MTE2', 2)": 2,
+        "('VEC', 'MTE2', 3)": 1,
+        "('VEC', 'MTE3', 2)": 1,
+        "('VEC', 'MTE3', 3)": 1,
+        "('VEC', 'SCALAR', 3)": 1,
+        "('VEC', 'SCALAR', 4)": 1,
+        "('VEC', 'SCALAR', 5)": 1
+      },
+      "residual_tokens": 0,
+      "mte2_vector_intersections": 0,
+      "overlap_examples": [],
+      "engines": {
+        "SCALAR": 1272,
+        "PUSHQ": 61,
+        "MTE2": 19,
+        "MTE3": 7,
+        "FLOWCTRL": 107,
+        "VEC": 16,
+        "RVECLP": 50,
+        "RVECSU": 166,
+        "RVECLD": 1025,
+        "RVECEX": 999,
+        "RVECST": 946
+      }
+    },
+    {
+      "core": "core0.veccore1.instr_popped_log.dump",
+      "instructions": 4748,
+      "active": true,
+      "routes": {
+        "('MTE2', 'VEC', 0)": 3,
+        "('MTE2', 'VEC', 3)": 1,
+        "('MTE3', 'SCALAR', 2)": 1,
+        "('MTE3', 'VEC', 5)": 1,
+        "('VEC', 'MTE2', 0)": 2,
+        "('VEC', 'MTE2', 1)": 1,
+        "('VEC', 'MTE2', 2)": 2,
+        "('VEC', 'MTE2', 3)": 1,
+        "('VEC', 'MTE3', 2)": 1,
+        "('VEC', 'MTE3', 3)": 1,
+        "('VEC', 'SCALAR', 3)": 1,
+        "('VEC', 'SCALAR', 4)": 1,
+        "('VEC', 'SCALAR', 5)": 1
+      },
+      "residual_tokens": 0,
+      "mte2_vector_intersections": 0,
+      "overlap_examples": [],
+      "engines": {
+        "SCALAR": 1272,
+        "PUSHQ": 61,
+        "MTE2": 19,
+        "MTE3": 7,
+        "FLOWCTRL": 107,
+        "VEC": 16,
+        "RVECLP": 58,
+        "RVECSU": 166,
+        "RVECLD": 1033,
+        "RVECEX": 1063,
+        "RVECST": 946
+      }
+    },
+    {
+      "core": "core1.veccore0.instr_popped_log.dump",
+      "instructions": 6761,
+      "active": true,
+      "routes": {
+        "('MTE2', 'VEC', 0)": 3,
+        "('MTE2', 'VEC', 3)": 1,
+        "('MTE3', 'SCALAR', 0)": 1,
+        "('MTE3', 'SCALAR', 2)": 1,
+        "('MTE3', 'VEC', 5)": 1,
+        "('VEC', 'MTE2', 0)": 2,
+        "('VEC', 'MTE2', 1)": 1,
+        "('VEC', 'MTE2', 2)": 2,
+        "('VEC', 'MTE2', 3)": 1,
+        "('VEC', 'MTE3', 1)": 1,
+        "('VEC', 'MTE3', 2)": 1,
+        "('VEC', 'SCALAR', 3)": 1,
+        "('VEC', 'SCALAR', 4)": 1,
+        "('VEC', 'SCALAR', 5)": 1
+      },
+      "residual_tokens": 0,
+      "mte2_vector_intersections": 0,
+      "overlap_examples": [],
+      "engines": {
+        "SCALAR": 1464,
+        "PUSHQ": 75,
+        "MTE2": 19,
+        "MTE3": 8,
+        "FLOWCTRL": 113,
+        "VEC": 16,
+        "RVECLP": 71,
+        "RVECSU": 210,
+        "RVECLD": 1298,
+        "RVECEX": 2285,
+        "RVECST": 1202
+      }
+    },
+    {
+      "core": "core1.veccore1.instr_popped_log.dump",
+      "instructions": 1059,
+      "active": true,
+      "routes": {
+        "('MTE2', 'VEC', 0)": 2,
+        "('MTE3', 'SCALAR', 2)": 1,
+        "('MTE3', 'VEC', 5)": 1,
+        "('VEC', 'MTE2', 0)": 1,
+        "('VEC', 'MTE2', 1)": 1,
+        "('VEC', 'MTE2', 2)": 1,
+        "('VEC', 'MTE2', 3)": 1,
+        "('VEC', 'MTE3', 2)": 1,
+        "('VEC', 'MTE3', 3)": 1,
+        "('VEC', 'SCALAR', 3)": 1,
+        "('VEC', 'SCALAR', 4)": 1,
+        "('VEC', 'SCALAR', 5)": 1
+      },
+      "residual_tokens": 0,
+      "mte2_vector_intersections": 0,
+      "overlap_examples": [],
+      "engines": {
+        "SCALAR": 768,
+        "PUSHQ": 15,
+        "MTE2": 10,
+        "MTE3": 7,
+        "FLOWCTRL": 37,
+        "VEC": 12,
+        "RVECLP": 21,
+        "RVECSU": 52,
+        "RVECLD": 16,
+        "RVECEX": 78,
+        "RVECST": 43
+      }
+    }
+  ]
+}

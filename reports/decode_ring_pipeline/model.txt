@@ -1,0 +1,22 @@
+PASS Split-K N=0: 15 reachable states, empty final marking
+PASS Split-K N=1: 35 reachable states, empty final marking
+PASS Split-K N=2: 78 reachable states, empty final marking
+PASS Split-K N=3: 95 reachable states, empty final marking
+PASS Split-K N=4: 125 reachable states, empty final marking
+PASS Split-K N=5: 141 reachable states, empty final marking
+PASS Split-K N=8: 217 reachable states, empty final marking
+PASS Split-K N=16: 401 reachable states, empty final marking
+PASS Split-K N=64: 1505 reachable states, empty final marking
+PASS AIV N=0: 60 reachable states, empty final marking
+PASS AIV N=1: 141 reachable states, empty final marking
+PASS AIV N=2: 397 reachable states, empty final marking
+PASS AIV N=3: 517 reachable states, empty final marking
+PASS AIV N=4: 766 reachable states, empty final marking
+PASS AIV N=5: 887 reachable states, empty final marking
+PASS AIV N=8: 1506 reachable states, empty final marking
+PASS AIV N=16: 2986 reachable states, empty final marking
+PASS AIV N=64: 11866 reachable states, empty final marking
+PASS rejected negative control: unprime: deadlock / unprimed cycle
+PASS rejected negative control: duplicate: double SET loses token
+PASS rejected negative control: early_scale: scale overwritten before recurrence
+PASS 21738 states: 1-safe, ordered ownership, liveness, finite drain; 3 negative controls

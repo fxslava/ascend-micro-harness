@@ -1,0 +1,48 @@
+{
+  "status": "PASS",
+  "case": "splitk_middle",
+  "strips_per_active_core": 1,
+  "model_ticks": 19859,
+  "observations": [
+    "PASS Split-K boundary page=4 strip=4 count=1 rows=1: byte-exact context; ASSERT_CANARY_INTACT 1262536 bytes"
+  ],
+  "idle_cores": 95,
+  "cores": [
+    {
+      "core": "core0.veccore0.instr_popped_log.dump",
+      "instructions": 6340,
+      "active": true,
+      "routes": {
+        "('MTE2', 'VEC', 0)": 3,
+        "('MTE3', 'SCALAR', 0)": 1,
+        "('MTE3', 'SCALAR', 2)": 1,
+        "('MTE3', 'VEC', 5)": 1,
+        "('VEC', 'MTE2', 0)": 2,
+        "('VEC', 'MTE2', 1)": 1,
+        "('VEC', 'MTE2', 2)": 2,
+        "('VEC', 'MTE2', 3)": 1,
+        "('VEC', 'MTE3', 1)": 1,
+        "('VEC', 'MTE3', 2)": 1,
+        "('VEC', 'SCALAR', 3)": 1,
+        "('VEC', 'SCALAR', 4)": 1,
+        "('VEC', 'SCALAR', 5)": 1
+      },
+      "residual_tokens": 0,
+      "mte2_vector_intersections": 0,
+      "overlap_examples": [],
+      "engines": {
+        "SCALAR": 1332,
+        "PUSHQ": 72,
+        "MTE3": 8,
+        "MTE2": 17,
+        "FLOWCTRL": 106,
+        "VEC": 15,
+        "RVECLP": 55,
+        "RVECSU": 155,
+        "RVECLD": 1261,
+        "RVECEX": 2135,
+        "RVECST": 1184
+      }
+    }
+  ]
+}

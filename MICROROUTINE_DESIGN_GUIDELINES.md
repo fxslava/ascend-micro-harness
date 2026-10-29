@@ -1,5 +1,10 @@
 # Micro-routine design guidelines — Ascend 950PR / dav-3510 / CANN 9.2
 
+Pipeline and buffer-lifetime refactors of real operators follow the primary
+[combat kernel refinement baseline](REFINEMENT_OF_COMBAT_KERNELS.md): token model,
+UB checks, isolated logical-page head/middle/tail canaries, ring wrap, trace audit.
+
+
 Target: `Ascend950PR_9599` CAModel, `__NPU_ARCH__ == 3510`, CANN
 9.2.0-beta.2 (`ccec` / BiSheng). Every rule below is traced either to a
 CANN 9.2 implementation header or to a CAModel instruction trace from this

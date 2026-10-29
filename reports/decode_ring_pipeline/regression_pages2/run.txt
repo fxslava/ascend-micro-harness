@@ -1,0 +1,72 @@
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+single-token decode (AIV only) on CAModel: 1 row(s), 2 page(s), 2 strip(s) from 0, item 2 isolated (request 0, kv_head 2)
+[INFO] Config file is found, path is /usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/simulator/dav_3510/lib/config_stars.json.
+[FuncCache]: size:0x20000, line_size:128, way_num:16, line_num:1024, idx_num:64
+             idx_lsb:7, idx_mask:0x3f, tag_lsb:13, tag_mask:0xffffffffffffffff, ofst_mask:0x7f
+
+[TmSim]: Run in serial mode.
+[INFO] Config file [config.json] from model dynamic library path. Path: /usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/simulator/dav_3510/lib/config.json
+[INFO] AicWrapper attach AIC 0, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 1, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 2, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 3, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 4, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 5, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 6, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 7, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 8, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 9, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 10, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 11, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 12, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 13, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 14, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 15, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 16, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 17, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 18, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 19, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 20, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 21, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 22, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 23, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 24, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 25, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 26, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 27, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 28, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 29, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 30, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 31, num_vec_core=2, num_subcore=3
+[INFO] Chip 0 AIC / Scheduler / Soc periods: 200.0000 / 200.0000 / 105.0000
+[INFO] chip 0 die 0 device created
+================================================================================
+>>>>                                                                        
+>>>>                             " PEM MODEL "                                
+>>>>             Total no. of 1 chip(s) Model Init Success!                
+>>>>                                                                        
+================================================================================
+[INFO] Model Start Time: 2026-10-29 14:04:26
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:0 swapbuf_addr:10000000
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:1 swapbuf_addr:10000040
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:2 swapbuf_addr:10000080
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+  uploaded: 4 cache slice(s) and 1 query row(s) real, everything else canary 0x7FC0BEEF
+  guard bands: all 13 buffers intact, head and tail
+  launch: GetBlockIdx 0, GetBlockNum 1, GetSubBlockNum 1, itemCount 1 (grid 1)
+  inputs: 0 word(s) changed across the caches, the query panel and the scale plane
+  scores:   0/64 panel entries wrong (bit-exact check)
+  numerics: m bit-exact, l <= 0 ULP, acc err 4.172e-07 vs budget 3.824e-04 (7 ULP, largest |acc| 1.565807)
+  egress:   rotation err 1.118e-08 vs budget 7.253e-05 (largest |rot| 0.074169), context err 0.000e+00 vs budget 7.783e-04 (largest |ctx| 0.049805)
+  isolation: 57008/57008 unassigned and guard-band output words still canary
+[INFO] Model Stop Time: 2026-10-29 14:05:58
+Model RUN TIME: 91772.2 ms
+[INFO] Total tick: 30100
+[INFO] Model stopped successfully.
+PASS single-token decode: 1 row(s), 2 page(s), 2 strip(s), item 2 isolated

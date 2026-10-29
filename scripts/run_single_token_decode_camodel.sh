@@ -28,6 +28,11 @@
 # directory dies with "unknown file type".
 set -euo pipefail
 
+# The primary logical-page boundary baseline for pipeline refactors.
+if [[ "${1:-}" == boundary ]]; then
+    exec bash "$(dirname "${BASH_SOURCE[0]}")/run_decode_pipeline_camodel.sh"
+fi
+
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 toolkit="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.2.0-beta.2}"
 soc="${SOC_VERSION:-Ascend950PR_9599}"
@@ -171,11 +176,19 @@ elif [[ "${mode}" == "ladder" || "${mode}" == "rest" ]]; then
     # reading the wrong page is observable, and the only one that exercises the
     # branch where the CARRIED maximum wins.
     run_one "pages4_H1" 6 32 1 -- --head 1 --pages 4 || overall=1
-    # The row sweep: `rows` is a runtime bound, so 1 and 8 are its ends. These
-    # are also what make the audit's RV_VMULA derivation falsifiable rather than
-    # fitted -- both of its terms are linear in the row count.
+    # The row sweep. `rows` is a runtime bound in the kernel, so these rungs
+    # check that the bound is really runtime -- and together with the 6-row
+    # canary rungs they give three points on the audit's RV_VMULA derivation,
+    # which is linear in the row count, so 48 / 144 / 288 and nothing else.
+    #
+    # 1 and 3, NOT 1 and 8. The kernel's kMaxRows = 8 is a Unified Buffer
+    # bound; the ORACLE models 6 rows, because that is H_q / H_kv. A rung at
+    # --rows 8 drove the device correctly and then compared it against host
+    # memory past the end of the oracle's panel and state vectors, reporting
+    # 256 "wrong" entries and a largest |acc| of 1.7e35 that came from outside
+    # the allocation. The runner now refuses --rows above 6 for that reason.
     run_one "rows1_H0" 1 8 1 -- --head 0 --rows 1 || overall=1
-    run_one "rows8_H0" 8 8 1 -- --head 0 --rows 8 || overall=1
+    run_one "rows3_H0" 3 8 1 -- --head 0 --rows 3 || overall=1
     # The concurrent grid: four items in one launch, one per physical AIV. Last,
     # because it is the only rung where the companion Vector core is expected to
     # work and so the only one that relaxes an audit check.

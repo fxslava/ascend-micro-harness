@@ -1,5 +1,10 @@
 # Ascend 950PR 16×16 Cube Hadamard probe
 
+Pipeline and buffer-lifetime refactors of real operators follow the primary
+[combat kernel refinement baseline](REFINEMENT_OF_COMBAT_KERNELS.md): token model,
+UB checks, isolated logical-page head/middle/tail canaries, ring wrap, trace audit.
+
+
 ## Test domains and NPU TurboQuant harness
 
 `tests/cpu/` contains host-only oracle probes; `tests/camodel/` contains CANN

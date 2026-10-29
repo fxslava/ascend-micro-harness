@@ -1,0 +1,5 @@
+rotate butterfly Tier-1 probe: d = 256, 8 stages, 4 registers x 64 lanes
+  sign diagonal: 73 of 256 negative
+  Pi . Pi^T diagonal 256 over 256 x 256 entries
+  peak |Pi . x| over the fixture: 433.4 (FP32 exact below 2^24)
+rotate butterfly probe: PASS

@@ -12,3 +12,5 @@ __pycache__/
 /.vscode/
 /core*.dump
 /profile_*.toml
+.claude/
+probe/prof_output/
