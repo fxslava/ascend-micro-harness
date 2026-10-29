@@ -36,8 +36,45 @@ the benchmark binary:
 ```powershell
 wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/test_turboquant_a8_validation
 wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/test_turboquant_bf16_validation
-wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/bench_turboquant_a8_vs_bf16
+wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/bench_turboquant_reshape_and_cache
+wsl -- /tmp/ascend-turboquant-npu-XXXXXX/lib/bench_turboquant_decode_splitk
 ```
+
+The **Split-K decode benchmark** is the second of those. It sweeps the split
+count against the two decode operators and the two reduction protocols:
+
+```sh
+bash scripts/run_decode_splitk_bench.sh build   # NPU build only, no device needed
+bash scripts/run_decode_splitk_bench.sh hw --splitk "2,4,8,16" --context 4096
+bash scripts/run_decode_splitk_bench.sh smoke   # the functional check, on the sim twin
+```
+
+`--splitk`, `--context`, `--warmup`, `--iters`, `--impl aic|aiv|both` and
+`--sync-mode atomic|workspace|both` are the sweep; `--cache warm|cold|both`
+chooses whether L2 is evicted between iterations, and `--watchdog N` bounds
+every spin. It reports min / mean / p50 / p95 / p99 in microseconds from ACL
+device events, the host enqueue cost separately, throughput over the bytes each
+phase actually moves, and — from absolute system-cycle stamps each split
+publishes — the **tail delta** between the first and last split to finish.
+
+Two things about it are worth knowing before reading any number it prints.
+There is deliberately **no combine kernel**: the `atomic` mode accumulates in
+place under a Global Memory spinlock with all K splits contending for one line,
+because that is what makes L2 line bouncing across physical cores measurable,
+and a tidy-up pass afterwards would be measured work the question does not ask
+about. And every acquire is bounded by a watchdog, after which a split gives up
+without the lock and publishes that it did — so a launch cannot hang, and any
+run with a nonzero timeout count is reported as INVALID rather than averaged
+in. The CAModel probe that chose these two protocols, and the crossover that
+says when the atomic one is affordable at all, are in
+[`reports/l2_atomic_contention_split_k.md`](reports/l2_atomic_contention_split_k.md).
+
+**This host has no NPU**, so the benchmark's standing here is a clean NPU-mode
+build — the same standing `reports/reshape_and_cache_a8.md` records for the
+reshape-and-cache benchmark. Its CLI, statistics, tail arithmetic and watchdog
+census are exercised through `bench_decode_splitk_sim`, which builds the same
+source against the CAModel libraries and announces at startup that its figures
+are model ticks rather than hardware latencies.
 
 A8 validation checks one 16-token strip and 512/1024-token contexts. Each strip
 uses one physical AI Core; all packed key and value nibbles and FP32 scale bits

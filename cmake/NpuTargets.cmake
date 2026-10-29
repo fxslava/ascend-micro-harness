@@ -64,20 +64,70 @@ function(add_ascend_micro_npu_targets)
   # as well: A8 Cube, BF16 Cube and the vendored BF16 Vector baseline. Only the
   # two BF16 figures share an input precision and a quantiser, so only that pair
   # isolates Cube against Vector; the runner says so in its own output.
-  add_executable(bench_turboquant_a8_vs_bf16
-      tests/npu/bench/bench_turboquant_a8_vs_bf16.cpp)
-  target_include_directories(bench_turboquant_a8_vs_bf16 PRIVATE
+  add_executable(bench_turboquant_reshape_and_cache
+      tests/npu/bench/bench_turboquant_reshape_and_cache.cpp)
+  target_include_directories(bench_turboquant_reshape_and_cache PRIVATE
       "${ASCEND_HOME_PATH}/include" "${BASELINE_DIR}")
-  target_link_libraries(bench_turboquant_a8_vs_bf16 PRIVATE
+  target_link_libraries(bench_turboquant_reshape_and_cache PRIVATE
       turboquant_a8_npu turboquant_bf16_npu turboquant_bf16_baseline_npu ascendcl)
-  target_compile_options(bench_turboquant_a8_vs_bf16 PRIVATE -Wall -Wextra -Werror)
+  target_compile_options(bench_turboquant_reshape_and_cache PRIVATE -Wall -Wextra -Werror)
+
+  # ---------------------------------------------------------- Split-K decode
+  # The two decode operators as physical-device libraries. Both sources are
+  # FROZEN and are compiled here exactly as the CAModel targets compile them;
+  # the only difference is RUN_MODE, which CANN selects per target.
+  ascendc_library(turboquant_paged_decode_npu SHARED
+      kernels/ops/turboquant/turboquant_paged_decode_attention.cpp)
+  ascendc_compile_definitions(turboquant_paged_decode_npu PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(turboquant_paged_decode_npu PRIVATE
+      -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  ascendc_library(turboquant_single_token_decode_npu SHARED
+      kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp)
+  ascendc_compile_definitions(turboquant_single_token_decode_npu PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(turboquant_single_token_decode_npu PRIVATE
+      -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  # The Split-K reduction. A separate translation unit from the CAModel probe
+  # in kernels/camodel/l2_atomic_synthetic.cpp on purpose: this one carries the
+  # watchdog, K up to 16 and the absolute timestamps that hardware needs, and
+  # the probe's published instruction budget was measured without them. See the
+  # header of the source and §5 of reports/l2_atomic_contention_split_k.md.
+  ascendc_library(turboquant_splitk_reduce_npu SHARED
+      kernels/ops/turboquant/turboquant_splitk_reduce.cpp)
+  ascendc_compile_definitions(turboquant_splitk_reduce_npu PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(turboquant_splitk_reduce_npu PRIVATE
+      -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  # The benchmark. HARDWARE ONLY: it needs a 950PR, and the development host
+  # for this harness has none, so what CI can establish for it is a clean build
+  # -- the same standing as bench_turboquant_reshape_and_cache, which
+  # reports/reshape_and_cache_a8.md records as compile-only for the same
+  # reason. `add_ascend_micro_sim_targets` registers a simulator twin that
+  # exercises the CLI, the statistics and the tail arithmetic where no device
+  # exists.
+  add_executable(bench_turboquant_decode_splitk
+      tests/npu/bench/bench_turboquant_decode_splitk.cpp)
+  target_include_directories(bench_turboquant_decode_splitk PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(bench_turboquant_decode_splitk PRIVATE
+      turboquant_paged_decode_npu turboquant_single_token_decode_npu
+      turboquant_splitk_reduce_npu ascendcl)
+  target_compile_options(bench_turboquant_decode_splitk PRIVATE
+      -Wall -Wextra -Werror)
 
   foreach(target test_turboquant_a8_validation test_turboquant_bf16_validation
-      bench_turboquant_a8_vs_bf16)
+      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk)
     set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
   endforeach()
   add_custom_target(turboquant_npu_all DEPENDS
       test_turboquant_a8_validation test_turboquant_bf16_validation
-      bench_turboquant_a8_vs_bf16)
+      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk)
 endfunction()

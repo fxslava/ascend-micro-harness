@@ -207,6 +207,64 @@ enum class ProbeMode : std::uint32_t {
     TailEgress = 2,     // Mode C
 };
 
+// ------------------------------------------------ the hardware split-K path
+// Everything above is the CAModel probe, whose instruction budget and cycle
+// figures `reports/l2_atomic_contention_split_k.md` records. Everything below
+// is ADDITIVE and exists for the physical-device benchmark
+// (`tests/npu/bench/bench_turboquant_decode_splitk.cpp`): new constants and
+// new entry points, with no line of the probe's own surface changed. That is
+// deliberate and it is the repository's own precedent -- the recurrence leaf
+// gained `vector_decode_recur_rows` the same way -- because the probe's
+// published numbers were measured against the unbounded spin and an edit to it
+// would silently invalidate them.
+//
+// Two things the hardware path needs that the probe does not.
+//
+// **A watchdog.** On CAModel a lost lock hangs a simulation someone can kill.
+// On silicon it hangs a device, and the task requires that it cannot. So the
+// hardware acquire below bounds its attempts and, on expiry, gives up WITHOUT
+// taking the lock, records that it did, and leaves the lock untouched for
+// whoever actually holds it. The release reads that same per-slot record and
+// clears the lock only if this split really acquired it, so a timed-out split
+// cannot release a lock it never held -- which would be worse than hanging,
+// because it would corrupt the protocol silently and still produce numbers.
+//
+// The bound is an ATTEMPT count, not a cycle budget: `asc_get_system_cycle` is
+// `__aicore__` and a SIMT VF may call only `__simt_callee__` helpers, so there
+// is no clock to read inside the spin. The benchmark converts: one failed
+// attempt is one atomic round trip, measured on CAModel at a few hundred
+// ticks, so a bound of N attempts is on the order of N * 500 cycles. The
+// report states the conversion rather than implying a wall-clock guarantee.
+//
+// **Absolute timestamps.** The probe publishes per-phase cycle DELTAS, which
+// cannot express a tail: a split's delta says how long it took, not when it
+// finished. The system counter is global across cores on this part, so the
+// hardware path publishes absolute entry and exit stamps as (hi, lo) int32
+// pairs in the slots the probe left free, and the host computes the spread
+// between the first and last split to finish.
+constexpr std::uint32_t kSplitKMaxSplits = 16u;
+static_assert(kSplitKMaxSplits >= kProbeMaxSplits,
+              "the hardware sweep must cover at least the probe's split range");
+
+// The free metric slots, 9..15. The probe uses 0..8 and 16..23.
+enum SplitKMetric : std::uint32_t {
+    kMetricBeginHi = 9,   // absolute system cycle at region entry, high word
+    kMetricBeginLo = 10,
+    kMetricEndHi = 11,    // absolute system cycle at region exit
+    kMetricEndLo = 12,
+    kMetricAcquired = 13,  // acquisitions this split actually obtained
+    kMetricTimeouts = 14,  // acquisitions the watchdog gave up on
+    kMetricSpins = 15,     // failed exchanges, summed over the repetitions
+};
+// Both sides cast to a common type on purpose: `SplitKMetric` and
+// `ProbeMetric` are distinct enumerations, and comparing them directly is
+// -Wenum-compare, which the physical-device leg builds with -Werror even
+// though the simulator leg does not.
+static_assert(static_cast<std::uint32_t>(kMetricSpins) <
+                  static_cast<std::uint32_t>(kMetricRepBase),
+              "the hardware metric slots must not overrun the probe's "
+              "per-repetition slots");
+
 #if defined(__CCE_AICORE__)
 
 // ===================================================================== SIMT
@@ -288,6 +346,68 @@ __simt_vf__ __launch_bounds__(32) inline void probe_state_max_vf(
     if (threadIdx.x != 0u) return;
     const float m_tile = asc_ldcg(gm_tile_m);
     (void)asc_atomic_max(gm_m, m_tile);
+}
+
+// ------------------------------------------- the hardware SIMT entry points
+// Watchdog-bounded counterparts of the two lock VFs above. They are separate
+// functions rather than a parameter on the originals so that the probe's
+// measured instruction budget is untouched; see the note beside
+// `kSplitKMaxSplits`.
+
+// Bounded test-and-set. Returns nothing; publishes what happened:
+//
+//   acquired[slot] = 1 and the lock is HELD      -- the normal path
+//   acquired[slot] = 0 and the lock is NOT held  -- the watchdog gave up
+//
+// `max_attempts` of 0 means unbounded, which reproduces the probe's behaviour
+// exactly and is what a CAModel run uses; the benchmark always passes a bound.
+// The caller must pair this with `splitk_lock_release_vf` and the SAME
+// `acquired` slot, or a timed-out split will release a lock it never held.
+__simt_vf__ __launch_bounds__(32) inline void splitk_lock_acquire_vf(
+    __gm__ std::uint32_t* lock, __gm__ std::uint32_t* ticket,
+    __gm__ std::uint32_t* ticket_log, __gm__ std::uint32_t* spin_census,
+    __gm__ std::uint32_t* acquired, std::uint32_t slot,
+    std::uint32_t max_attempts)
+{
+    if (threadIdx.x != 0u) return;
+    std::uint32_t spins = 0u;
+    std::uint32_t got = 0u;
+    while (true) {
+        if (asc_atomic_exch(lock, 1u) == 0u) {
+            got = 1u;
+            break;
+        }
+        ++spins;
+        if (max_attempts != 0u && spins >= max_attempts) break;
+    }
+    if (got != 0u) {
+        // Held. The ticket orders the acquisitions for the host's mutual
+        // exclusion check, exactly as in the probe.
+        const std::uint32_t mine = asc_atomic_add(ticket, 1u);
+        asc_stcg(ticket_log + slot, mine);
+    } else {
+        // Not held. A ticket is deliberately NOT taken: the ticket sequence
+        // must stay a permutation over the acquisitions that really happened,
+        // or the host's permutation check would fail for a reason that has
+        // nothing to do with exclusion. The sentinel marks the gap instead.
+        asc_stcg(ticket_log + slot, 0xFFFFFFFFu);
+    }
+    asc_stcg(acquired + slot, got);
+    asc_stcg(spin_census + slot, spins);
+}
+
+// Release, conditional on this split actually holding the lock. The flag is
+// read with `asc_ldcg` inside the VF -- through L2/Global Memory, bypassing
+// the per-core SIMT DataCache, which is not coherent with Global Memory -- so
+// no SIMD-side scalar read is needed and no reserved event id is consumed.
+__simt_vf__ __launch_bounds__(32) inline void splitk_lock_release_vf(
+    __gm__ std::uint32_t* lock, __gm__ std::uint32_t* acquired,
+    std::uint32_t slot)
+{
+    if (threadIdx.x != 0u) return;
+    if (asc_ldcg(acquired + slot) == 0u) return;  // never held it
+    asc_threadfence();
+    (void)asc_atomic_exch(lock, 0u);
 }
 
 // ===================================================================== SIMD

@@ -19,4 +19,4 @@ cmake -S "${repo}" -B "${build}" -G "Unix Makefiles" \
 cmake --build "${build}" --target turboquant_npu_all -j 4
 echo "NPU binaries built at: ${build}"
 echo "Hardware only: ${build}/lib/test_turboquant_a8_validation"
-echo "Hardware only: ${build}/lib/bench_turboquant_a8_vs_bf16"
+echo "Hardware only: ${build}/lib/bench_turboquant_reshape_and_cache"

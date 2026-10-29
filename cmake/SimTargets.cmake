@@ -234,6 +234,45 @@ function(add_ascend_micro_sim_targets)
   add_micro_camodel_probe(cube_single_tile_baseline
       kernels/ops/turboquant/turboquant_paged_decode_attention.cpp)
 
+  # ------------------------------------------- the Split-K bench's sim twin
+  # `tests/npu/bench/bench_turboquant_decode_splitk.cpp` is a hardware
+  # benchmark and this host has no NPU, so without this target nothing in it
+  # would ever execute: the CLI, the percentile statistics, the tail-delta
+  # arithmetic, the watchdog census and the combine soundness check would all
+  # be unexercised code shipped on the strength of a clean compile.
+  #
+  # This builds the SAME source against simulator-mode kernel libraries, with
+  # ASCEND_MICRO_BENCH_SIM defined so the binary says at startup that its
+  # figures are CAModel ticks and not hardware latencies. It reuses the decode
+  # libraries the probes above already create, and adds the one library the
+  # reduction needs.
+  #
+  # It is deliberately NOT part of any aggregate target: a CAModel decode
+  # launch is minutes, so a default `--iters 100` run would take days. Run it
+  # with small counts, as scripts/run_decode_splitk_bench.sh does.
+  ascendc_library(camodel_splitk_reduce_kernel SHARED
+      kernels/ops/turboquant/turboquant_splitk_reduce.cpp)
+  ascendc_compile_definitions(camodel_splitk_reduce_kernel PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(camodel_splitk_reduce_kernel PRIVATE
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  add_executable(bench_decode_splitk_sim
+      tests/npu/bench/bench_turboquant_decode_splitk.cpp)
+  target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM)
+  target_include_directories(bench_decode_splitk_sim PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(bench_decode_splitk_sim PRIVATE
+      camodel_splitk_reduce_kernel camodel_paged_decode_attention_kernel
+      camodel_single_token_decode_aiv_kernel ascendcl
+      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  target_link_options(bench_decode_splitk_sim PRIVATE
+      "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+  target_compile_options(bench_decode_splitk_sim PRIVATE -Wall -Wextra -Werror)
+  set_target_properties(bench_decode_splitk_sim PROPERTIES
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+
   # The BF16 operand-layout micro-probe. Explicit rather than through
   # add_micro_camodel_probe because its runner is test_micro_layout_bf16.cpp,
   # not test_camodel_<name>.cpp: it is a data-movement probe over one tile, not
