@@ -202,6 +202,38 @@ function(add_ascend_micro_sim_targets)
       tests/cpu/test_single_token_decode_probe.cpp)
   target_compile_options(test_single_token_decode_probe PRIVATE -Wall -Wextra -Werror)
 
+  # The Split-K synchronisation probe (L2 atomic contention). Three entry
+  # points in one kernel -- Mode A collision-free, Mode B shared slot under a
+  # Global Memory spinlock, Mode C the tail split's egress flush -- and one
+  # runner that takes --mode/--splits/--reps/--fixture at runtime, so one
+  # binary covers the whole K sweep and both fixtures.
+  #
+  # This is the only kernel here that contains a SIMT VF. The atomics it needs
+  # exist nowhere else: asc_atomic_exch/_add/_max are SIMT API interfaces
+  # declared __simt_callee__, reachable only from a __simt_vf__ dispatched by
+  # asc_vf_call -- and asc_vf_call expands to nothing unless SPLIT_CORE_VEC is
+  # defined, which simt_api/common_functions.h does for __DAV_VEC__ at
+  # __NPU_ARCH__ 3510, i.e. in the AIV leg only. Hence KERNEL_TYPE_AIV_ONLY
+  # and hence no Cube path in the probe.
+  add_micro_camodel_probe(l2_atomic_synthetic)
+  # Its Tier-1 host oracle: the log-sum-exp combine, the order independence
+  # the bit-exact device gate rests on, and the egress reference against the
+  # dense 256 x 256 rotation. No device, no simulator, milliseconds.
+  add_executable(test_l2_atomic_probe tests/cpu/test_l2_atomic_probe.cpp)
+  target_compile_options(test_l2_atomic_probe PRIVATE -Wall -Wextra -Werror)
+
+  # The single-tile Cube baseline. A SECOND runner over the SAME frozen
+  # production operator source as add_micro_camodel_probe(paged_decode
+  # _attention) above -- not a copy of it and not a variant of it. The
+  # Split-K crossover needs T_compute_strip measured on the real operator,
+  # and the way to get it without touching a frozen file is another runner
+  # against the same translation unit: one strip, one block, the ingress
+  # rotation and that strip's score panel checked bit-exactly, and the tick
+  # spans read out of the Cube dump by
+  # scripts/analyze_cube_tile_baseline.py.
+  add_micro_camodel_probe(cube_single_tile_baseline
+      kernels/ops/turboquant/turboquant_paged_decode_attention.cpp)
+
   # The BF16 operand-layout micro-probe. Explicit rather than through
   # add_micro_camodel_probe because its runner is test_micro_layout_bf16.cpp,
   # not test_camodel_<name>.cpp: it is a data-movement probe over one tile, not

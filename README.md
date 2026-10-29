@@ -373,6 +373,62 @@ census against a pre-registered budget, and what the runs do **not** establish
 — no silicon, no grid past the physical AIV count, no ragged tail, no MTP — are
 in [`reports/single_token_decode_aiv.md`](reports/single_token_decode_aiv.md).
 
+The **Split-K synchronisation probe** in
+[`kernels/camodel/l2_atomic_synthetic.cpp`](kernels/camodel/l2_atomic_synthetic.cpp)
+answers where the cross-page reduction of the Cube decode operator should live.
+That operator emits a *partial* softmax per 128-token page and the combine is
+not in it, so a multi-thousand-token context needs one; simulating a full
+sequence is cycle-prohibitive, so the question is answered by composition
+instead. Three modes over the same state record — `m` and `l` as replicated
+32-byte DataBlocks, `Acc` as 256 FP32 moved in one 32-burst transfer — and a
+second runner over the **frozen** decode operator for the other term:
+
+```sh
+bash scripts/run_l2_atomic_probe_camodel.sh            # the K sweep, modes A/B/C
+bash scripts/run_l2_atomic_probe_camodel.sh smoke      # one cheap rung, to time it
+bash scripts/run_l2_atomic_probe_camodel.sh baseline    # the Cube strip baseline
+bash scripts/run_l2_atomic_probe_camodel.sh all         # both, then the crossover
+```
+
+It is the only kernel here with a SIMT VF, and that is forced: there is no SIMD
+atomic on this part. `asc_atomic_exch`, `asc_atomic_max` and `asc_atomic_add`
+are declared `__simt_callee__`, reachable only from a `__simt_vf__` that
+`asc_vf_call` dispatches — and `simt_api/common_functions.h` makes
+`asc_vf_call` expand to **nothing** unless `SPLIT_CORE_VEC` is defined, which
+at `__NPU_ARCH__ 3510` happens only in the AIV leg. A lock written into a
+Cube-side code path would have been silently deleted and would have raced,
+which is why the probe is `KERNEL_TYPE_AIV_ONLY` and why the trace audit
+asserts the VF dispatch count rather than trusting it.
+
+The results invert the premise the task started from. The Cube's own cost for
+one 16-token strip is **180 ticks**, not 40,000; the rate at which the pipeline
+*retires* a strip is **19,905** ticks, and that interval is set by the AIV0
+recurrence, which is in flight 234,863 ticks against the Cube's 1,440 over the
+same eight-strip run. On the synchronisation side every phase except the spin
+is **flat in K** — the critical section is 1,487–1,530 ticks whether one split
+or eight address the same line, and so are the atomic maximum and the Global
+Memory bursts — so on this model the cost of sharing a line is serialisation
+and nothing else. The crossover follows: a collision-free per-split workspace
+is under the 3% target at **one strip**, while an in-place locked combine needs
+**224 tokens** per split at K = 2 and **752** at K = 8. And 71% of the
+uncontended 5,288-tick floor is three SIMT VF dispatches, not the atomics —
+which is the term to attack, and it does not depend on K.
+
+Two things the trace said that the runner could not. Under
+`KERNEL_TYPE_AIV_ONLY` an AIV is **not** an AI core: each 950PR AI core carries
+two Vector cores and the model dumps them separately, so split `k` runs on
+`core<k/2>.veccore<k%2>` and not `core<k>.veccore0` as the MIX mapping would
+have it — the audit now asserts that with a census over every dump, because the
+first version reported an untouched core for every odd split. And mutual
+exclusion is proved twice over, independently: the runner checks that the
+acquisition tickets form a permutation, while the audit checks from the **data**
+instructions that no two splits' critical-section windows overlap in time. The
+measured crossover tables, the one model diagnostic that is *not* resolved, and
+what these runs do not establish — no silicon, no bus-level record in the
+dumps at all, and an exclusion argument that the measurement barriers partly
+subsume — are in
+[`reports/l2_atomic_contention_split_k.md`](reports/l2_atomic_contention_split_k.md).
+
 The prefill counterpart in
 [`kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp`](kernels/ops/turboquant/turboquant_reshape_and_cache_a8.cpp)
 is a **four-stage** `MIX_AIC_1_2` ring over the eight chunks of one 16-token ×
