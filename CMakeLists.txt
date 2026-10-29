@@ -28,5 +28,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 include(cmake/SimTargets.cmake)
 include(cmake/NpuTargets.cmake)
 
+add_subdirectory(tests/research)
+
 add_ascend_micro_sim_targets()
 add_ascend_micro_npu_targets()
