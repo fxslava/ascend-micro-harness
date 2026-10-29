@@ -87,6 +87,50 @@
 
 #include <cstdint>
 
+// ===================================================== device callability
+// Directive 1 / the device link error this header caused:
+//
+//   ld.lld: undefined symbol: turboquant_wave::TotalStrips
+//
+// `constexpr` already implies `inline` in C++17, so every function below has
+// vague linkage and a weak definition in each translation unit that uses it.
+// That was never the problem. The problem is the *core type*: TotalStrips is
+// called with runtime scalars from inside the `__global__ __aicore__` kernel
+// body, and a function with no core-type attribute is host code, so BiSheng
+// emits a call to a host symbol that the device link cannot resolve.
+//
+// The same two functions are also called from the host launch wrapper, which
+// computes the grid. Both callers live in the same file but never in the same
+// compilation: the kernel body is under `#if defined(__CCE_AICORE__)` and the
+// launcher under the `#elif defined(ASCEND_MICRO_CANN_LAUNCH)` arm of the same
+// conditional. `__CCE_AICORE__` is defined only in the device pass, so one
+// macro serves both -- the device pass gets `[aicore] inline`, the host pass
+// plain `inline` -- and there is one body rather than a device copy and a host
+// copy that could drift apart.
+//
+// Marking every function, not just the two that are called at runtime today:
+// the rest are consumed in constant expressions only, where the attribute is
+// inert, and a future runtime call to any of them would otherwise reintroduce
+// exactly this link error. `scripts/audit_device_symbols.sh` checks that the
+// device objects define and reference no `turboquant_wave` symbol at all.
+//
+// `__aicore__` is a macro the CCE compiler and kernel_operator.h provide; both
+// reshape kernels now include this header after kernel_operator.h so it is
+// defined here. The literal `[aicore]` fallback covers a device translation
+// unit that includes this header first, which is how the broken include order
+// produced a link error rather than a compile error.
+#ifndef TQ_WAVE_FN
+#  if defined(__CCE_AICORE__)
+#    if defined(__aicore__)
+#      define TQ_WAVE_FN __aicore__ inline
+#    else
+#      define TQ_WAVE_FN [aicore] inline
+#    endif
+#  else
+#    define TQ_WAVE_FN inline
+#  endif
+#endif
+
 namespace turboquant_wave {
 
 // =========================================================== strip boundary
@@ -96,16 +140,46 @@ namespace turboquant_wave {
 // an integer divide by zero on the scalar unit is as fatal as the out-of-range
 // slotMapping read this boundary exists to prevent. Returning 0 makes every
 // block take the early return, which is the safe direction.
-constexpr std::uint32_t TotalStrips(std::uint32_t num_tokens,
+TQ_WAVE_FN constexpr std::uint32_t TotalStrips(std::uint32_t num_tokens,
                                     std::uint32_t tokens_per_core)
 {
     return tokens_per_core == 0u ? 0u : num_tokens / tokens_per_core;
 }
 
-constexpr bool BlockOutOfRange(std::uint32_t block, std::uint32_t num_tokens,
+// The guard itself, against a strip count the caller has already computed.
+// The kernel bodies use this form rather than the three-argument one below so
+// that a launch costs exactly one scalar divide: `tokensPerCore` is a runtime
+// scalar, so TotalStrips is a real division, and the three-argument guard
+// would make it two.
+TQ_WAVE_FN constexpr bool BlockOutOfStrips(std::uint32_t block,
+                                           std::uint32_t total_strips)
+{
+    return block >= total_strips;
+}
+
+TQ_WAVE_FN constexpr bool BlockOutOfRange(std::uint32_t block, std::uint32_t num_tokens,
                                std::uint32_t tokens_per_core)
 {
-    return block >= TotalStrips(num_tokens, tokens_per_core);
+    return BlockOutOfStrips(block, TotalStrips(num_tokens, tokens_per_core));
+}
+
+// Whether the context is a whole number of strips.
+//
+// A strip is one 16-token page of the paged KV cache, so a partial trailing
+// strip is a partially filled page -- a shape this operator does not have
+// (see the "no ragged shapes" note at the head of both kernels). TotalStrips
+// truncates, which is the safe direction for the *guard* but silent data loss
+// for a *launch*: 1000 tokens at 16 per strip is 62 strips, and tokens 992..999
+// would simply never be written to the cache, with every canary intact and
+// every other token bit-exact. So the launchers refuse that geometry rather
+// than dispatching it, and this is the predicate they refuse on. Arbitrary
+// context length means any number of strips, over any number of waves, which
+// is what the guard and the inter-wave drain deliver; it does not mean a
+// partial page.
+TQ_WAVE_FN constexpr bool WholeStrips(std::uint32_t num_tokens,
+                                      std::uint32_t tokens_per_core)
+{
+    return tokens_per_core != 0u && num_tokens % tokens_per_core == 0u;
 }
 
 static_assert(TotalStrips(1024u, 16u) == 64u, "64 strips of 16 tokens");
@@ -117,6 +191,28 @@ static_assert(BlockOutOfRange(32u, 512u, 16u), "block 32 of a 32-strip grid is o
 static_assert(!BlockOutOfRange(32u, 528u, 16u), "block 32 of a 33-strip grid is in");
 static_assert(BlockOutOfRange(0u, 0u, 16u), "an empty context runs no block");
 
+// The two-argument guard must agree with the three-argument one everywhere the
+// three-argument one is asserted above, or the kernels' one-divide form would
+// be a different predicate from the documented one.
+static_assert(BlockOutOfStrips(32u, TotalStrips(512u, 16u)) ==
+                  BlockOutOfRange(32u, 512u, 16u) &&
+              BlockOutOfStrips(32u, TotalStrips(528u, 16u)) ==
+                  BlockOutOfRange(32u, 528u, 16u) &&
+              BlockOutOfStrips(0u, TotalStrips(0u, 16u)) ==
+                  BlockOutOfRange(0u, 0u, 16u),
+              "BlockOutOfStrips must be BlockOutOfRange with the divide hoisted");
+static_assert(BlockOutOfStrips(0u, 0u), "a zero strip count guards every block");
+
+// Arbitrary context length is any number of strips, including counts that are
+// not a multiple of the 32-block wave width; it is not a partial strip.
+static_assert(WholeStrips(16u, 16u) && WholeStrips(528u, 16u) &&
+              WholeStrips(2048u, 16u) && WholeStrips(1584u, 16u),
+              "a whole number of strips is an arbitrary context this operator runs");
+static_assert(!WholeStrips(1000u, 16u), "1000 tokens is 62 strips and 8 lost tokens");
+static_assert(!WholeStrips(17u, 16u), "a single trailing token is still a partial page");
+static_assert(!WholeStrips(16u, 0u), "a zero strip width is not a whole context");
+static_assert(WholeStrips(0u, 16u), "an empty context is zero whole strips");
+
 // ===================================================== mode-4 flag id space
 // Ids are per sub block: 0..15 name AIV0's channel and 16..31 AIV1's, and the
 // `+ kIntraNum` offset is how a participant names the *other* sub block's
@@ -127,7 +223,7 @@ static_assert(BlockOutOfRange(0u, 0u, 16u), "an empty context runs no block");
 constexpr std::uint16_t kIntraNum = 16u;
 constexpr std::uint16_t kMaxSafeLocalId = 10u;
 
-constexpr std::uint16_t IntraId(std::uint32_t owner, std::uint32_t local)
+TQ_WAVE_FN constexpr std::uint16_t IntraId(std::uint32_t owner, std::uint32_t local)
 {
     return static_cast<std::uint16_t>(owner * kIntraNum + local);
 }
@@ -200,37 +296,37 @@ struct SingleShotChannels {
     static constexpr std::uint32_t kPanelFreeCount = Chunks / 2u + LandDepth;
     static constexpr std::uint32_t kMaxLocalId = kPanelFreeBase + kPanelFreeCount;
 
-    static constexpr std::uint16_t ProductReady(std::uint32_t owner, std::uint32_t chunk)
+    static TQ_WAVE_FN constexpr std::uint16_t ProductReady(std::uint32_t owner, std::uint32_t chunk)
     {
         return IntraId(owner, chunk / 2u);
     }
-    static constexpr std::uint16_t PanelFree(std::uint32_t owner, std::uint32_t index)
+    static TQ_WAVE_FN constexpr std::uint16_t PanelFree(std::uint32_t owner, std::uint32_t index)
     {
         return IntraId(owner, kPanelFreeBase + index);
     }
     // The Cube's wait before the Fixpipe of `chunk`.
-    static constexpr std::uint16_t PanelFreeWait(std::uint32_t owner, std::uint32_t chunk)
+    static TQ_WAVE_FN constexpr std::uint16_t PanelFreeWait(std::uint32_t owner, std::uint32_t chunk)
     {
         return PanelFree(owner, chunk / 2u);
     }
     // AIVk's release after `chunk`: the token the Cube consumes LandDepth
     // generations later, which is why the index is shifted by the ring depth.
-    static constexpr std::uint16_t PanelFreeSet(std::uint32_t owner, std::uint32_t chunk)
+    static TQ_WAVE_FN constexpr std::uint16_t PanelFreeSet(std::uint32_t owner, std::uint32_t chunk)
     {
         return PanelFree(owner, chunk / 2u + LandDepth);
     }
     // One prologue credit per landing slot.
-    static constexpr std::uint16_t PanelFreePrime(std::uint32_t owner, std::uint32_t slot)
+    static TQ_WAVE_FN constexpr std::uint16_t PanelFreePrime(std::uint32_t owner, std::uint32_t slot)
     {
         return PanelFree(owner, slot);
     }
     // The releases from each core's last LandDepth chunks: nothing in the
     // schedule waits for them, so the Cube's epilogue drains them.
-    static constexpr std::uint16_t EpilogueDrain(std::uint32_t owner, std::uint32_t k)
+    static TQ_WAVE_FN constexpr std::uint16_t EpilogueDrain(std::uint32_t owner, std::uint32_t k)
     {
         return PanelFree(owner, Chunks / 2u + k);
     }
-    static constexpr std::uint16_t PageDrained(std::uint32_t owner)
+    static TQ_WAVE_FN constexpr std::uint16_t PageDrained(std::uint32_t owner)
     {
         return IntraId(owner, kMaxLocalId);
     }
@@ -252,34 +348,34 @@ struct RecycledChannels {
     static constexpr std::uint32_t kPanelFreeCount = LandDepth;
     static constexpr std::uint32_t kMaxLocalId = 2u * LandDepth;
 
-    static constexpr std::uint16_t ProductReady(std::uint32_t owner, std::uint32_t chunk)
+    static TQ_WAVE_FN constexpr std::uint16_t ProductReady(std::uint32_t owner, std::uint32_t chunk)
     {
         return IntraId(owner, (chunk / 2u) % LandDepth);
     }
-    static constexpr std::uint16_t PanelFree(std::uint32_t owner, std::uint32_t index)
+    static TQ_WAVE_FN constexpr std::uint16_t PanelFree(std::uint32_t owner, std::uint32_t index)
     {
         return IntraId(owner, kPanelFreeBase + index % LandDepth);
     }
-    static constexpr std::uint16_t PanelFreeWait(std::uint32_t owner, std::uint32_t chunk)
+    static TQ_WAVE_FN constexpr std::uint16_t PanelFreeWait(std::uint32_t owner, std::uint32_t chunk)
     {
         return PanelFree(owner, chunk / 2u);
     }
     // The release and the wait are the SAME id here: that is the recycling.
-    static constexpr std::uint16_t PanelFreeSet(std::uint32_t owner, std::uint32_t chunk)
+    static TQ_WAVE_FN constexpr std::uint16_t PanelFreeSet(std::uint32_t owner, std::uint32_t chunk)
     {
         return PanelFree(owner, chunk / 2u);
     }
-    static constexpr std::uint16_t PanelFreePrime(std::uint32_t owner, std::uint32_t slot)
+    static TQ_WAVE_FN constexpr std::uint16_t PanelFreePrime(std::uint32_t owner, std::uint32_t slot)
     {
         return PanelFree(owner, slot);
     }
     // The last generation's releases come back on the same LandDepth ids the
     // prologue primed, so the epilogue drains those.
-    static constexpr std::uint16_t EpilogueDrain(std::uint32_t owner, std::uint32_t k)
+    static TQ_WAVE_FN constexpr std::uint16_t EpilogueDrain(std::uint32_t owner, std::uint32_t k)
     {
         return PanelFree(owner, k);
     }
-    static constexpr std::uint16_t PageDrained(std::uint32_t owner)
+    static TQ_WAVE_FN constexpr std::uint16_t PageDrained(std::uint32_t owner)
     {
         return IntraId(owner, kMaxLocalId);
     }
@@ -308,7 +404,7 @@ using ChannelPolicy =
 
 // An id is legal when it is inside a sub block's half and clear of the
 // library's reserved range in that half.
-constexpr bool LegalIntraId(std::uint16_t id)
+TQ_WAVE_FN constexpr bool LegalIntraId(std::uint16_t id)
 {
     return (id % kIntraNum) <= kMaxSafeLocalId && id < 2u * kIntraNum;
 }
@@ -344,7 +440,7 @@ static_assert(ReshapeRecycled::kMaxLocalId < ReshapeSingleShot::kMaxLocalId,
 
 // Every id either policy can emit, on both sub blocks, is legal.
 template <class P>
-constexpr bool AllIdsLegal()
+TQ_WAVE_FN constexpr bool AllIdsLegal()
 {
     for (std::uint32_t owner = 0; owner < 2u; ++owner) {
         if (!LegalIntraId(P::PageDrained(owner))) return false;
@@ -368,7 +464,7 @@ static_assert(AllIdsLegal<ReshapeRecycled>(), "a recycled id reaches the reserve
 // here is the one error class that balances every set/wait census and still
 // corrupts a panel, so it is asserted rather than read off the tables above.
 template <class P>
-constexpr bool RolesDisjoint()
+TQ_WAVE_FN constexpr bool RolesDisjoint()
 {
     std::uint16_t highest_ready = 0;
     std::uint16_t lowest_free = static_cast<std::uint16_t>(kIntraNum);
@@ -438,12 +534,12 @@ constexpr std::uint32_t kUbWindow = 192u * 1024u;
 constexpr std::uint32_t kL1Window = 512u * 1024u;
 constexpr std::uint32_t kL0Window = 64u * 1024u;
 
-constexpr std::uint32_t RoundUpBlock(std::uint32_t bytes)
+TQ_WAVE_FN constexpr std::uint32_t RoundUpBlock(std::uint32_t bytes)
 {
     return (bytes + kBlock - 1u) / kBlock * kBlock;
 }
 
-constexpr std::uint32_t NextSlot(std::uint32_t prev_base, std::uint32_t prev_bytes)
+TQ_WAVE_FN constexpr std::uint32_t NextSlot(std::uint32_t prev_base, std::uint32_t prev_bytes)
 {
     return RoundUpBlock(prev_base + prev_bytes) + kBankSkewBytes;
 }
@@ -452,12 +548,12 @@ constexpr std::uint32_t NextSlot(std::uint32_t prev_base, std::uint32_t prev_byt
 // the same bank phase, which is the AKA3003 case the 32-byte skew exists to
 // break. Checked against the stride rather than against the payload, because
 // it is the stride that decides floor(offset / 32) mod 16.
-constexpr bool SlotStrideSkewed(std::uint32_t slot_bytes)
+TQ_WAVE_FN constexpr bool SlotStrideSkewed(std::uint32_t slot_bytes)
 {
     return slot_bytes % kBlock == 0u && slot_bytes % 256u != 0u;
 }
 
-constexpr bool BaseAligned(std::uint32_t base) { return base % kBlock == 0u; }
+TQ_WAVE_FN constexpr bool BaseAligned(std::uint32_t base) { return base % kBlock == 0u; }
 
 static_assert(RoundUpBlock(0u) == 0u && RoundUpBlock(1u) == 32u &&
                   RoundUpBlock(32u) == 32u && RoundUpBlock(33u) == 64u,

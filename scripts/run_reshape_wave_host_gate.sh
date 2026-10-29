@@ -26,6 +26,11 @@ set -uo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 stub="${repo}/tests/host_stubs"
 out="${WAVE_GATE_DIR:-$(mktemp -d /tmp/ascend-wave-host-gate-XXXXXX)}"
+# mktemp creates its directory; a caller-supplied WAVE_GATE_DIR may not exist,
+# and every stage below writes a binary or a compiler log into it. Without this
+# the gate reports FAIL for each of them with "No such file or directory",
+# which looks exactly like a real compile failure.
+mkdir -p "${out}"
 cd "${repo}"
 status=0
 

@@ -280,8 +280,6 @@
 //   AIVk intra   V_S, MTE2_S, MTE3_S  every Vector-core queue into the scalar
 //                              stream, after that announcement
 
-#include "turboquant_wave_protocol.hpp"
-
 #include <cstdint>
 #include <utility>
 
@@ -294,6 +292,13 @@
 // reports/micro_layout_bf16.md.
 #include "../../../routines/routine_stage_page_zn_bf16.hpp"
 #endif
+
+// After kernel_operator.h on purpose: this header's TQ_WAVE_FN marks every
+// function in it `__aicore__ inline` for a device pass, and `__aicore__` is
+// defined by kernel_operator.h. Including it earlier is what left
+// turboquant_wave::TotalStrips host-attributed in the device object and
+// failed the device link.
+#include "turboquant_wave_protocol.hpp"
 
 // Verification-only, and absent from every build that does not ask for it.
 // ASCEND_MICRO_SPARSE_SAMPLING is set on the CAModel probe's kernel library
@@ -1543,7 +1548,7 @@ __aicore__ inline void KernelBody(
     // the sampling predicate below are its only two readers.
     const uint32_t total_strips =
         turboquant_wave::TotalStrips(numTokens, tokensPerCore);
-    if (block >= total_strips) return;
+    if (turboquant_wave::BlockOutOfStrips(block, total_strips)) return;
     AscendC::InitSocState();
 #if defined(ASCEND_MICRO_SPARSE_SAMPLING)
     // Sparse boundary sampling, CAModel builds only. The skip is taken before
@@ -1661,6 +1666,8 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16_mode4_si
 
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 
+#include <stdexcept>
+
 // The activations are 2-byte here, and this leg has no CANN headers -- the
 // device types live behind `#if defined(__CCE_AICORE__)` -- so `bfloat16_t` is
 // not available. std::uint16_t stands in for it: the two legs are separate
@@ -1705,6 +1712,18 @@ extern "C" void launch_turboquant_reshape_and_cache_bf16(
     // branch, because the policy is a compile-time parameter and a runtime
     // branch inside a MIX kernel would have to be taken identically by three
     // cores.
+    //
+    // Arbitrary context length means any number of strips, over any number of
+    // waves. It does not mean a partial strip: a strip is one 16-token page,
+    // and TotalStrips rounds down, so dispatching 1000 tokens at 16 per strip
+    // would run 62 blocks and silently never write tokens 992..999 -- a short
+    // cache with every canary intact and every other token bit-exact, which is
+    // the hardest kind of wrong answer to notice. There is no partial-page
+    // path to add in the kernel, so the launcher refuses the geometry instead.
+    if (!turboquant_wave::WholeStrips(num_tokens, tokens_per_core))
+        throw std::invalid_argument(
+            "reshape_and_cache_bf16: numTokens must be a whole number of "
+            "tokensPerCore strips; a partial trailing strip would be dropped");
     const std::uint32_t grid =
         turboquant_wave::TotalStrips(num_tokens, tokens_per_core);
     if (!reuse_mode4_flags) {
