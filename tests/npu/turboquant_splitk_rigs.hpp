@@ -38,7 +38,7 @@ extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
     float*, float*, turboquant_splitk::AtomicHeadSlot*,
     turboquant_splitk::WorkerMetrics*, std::uint16_t*, std::uint32_t,
     std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-    std::uint32_t, std::uint32_t);
+    std::uint32_t, std::uint32_t, std::uint32_t);
 
 extern "C" void launch_turboquant_paged_decode_splitk_aic(
     void*, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
@@ -79,7 +79,12 @@ struct AivRig {
             static_cast<float*>(signs.ptr), static_cast<contract::AtomicHeadSlot*>(slots.ptr),
             static_cast<contract::WorkerMetrics*>(metrics.ptr),
             static_cast<std::uint16_t*>(out.ptr), f.requests, f.heads, f.rows,
-            f.page_tokens, f.requests * f.pages, f.pages, splits, watchdog);
+            f.page_tokens, f.requests * f.pages, f.pages, splits, watchdog,
+            // The fixture's live token count, not its page capacity. On an
+            // aligned fixture the two are equal and this is the pre-tail
+            // behaviour; on an unaligned one it is what tells the kernel where
+            // the sequence actually ends.
+            static_cast<std::uint32_t>(f.seq_len));
     }
     struct Census {
         std::uint64_t failed = 0, timeouts = 0;

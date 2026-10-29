@@ -8,8 +8,10 @@
 # hardware claim: it compiles the protocol arithmetic the kernels are built on,
 # audits the cross-core id census for both channel policies, audits the scalar
 # fence in front of every cross-core announcement, compiles every host harness
-# strictly, and explores the token/queue model of a physical block running two
-# grid blocks back to back.
+# strictly, checks the decode tail geometry exhaustively against a brute-force
+# count, probes the unaligned-context fixture and its masked oracle, and
+# explores the token/queue model of a physical block running two grid blocks
+# back to back.
 #
 # What it does NOT cover, and what still has to run on a machine that has the
 # toolkit: device compilation of the two kernels (BiSheng, CANN 9.2), the
@@ -74,6 +76,7 @@ for f in tests/npu/validation/test_turboquant_a8_validation.cpp \
          tests/npu/bench/bench_turboquant_decode_splitk.cpp \
          tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp \
          tests/npu/validation/test_turboquant_decode_splitk_aiv_validation.cpp \
+         tests/npu/test_npu_decode_single_token_unaligned.cpp \
          tests/camodel/test_camodel_turboquant_reshape_and_cache_a8.cpp \
          tests/camodel/test_camodel_turboquant_reshape_and_cache_bf16.cpp \
          tests/research/test_cluster_sync_probe.cpp; do
@@ -103,7 +106,35 @@ else
 fi
 
 echo
-echo "=== 6. token/queue models ==="
+# The half of the tail change that a machine without a toolkit can actually
+# settle: which tokens are live, and whether masking them is observable at all.
+# The device masking phase itself cannot be compiled here, let alone run.
+echo "=== 6. decode tail: geometry and the masked oracle ==="
+printf '%-62s ' tests/cpu/test_decode_tail_geometry.cpp
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror -I. \
+       tests/cpu/test_decode_tail_geometry.cpp \
+       -o "${out}/test_decode_tail_geometry" 2> "${out}/gate.err"; then
+    echo OK
+    "${out}/test_decode_tail_geometry" | tail -1 || status=1
+else
+    echo FAIL
+    sed -n '1,40p' "${out}/gate.err"
+    status=1
+fi
+printf '%-62s ' tests/cpu/test_decode_tail_probe.cpp
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror -I. \
+       tests/cpu/test_decode_tail_probe.cpp \
+       -o "${out}/test_decode_tail_probe" 2> "${out}/gate.err"; then
+    echo OK
+    "${out}/test_decode_tail_probe" | tail -2 || status=1
+else
+    echo FAIL
+    sed -n '1,40p' "${out}/gate.err"
+    status=1
+fi
+
+echo
+echo "=== 7. token/queue models ==="
 python3 tests/cpu/test_reshape_wave_model.py || status=1
 echo
 python3 tests/cpu/test_decode_ring_model.py | tail -4 || status=1

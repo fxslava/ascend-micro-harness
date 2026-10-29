@@ -7,6 +7,9 @@
 // Derived from single_token_decode_aiv; production kernels remain unchanged.
 #if defined(__CCE_AICORE__)
 #include "kernel_operator.h"
+// After kernel_operator.h so TQ_TAIL_FN carries the device core-type
+// attribute; see the header's note on the link error it otherwise produces.
+#include "turboquant_decode_tail.hpp"
 #include "simt_api/asc_simt.h"
 #include "simt_api/common_functions.h"
 #include "../../../routines/routine_vector_decode_gemv.hpp"
@@ -242,6 +245,13 @@ struct Geometry {
     std::uint32_t page_begin;
     std::uint32_t table_stride;
     std::uint32_t strip_begin;
+    // Live tokens in the whole sequence, in the request's own logical token
+    // numbering -- NOT this split's share of them. That is what makes the tail
+    // work under Split-K without any per-split arithmetic: `page_begin` already
+    // places this worker's window in that numbering, so the one worker whose
+    // range contains the last live token finds a partial strip and every other
+    // finds only full ones.
+    std::uint32_t seq_len;
 };
 
 // The packed strip's byte offset. Both planes share the layout
@@ -737,7 +747,12 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtPackedFree + slot);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
     }
-    const std::uint32_t count = geom.seq_pages * geom.strips;
+    // Live strips of THIS split's page range. A split whose range lies
+    // entirely past the last live token gets 0 and contributes the neutral
+    // element, which is the same path an empty `Partition` range already takes.
+    const std::uint32_t count = turboquant_decode_tail::LiveStripsInWindow(
+        geom.seq_len, geom.page_begin, geom.seq_pages, geom.block_size,
+        geom.strip_begin, geom.strips);
     // Prefill both landings before the first Vector wait. Refill is issued
     // only after retiring that slot's recurrence, never ahead of its credit.
     for (std::uint32_t index = 0; index < count && index < kStageDepth; ++index) {
@@ -767,7 +782,17 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
             rec.key_scale = View<float>(kUbKeyScale[slot], kKeys);
             rec.value_scale = View<float>(kUbValueScale[slot], kKeys);
             rec.value_page = View<float>(kUbValuePage[slot], kPanelElems);
-            ascend_micro::vector_decode_recur_rows(rec, rows);
+            // One partial strip per sequence at most, so `active` is 16
+            // on every strip of every other split and the aligned path is
+            // unchanged. `count` is the live prefix, so `active` is never 0.
+            const std::uint32_t active = turboquant_decode_tail::WalkActive(
+                tick - 1u, geom.strips, geom.page_begin, geom.strip_begin,
+                geom.block_size, geom.seq_len);
+            if (active == turboquant_decode_tail::kStripTokens)
+                ascend_micro::vector_decode_recur_rows(rec, rows);
+            else
+                ascend_micro::vector_decode_recur_rows_masked(
+                    rec, rows, active, turboquant_decode_tail::kMaskedScore);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
             const std::uint32_t index = tick - 1u + kStageDepth;
@@ -799,7 +824,7 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
     __gm__ turboquant_splitk::WorkerMetrics* metrics, __gm__ bfloat16_t* out,
     uint32_t requests, uint32_t heads, uint32_t rows,
     uint32_t block_size, uint32_t cache_pages, uint32_t pages,
-    uint32_t splits, uint32_t max_attempts)
+    uint32_t splits, uint32_t max_attempts, uint32_t seq_len)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     AscendC::InitSocState();
@@ -808,13 +833,17 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
         block_size == 0u || block_size % kKeys != 0u || pages == 0u ||
         pages > cache_pages || splits == 0u || splits > turboquant_splitk::kMaxSplits ||
         max_attempts == 0u) return;
+    // `seq_len == 0` means every token of the `pages` allocated pages is live:
+    // the pre-tail contract, so existing callers keep their exact behaviour.
+    const uint32_t live = seq_len == 0u ? pages * block_size : seq_len;
+    if (!turboquant_decode_tail::SeqLenInCapacity(live, pages, block_size)) return;
     const auto item = static_cast<uint32_t>(AscendC::GetBlockIdx());
     if (item >= requests * heads * splits) return;
     const auto head_item = item / splits;
     const auto range = turboquant_splitk::Partition(pages, splits, item % splits);
     Geometry geom{heads, rows, kHeadSize, block_size, cache_pages,
                   block_size / kKeys, range.count, block_size / kKeys,
-                  range.begin, pages, 0u};
+                  range.begin, pages, 0u, live};
     AscendC::GlobalTensor<bfloat16_t> q, context;
     AscendC::GlobalTensor<std::int8_t> key_cache, value_cache;
     AscendC::GlobalTensor<float> scale_cache, gate_tensor, pi_signs;
@@ -850,8 +879,12 @@ extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
     if (head >= 4u || rows == 0u || rows > kMaxRows || page_begin >= 8u ||
         page_count == 0u || page_count > 8u - page_begin || strips == 0u ||
         strips > 8u || strip_begin > 8u - strips) return;
+    // The diagnostic entry has no seq_len operand, so it declares the whole
+    // window live, which is what it meant before the tail change.
     Geometry geom{4u, rows, kHeadSize, 128u, 9u, 8u, page_count, strips,
-                  page_begin, 8u, strip_begin};
+                  page_begin, 8u, strip_begin,
+                  static_cast<std::uint32_t>(turboquant_decode_tail::WholeWindowTokens(
+                      page_begin, page_count, 128u, strip_begin, strips))};
     AscendC::GlobalTensor<bfloat16_t> q, context;
     AscendC::GlobalTensor<std::int8_t> keys, values;
     AscendC::GlobalTensor<float> scale_tensor, gates, sign_tensor;
@@ -871,13 +904,17 @@ extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
 
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 
+#include <stdexcept>
+
+#include "turboquant_decode_tail.hpp"
+
 extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
     __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
     __gm__ uint32_t*, __gm__ float*, __gm__ float*,
     __gm__ turboquant_splitk::AtomicHeadSlot*,
     __gm__ turboquant_splitk::WorkerMetrics*, __gm__ bfloat16_t*,
     uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t);
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 
 extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
     void* stream, std::uint16_t* q_rot, std::int8_t* key, std::int8_t* value,
@@ -885,13 +922,22 @@ extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
     turboquant_splitk::AtomicHeadSlot* slots, turboquant_splitk::WorkerMetrics* metrics,
     std::uint16_t* out, std::uint32_t requests, std::uint32_t heads,
     std::uint32_t rows, std::uint32_t block_size, std::uint32_t cache_pages,
-    std::uint32_t pages, std::uint32_t splits, std::uint32_t max_attempts)
+    std::uint32_t pages, std::uint32_t splits, std::uint32_t max_attempts,
+    std::uint32_t seq_len)
 {
+    // 0 means "the whole allocation is live", the pre-tail contract. Anything
+    // else must fit the pages the caller says it allocated; the device returns
+    // on a violation, which on a grid of blocks is silent, so the host raises.
+    if (seq_len != 0u &&
+        !turboquant_decode_tail::SeqLenInCapacity(seq_len, pages, block_size))
+        throw std::invalid_argument(
+            "single_token_decode_splitk: seqLen exceeds the pages allocated to "
+            "the sequence");
     turboquant_single_token_decode_splitk_aiv<<<requests * heads * splits,
                                              nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(q_rot), key, value, scales, table, gate, signs,
         slots, metrics, reinterpret_cast<bfloat16_t*>(out), requests, heads, rows,
-        block_size, cache_pages, pages, splits, max_attempts);
+        block_size, cache_pages, pages, splits, max_attempts, seq_len);
 }
 extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
     __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,

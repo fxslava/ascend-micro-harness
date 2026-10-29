@@ -7,18 +7,45 @@ namespace splitk_decode_test {
 using ascend_micro::sim::require;
 constexpr int kHeads = 4, kRows = 6, kChannels = 256, kPageTokens = 128;
 
+// The pattern written into every cache slot at or past `seq_len`: 0x7FC0BEEF,
+// the quiet NaN the isolated-canary protocol in
+// tests/camodel/test_camodel_single_token_decode_aiv.cpp already uses. It is
+// not decoration. A kernel that masks the dead lanes by MULTIPLYING them by
+// zero still produces NaN, because 0 * NaN is NaN, and the NaN then reaches m,
+// l, Acc and the context. So this constant is what separates a mask that
+// overwrites the dead lanes from one that merely scales them, and it is the
+// reason the device phase is a masked write rather than a masked multiply.
+inline float TailCanary()
+{
+    const std::uint32_t bits = 0x7FC0BEEFu;
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
 struct Fixture {
-    int tokens, pages, requests, heads, rows, page_tokens;
+    // `tokens` is the cache CAPACITY this fixture allocates, rounded up to
+    // whole pages; `seq_len` is how many of those tokens are live. They differ
+    // for every context length that is not a multiple of the page size, which
+    // in generative decoding is almost all of them.
+    int tokens, seq_len, pages, requests, heads, rows, page_tokens;
     std::vector<std::uint16_t> q;
     std::vector<std::uint8_t> key, value;
     std::vector<float> scales, gate, signs;
     std::vector<std::uint32_t> table;
     std::vector<float> expected;
 
+    // `live` defaults to -1, meaning "every allocated token is live", which
+    // is what every caller from before the tail change meant. Pass a smaller
+    // value for an unaligned context: the pages are still allocated whole (the
+    // cache has no notion of a part-page), the slots past `live` are flooded
+    // with TailCanary(), and the oracle masks them out.
     Fixture(int n, int batch, int head_count = kHeads, int row_count = kRows,
-            int page_size = kPageTokens)
-        : tokens(n), pages(n / page_size), requests(batch), heads(head_count),
-          rows(row_count), page_tokens(page_size),
+            int page_size = kPageTokens, int live = -1)
+        : tokens(((n + page_size - 1) / page_size) * page_size),
+          seq_len(live < 0 ? n : live),
+          pages((n + page_size - 1) / page_size), requests(batch),
+          heads(head_count), rows(row_count), page_tokens(page_size),
           q(batch * heads * rows * kChannels),
           key(static_cast<std::size_t>(batch) * pages * heads * page_tokens * 128),
           value(key.size()), scales(static_cast<std::size_t>(batch) * pages *
@@ -39,20 +66,36 @@ struct Fixture {
                             (static_cast<std::size_t>(physical) * heads + head) *
                             page_tokens * 128 + strip * 2048;
                         for (int t = 0; t < 16; ++t) {
+                            // The logical token this slot holds, in the
+                            // request's own numbering -- the same numbering
+                            // turboquant_decode_tail works in.
+                            const int logical = page * page_tokens + strip * 16 + t;
+                            const bool live = logical < seq_len;
                             for (int c = 0; c < kChannels; ++c) {
                                 paged_decode::PackNibble(key.data() + offset,
                                     t * kChannels + c,
-                                    single_token_decode::KeyNibbleAt(head, global_strip, t, c));
+                                    live ? single_token_decode::KeyNibbleAt(head, global_strip, t, c)
+                                         : 7);
                                 paged_decode::PackNibble(value.data() + offset,
                                     c * 16 + t,
-                                    single_token_decode::ValueNibbleAt(head, global_strip, c, t));
+                                    live ? single_token_decode::ValueNibbleAt(head, global_strip, c, t)
+                                         : 7);
                             }
                             const auto at =
                                 (static_cast<std::size_t>(physical) * heads + head) *
                                 page_tokens + strip * 16 + t;
-                            scales[at] = single_token_decode::KeyScale(head, global_strip, t);
-                            scales[scales.size() / 2 + at] =
-                                single_token_decode::ValueScaleAt(head, global_strip, t);
+                            // Dead slots get the largest nibble the format
+                            // holds and a NaN scale, so a kernel that lets one
+                            // through cannot produce a nearly-right answer:
+                            // either the NaN propagates, or the score is the
+                            // largest this fixture can make and dominates the
+                            // softmax.
+                            scales[at] = live
+                                ? single_token_decode::KeyScale(head, global_strip, t)
+                                : TailCanary();
+                            scales[scales.size() / 2 + at] = live
+                                ? single_token_decode::ValueScaleAt(head, global_strip, t)
+                                : TailCanary();
                         }
                     }
                 }
@@ -80,6 +123,12 @@ struct Fixture {
 
     // Independent full-context FP64 softmax, reading the uploaded packed bytes
     // through the uploaded block table. No split partition or online merge.
+    // Independent full-context FP64 softmax over the LIVE tokens, with the
+    // dead tail masked to -inf exactly as the kernel masks it to a large
+    // negative. Reading a dead slot is avoided rather than neutralised: its
+    // scale is a NaN, and `0 * NaN` is NaN here just as it is on the device, so
+    // a zero weight would not be enough -- the same hazard, in the same shape,
+    // on both sides of the comparison.
     void Reference()
     {
         std::vector<double> scores(tokens), weights(tokens);
@@ -89,6 +138,10 @@ struct Fixture {
                     const auto base = ((request * heads + head) * rows + row) * kChannels;
                     double maximum = -std::numeric_limits<double>::infinity();
                     for (int t = 0; t < tokens; ++t) {
+                        if (t >= seq_len) {
+                            scores[t] = -std::numeric_limits<double>::infinity();
+                            continue;
+                        }
                         const auto physical = table[request * pages + t / page_tokens];
                         const auto strip_base =
                             (static_cast<std::size_t>(physical) * heads + head) *
@@ -110,6 +163,7 @@ struct Fixture {
                     }
                     std::vector<double> acc(kChannels, 0);
                     for (int t = 0; t < tokens; ++t) {
+                        if (t >= seq_len) continue;  // weights[t] is 0; the payload is NaN
                         const auto physical = table[request * pages + t / page_tokens];
                         const auto strip_base =
                             (static_cast<std::size_t>(physical) * heads + head) *

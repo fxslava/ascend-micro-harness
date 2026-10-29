@@ -343,6 +343,33 @@ function(add_ascend_micro_sim_targets)
         INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
   endforeach()
 
+  # ------------------------ unaligned context lengths, on CAModel
+  # The simulator twin of NpuTargets.cmake's
+  # test_npu_decode_single_token_unaligned, and the only leg that can RUN the
+  # unaligned ladder without a 950PR. It links both AIV decode kernels because
+  # the harness launches both: the plain operator through its arbitrary-context
+  # entry point, and the split-K operator at four split counts, where the
+  # partial strip lands in whichever split owns the last live page and the
+  # splits beyond it must contribute the neutral element.
+  add_executable(test_decode_single_token_unaligned_sim
+      tests/npu/test_npu_decode_single_token_unaligned.cpp)
+  target_compile_definitions(test_decode_single_token_unaligned_sim PRIVATE
+      ASCEND_MICRO_DECODE_SPLITK_SIM)
+  target_include_directories(test_decode_single_token_unaligned_sim PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_decode_single_token_unaligned_sim PRIVATE
+      camodel_single_token_decode_aiv_kernel
+      camodel_single_token_decode_splitk_kernel
+      camodel_paged_decode_attention_kernel ascendcl
+      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  target_link_options(test_decode_single_token_unaligned_sim PRIVATE
+      "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+  target_compile_options(test_decode_single_token_unaligned_sim PRIVATE
+      -Wall -Wextra -Werror)
+  set_target_properties(test_decode_single_token_unaligned_sim PROPERTIES
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+
   # ------------------------------------------- mode-4 research probe, on CAModel
   # The simulator twin of NpuTargets.cmake's test_cluster_sync_probe: the same
   # tests/research/kernel_cluster_sync_probe.cpp, built against the model

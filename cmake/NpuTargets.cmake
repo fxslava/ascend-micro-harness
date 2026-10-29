@@ -159,6 +159,26 @@ function(add_ascend_micro_npu_targets)
   target_compile_options(test_npu_decode_splitk_aiv PRIVATE
       -Wall -Wextra -Werror)
 
+  # ------------------------- single-token decode at an unaligned context S
+  # tests/npu/test_npu_decode_single_token_unaligned.cpp walks the ladder
+  # S = 1, 7, 15, 17, 31, 33, 127, 129, 255, 257, 1023 -- not one of them a
+  # multiple of the 16-token strip, and most not a multiple of the page. It
+  # launches BOTH AIV decode kernels (the plain one through its new
+  # arbitrary-context entry point, and the split-K one at K = 1, 2, 4, 8), so
+  # it links both kernel libraries. Every cache slot past seq_len carries a
+  # quiet-NaN canary, so a tail that leaks arrives as a non-finite context
+  # rather than a near miss.
+  add_executable(test_npu_decode_single_token_unaligned
+      tests/npu/test_npu_decode_single_token_unaligned.cpp)
+  target_include_directories(test_npu_decode_single_token_unaligned PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_npu_decode_single_token_unaligned PRIVATE
+      turboquant_single_token_decode_npu
+      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu
+      ascendcl)
+  target_compile_options(test_npu_decode_single_token_unaligned PRIVATE
+      -Wall -Wextra -Werror)
+
   # ------------------------------------------------- mode-4 research probe
   # tests/research/kernel_cluster_sync_probe.cpp: one physical AI Core block,
   # 1 Cube + 2 Vector cores, no data, and a cyclic bilateral handshake over
@@ -195,6 +215,7 @@ function(add_ascend_micro_npu_targets)
   foreach(target test_turboquant_a8_validation test_turboquant_bf16_validation
       bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
       test_npu_decode_splitk_aic test_npu_decode_splitk_aiv
+      test_npu_decode_single_token_unaligned
       test_cluster_sync_probe)
     set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
@@ -202,5 +223,6 @@ function(add_ascend_micro_npu_targets)
   add_custom_target(turboquant_npu_all DEPENDS
       test_turboquant_a8_validation test_turboquant_bf16_validation
       bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
-      test_npu_decode_splitk_aic test_npu_decode_splitk_aiv)
+      test_npu_decode_splitk_aic test_npu_decode_splitk_aiv
+      test_npu_decode_single_token_unaligned)
 endfunction()
