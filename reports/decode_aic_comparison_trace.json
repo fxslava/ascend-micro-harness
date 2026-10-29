@@ -1,0 +1,20 @@
+{
+  "hardevent_pairs": 171,
+  "reserved_event_ids": 0,
+  "mode4_sets_and_waits": {
+    "16": 6,
+    "8": 6,
+    "10": 6,
+    "26": 6,
+    "4": 12,
+    "5": 6,
+    "0": 6
+  },
+  "cube_mmad": {
+    "MMAD": 368
+  },
+  "active_workers": 5,
+  "processed_pages": 6,
+  "query_rotation_mmads_per_worker": 64,
+  "score_mmads_per_strip": 8
+}

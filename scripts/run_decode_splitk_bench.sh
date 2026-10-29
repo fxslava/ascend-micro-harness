@@ -94,13 +94,10 @@ sim|smoke)
     cd "${build_dir}"
     rm -f core*.dump excp_log*.dump
     if [[ "${mode}" == "smoke" ]]; then
-        # Three real 16-token pages exercise uneven ranges and empty splits.
-        # A CAModel
-        # decode launch is minutes, so the iteration counts are 0 and 1 -- this
-        # is a functional check, and the percentiles it prints are over a
-        # single sample and mean nothing as performance.
-        set -- --context 48 --page-tokens 16 --heads 1 --rows 6 \
-            --splitk "1,2,4" --warmup 0 --iters 1
+        # K=2 carries state across pages; K=4 includes an empty worker.
+        # --single launches exactly once per selected implementation/case.
+        set -- --context 48 --page-tokens 16 --heads 1 --rows 1 \
+            --splitk "2,4" --single --impl both
     fi
     timeout "${run_timeout}" ./lib/bench_decode_splitk_sim "$@"
     ;;

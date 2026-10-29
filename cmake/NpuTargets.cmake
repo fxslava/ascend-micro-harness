@@ -73,9 +73,9 @@ function(add_ascend_micro_npu_targets)
   target_compile_options(bench_turboquant_reshape_and_cache PRIVATE -Wall -Wextra -Werror)
 
   # ---------------------------------------------------------- Split-K decode
-  # The two decode operators as physical-device libraries. Both sources are
-  # FROZEN and are compiled here exactly as the CAModel targets compile them;
-  # the only difference is RUN_MODE, which CANN selects per target.
+  # Physical-device decode libraries. The AIC source retains its legacy
+  # validation ABI and also exports the dynamic M=16 temporal split entry.
+  # CANN selects RUN_MODE per target.
   ascendc_library(turboquant_paged_decode_npu SHARED
       kernels/ops/turboquant/turboquant_paged_decode_attention.cpp)
   ascendc_compile_definitions(turboquant_paged_decode_npu PRIVATE
@@ -125,7 +125,7 @@ function(add_ascend_micro_npu_targets)
   target_include_directories(bench_turboquant_decode_splitk PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(bench_turboquant_decode_splitk PRIVATE
-      turboquant_single_token_decode_splitk_npu ascendcl)
+      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
   target_compile_options(bench_turboquant_decode_splitk PRIVATE
       -Wall -Wextra -Werror)
 

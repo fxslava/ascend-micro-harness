@@ -1,3 +1,7 @@
+// The legacy camodel_* entry keeps the fixed validation ABI described below.
+// turboquant_paged_decode_splitk_aic adds runtime request/head/split geometry,
+// page_begin + page_count windows, carried multi-page state and partial output.
+//
 // Fused TurboQuant paged DECODE attention, Ascend 950PR / arch35 / dav-3510 /
 // CANN 9.2, MIX_AIC_1_2: one Cube core and BOTH Vector cores.
 //
@@ -230,6 +234,7 @@
 
 #include <cstdint>
 #include <utility>
+#include "../../../include/turboquant_splitk_contract.hpp"
 
 #if defined(__CCE_AICORE__)
 #include "tensor_api/tensor.h"
@@ -513,8 +518,17 @@ template <std::uint32_t Slot>
 constexpr std::uint16_t kFlagScoreReady = 8u + Slot;   //  8..9  AIC  -> AIV0
 template <std::uint32_t Slot>
 constexpr std::uint16_t kFlagKeyReady = 16u + Slot;    // 16..17 AIV1 -> AIC
+// Full-page reuse handshake for the dynamic temporal entry. Mode-4 has
+// sixteen logical IDs per vector sub-block; 10 and 16+10 are distinct targets.
+constexpr std::uint16_t kFlagPageDrainedV0 = 10u;
+constexpr std::uint16_t kFlagPageDrainedV1 = 26u;
+constexpr std::int32_t kEvtPageDrain = 5;
+static_assert(kFlagPageDrainedV0 < 11u && kFlagPageDrainedV1 - 16u < 11u,
+              "page-completion flags must remain in the application ID range");
+
 // kFlagL1Free (AIC -> AIV1) is gone with the L1 ring it used to order; see
-// the kL1End comment. The AIC -> AIV1 direction now carries no channel.
+// the kL1End comment. The legacy entry has no AIC -> AIV1 channel; the
+// dynamic entry uses only the full-page completion channel above.
 
 static_assert(kFlagValueReady<kStageDepth - 1u> < 11u &&
               kFlagScoreFree<kStageDepth - 1u> < 11u &&
@@ -889,7 +903,8 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
                                       std::uint32_t key_scale_base,
                                       std::uint32_t value_scale_base,
                                       std::uint32_t gate_base,
-                                      std::uint32_t strips)
+                                      std::uint32_t strips, bool partial = false,
+                                      bool initialize = true, bool finalize = true)
 {
     ValueEngine engine;
     engine.value_cache.SetGlobalBuffer(gm_value_cache);
@@ -920,11 +935,13 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
     gm_offsets.SetGlobalBuffer(gm_gather_offsets);
     gm_signs.SetGlobalBuffer(gm_gather_signs);
     gm_signs_pi.SetGlobalBuffer(gm_pi_sign);
-    AscendC::DataCopy(gather_offsets, gm_offsets, kGatherStages * kHeadSize);
-    AscendC::DataCopy(gather_signs, gm_signs, kGatherStages * kHeadSize);
-    AscendC::DataCopy(pi_sign, gm_signs_pi, kHeadSize);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtStatic);
+    if (!partial) {
+        AscendC::DataCopy(gather_offsets, gm_offsets, kGatherStages * kHeadSize);
+        AscendC::DataCopy(gather_signs, gm_signs, kGatherStages * kHeadSize);
+        AscendC::DataCopy(pi_sign, gm_signs_pi, kHeadSize);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtStatic);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtStatic);
+    }
 
     // Seed the replicated-state invariant from immediate scalars, which never
     // read UB and so carry none of the tensor-source hazards. m starts at a
@@ -934,21 +951,37 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
     AscendC::LocalTensor<float> m_prev{kUb, kUbMPrev, kTokens * kStateLanes};
     AscendC::LocalTensor<float> l_prev{kUb, kUbLPrev, kTokens * kStateLanes};
     AscendC::LocalTensor<float> acc{kUb, kUbAcc, kTokens * kHeadSize};
-    AscendC::Duplicate(m_prev, -3.0e38f, static_cast<std::int32_t>(kTokens * kStateLanes));
-    AscendC::Duplicate(l_prev, 0.0f, static_cast<std::int32_t>(kTokens * kStateLanes));
-    AscendC::Duplicate(acc, 0.0f, static_cast<std::int32_t>(kTokens * kHeadSize));
+    if (initialize) {
+        AscendC::Duplicate(m_prev, -3.0e38f, static_cast<std::int32_t>(kTokens * kStateLanes));
+        AscendC::Duplicate(l_prev, 0.0f, static_cast<std::int32_t>(kTokens * kStateLanes));
+        AscendC::Duplicate(acc, 0.0f, static_cast<std::int32_t>(kTokens * kHeadSize));
+    }
 
-    // Feedback cycle priming: every packed value slot is free, and every score
-    // window in the Fixpipe ring is free for the Cube to write.
-    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
-    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
-    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFree<0>);
-    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFree<1>);
+    if (strips != 0u) {
+        // Feedback cycle priming: every packed value slot is free, and every score
+        // window in the Fixpipe ring is free for the Cube to write.
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
+        AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFree<0>);
+        AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFree<1>);
 
-    StepColumnsValue(engine, strips, ColumnSeq{});
+        StepColumnsValue(engine, strips, ColumnSeq{});
 
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
+    }
+    if (partial) {
+        if (finalize) {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kEvtStatic);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kEvtStatic);
+            AscendC::DataCopy(out_state, m_prev, kTokens * kStateLanes);
+            AscendC::DataCopy(out_state[kTokens * kStateLanes], l_prev, kTokens * kStateLanes);
+            AscendC::DataCopy(out_acc, acc, kPanel);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtStatic);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtStatic);
+        }
+        return;
+    }
 
     // ---- the egress, once, after the whole strip sequence ---------------
     ascend_micro::NativeEgressRotateEngine eg;
@@ -1078,8 +1111,10 @@ __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
                                      __gm__ bfloat16_t* gm_pi_table,
                                      __gm__ bfloat16_t* gm_out_qrot,
                                      std::uint32_t q_base,
-                                     std::uint32_t strips)
+                                     std::uint32_t strips, std::uint32_t pages = 1u,
+                                     bool temporal = false)
 {
+    if (pages == 0u) return;
     using namespace AscendC::Te;
     // L0A holds the eight Q group fractals and then Q_rot, both 4096 bf16
     // elements. L0B holds the 16 resident rotation blocks and then the two
@@ -1135,20 +1170,32 @@ __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
 
-    // ---- feedback cycle priming ----------------------------------------
-    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(0);
-    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(1);
-    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
-    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        // ---- feedback cycle priming ----------------------------------------
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(0);
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(1);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
 
-    StepColumnsCube(engine, strips, ColumnSeq{});
+        StepColumnsCube(engine, strips, ColumnSeq{});
 
-    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(1);
-    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagScoreFree<0>);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagScoreFree<1>);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(1);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
+        AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagScoreFree<0>);
+        AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagScoreFree<1>);
+        if (temporal) {
+            // The final score-free waits prove AIV0 consumed every score.
+            // Drain FIX before announcing that all eight L1 key pages and
+            // this page's mode-4 announcements can be reused.
+            AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtPageDrain);
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtPageDrain);
+            AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrainedV0);  // AIV0 page drained
+            AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrainedV1);  // AIV1 page drained
+        }
+    }
+
 }
 
 }  // namespace paged_decode
@@ -1217,6 +1264,71 @@ extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
     }
 }
 
+// Dynamic single-token schema with M=16 packed shared-KV query rows. The
+// legacy entry above keeps its validation ABI and standalone egress behavior.
+extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
+    __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table,
+    __gm__ std::int8_t* key, __gm__ std::int8_t* value, __gm__ float* scales,
+    __gm__ uint32_t* table, __gm__ bfloat16_t* qrot,
+    __gm__ float* state, __gm__ float* acc, uint32_t requests, uint32_t heads,
+    uint32_t block_size, uint32_t cache_pages, uint32_t seq_pages,
+    uint32_t splits, uint32_t page_begin, uint32_t page_count)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::InitSocState();
+    using namespace paged_decode;
+    if (requests == 0u || heads == 0u || splits == 0u || splits > 16u ||
+        block_size == 0u || block_size > kBlockSize || block_size % kTokens != 0u ||
+        seq_pages == 0u || seq_pages > cache_pages || page_begin > seq_pages ||
+        page_count > seq_pages - page_begin) return;
+    const auto item = static_cast<uint32_t>(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum());
+    if (item >= requests * heads * splits) return;
+    const uint32_t head_item = item / splits;
+    const uint32_t request = head_item / heads, head = head_item % heads;
+    const auto range = turboquant_splitk::Partition(page_count, splits, item % splits);
+    const uint32_t strips = block_size / kTokens;
+    if ASCEND_IS_AIC {
+        // Q rotation is amortized over the entire page range, not repeated
+        // per page. The modulo-8 strip pipeline is primed/drained per page.
+        run_cube_core(q, pi_table, qrot + item * kPanel, head_item * kPanel,
+                      strips, range.count, true);
+    } else if (AscendC::GetSubBlockIdx() == 0) {
+        // Empty temporal workers publish a neutral partial without any
+        // mode-4 flags, query rotation, or normalization of a zero sum.
+        const uint32_t iterations = range.count == 0u ? 1u : range.count;
+        for (uint32_t p = 0; p < iterations; ++p) {
+            const uint32_t physical = range.count == 0u ? 0u :
+                table[request * seq_pages + page_begin + range.begin + p];
+            const uint32_t base = (physical * heads + head) * block_size;
+            run_value_core(value, scales, nullptr, nullptr, nullptr, nullptr,
+                nullptr, state + item * 2u * kTokens * kStateLanes,
+                acc + item * kPanel, nullptr, nullptr, base * kHeadSize / 2u,
+                base, cache_pages * heads * block_size + base, 0u,
+                range.count == 0u ? 0u : strips, true, p == 0u, p + 1u == iterations);
+            if (range.count != 0u) {
+                AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagPageDrainedV0);
+                AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
+            }
+        }
+    } else {
+        for (uint32_t p = 0; p < range.count; ++p) {
+            const uint32_t physical = table[request * seq_pages + page_begin + range.begin + p];
+            const uint32_t base = (physical * heads + head) * block_size * kHeadSize / 2u;
+            run_key_core(key, base, strips);
+            AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(kFlagPageDrainedV1);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtPageDrain);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtPageDrain);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
+        }
+    }
+}
+
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 
 #include <cassert>
@@ -1246,6 +1358,30 @@ extern "C" void launch_camodel_paged_decode_attention(
         gather_signs, pi_sign, reinterpret_cast<bfloat16_t*>(out_qrot), out_scores,
         out_state, out_acc, reinterpret_cast<bfloat16_t*>(out_context), out_rotated,
         strips, strip_begin, active_block);
+}
+
+extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
+    __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*,
+    __gm__ std::int8_t*, __gm__ float*, __gm__ uint32_t*, __gm__ bfloat16_t*,
+    __gm__ float*, __gm__ float*, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t);
+
+extern "C" void launch_turboquant_paged_decode_splitk_aic(
+    void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key,
+    std::int8_t* value, float* scales, std::uint32_t* table,
+    std::uint16_t* qrot, float* state, float* acc, std::uint32_t requests,
+    std::uint32_t heads, std::uint32_t block_size, std::uint32_t cache_pages,
+    std::uint32_t seq_pages, std::uint32_t splits, std::uint32_t page_begin,
+    std::uint32_t page_count)
+{
+    if (!requests || !heads || !splits || splits > 16 || !seq_pages ||
+        !block_size || block_size > paged_decode::kBlockSize || block_size % 16 ||
+        seq_pages > cache_pages || page_begin > seq_pages || page_count > seq_pages - page_begin)
+        throw std::invalid_argument("invalid AIC temporal split geometry");
+    turboquant_paged_decode_splitk_aic<<<requests * heads * splits, nullptr, stream>>>(
+        reinterpret_cast<bfloat16_t*>(q), reinterpret_cast<bfloat16_t*>(pi_table),
+        key, value, scales, table, reinterpret_cast<bfloat16_t*>(qrot), state, acc,
+        requests, heads, block_size, cache_pages, seq_pages, splits, page_begin, page_count);
 }
 
 #endif

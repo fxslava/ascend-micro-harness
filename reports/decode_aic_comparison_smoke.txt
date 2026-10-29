@@ -1,0 +1,13 @@
+CAModel functional run: event times/speedups are unavailable; completion deltas are model ticks.
+[PROFILING MODE] Single launch mode active for msprof op.
+AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.
+AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.
+Single samples replace p50; tail/lock show maxima. No implicit K=1 launch.
+impl=both requests=1 heads=1 AIV_rows=1 AIC_rows=16 page_tokens=16 warmup=0 iters=1
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+--------------+
+| Context (N) | Splits (K) |   Grid |     AIV (us) | AIV Speedup | AIV KV GB/s | AIC Batch Raw(us) |      AIC Model(us/req) | AIC Model GB/s | Tail (ticks) |     Lock (ticks) | Failed Spins |
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+--------------+
+|          48 |          2 |      2 |           NA |          NA |          NA |                NA |                     NA |             NA |         8623 |             6972 |            3 |
+|          48 |          4 |      4 |           NA |          NA |          NA |                NA |                     NA |             NA |        17474 |            15090 |           22 |
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+--------------+
+PASS: CPU references matched. Kernel launches: AIV=2 AIC=2.

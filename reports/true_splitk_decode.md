@@ -1,5 +1,9 @@
 # True in-kernel Split-K decode (dav-3510)
 
+This is the validation record for commit `f8bbb24`. Later AIC schema and
+benchmark presentation changes are recorded in
+[the M=16 comparison report](decode_splitk_aic_comparison.md).
+
 The new operator partitions physical pages across `(request, kv_head, split)`
 blocks. Each worker runs the existing AIV GEMV and online recurrence only over
 its range. A bounded SIMT TAS acquire and atomic arrival increment protect one

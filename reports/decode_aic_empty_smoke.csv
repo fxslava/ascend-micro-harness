@@ -1,0 +1,2 @@
+context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,lock_ticks,failed_spins,timeouts,aiv_launches,aic_launches
+32,4,4,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,0,0,1

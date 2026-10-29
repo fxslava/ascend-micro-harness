@@ -244,7 +244,8 @@ function(add_ascend_micro_sim_targets)
   # This builds the SAME source against simulator-mode kernel libraries, with
   # ASCEND_MICRO_BENCH_SIM defined so the binary says at startup that its
   # figures are CAModel ticks and not hardware latencies. The benchmark links
-  # only the true Split-K decode library, with no synthetic reduction launch.
+  # the fused AIV Split-K and dynamic M=16 AIC decode libraries, with no
+  # synthetic reduction launch.
   #
   # It is deliberately NOT part of any aggregate target: a CAModel decode
   # launch is minutes, so a default context sweep would take days. Run it
@@ -276,16 +277,21 @@ function(add_ascend_micro_sim_targets)
   ascendc_compile_options(camodel_single_token_decode_splitk_kernel PRIVATE
       -std=c++17 -Wall -Werror ${splitk_system_options}
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(camodel_paged_decode_attention_kernel PRIVATE
+      -std=c++17 -Wall -Werror ${splitk_system_options}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
 
   add_executable(bench_decode_splitk_sim
       tests/npu/bench/bench_turboquant_decode_splitk.cpp)
   add_executable(test_splitk_decode_probe tests/cpu/test_splitk_decode_probe.cpp)
   target_compile_options(test_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
+  add_executable(test_aic_splitk_decode_probe tests/cpu/test_aic_splitk_decode_probe.cpp)
+  target_compile_options(test_aic_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
   target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM)
   target_include_directories(bench_decode_splitk_sim PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(bench_decode_splitk_sim PRIVATE
-      camodel_single_token_decode_splitk_kernel ascendcl
+      camodel_single_token_decode_splitk_kernel camodel_paged_decode_attention_kernel ascendcl
       "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
   target_link_options(bench_decode_splitk_sim PRIVATE
       "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
