@@ -243,12 +243,11 @@ function(add_ascend_micro_sim_targets)
   #
   # This builds the SAME source against simulator-mode kernel libraries, with
   # ASCEND_MICRO_BENCH_SIM defined so the binary says at startup that its
-  # figures are CAModel ticks and not hardware latencies. It reuses the decode
-  # libraries the probes above already create, and adds the one library the
-  # reduction needs.
+  # figures are CAModel ticks and not hardware latencies. The benchmark links
+  # only the true Split-K decode library, with no synthetic reduction launch.
   #
   # It is deliberately NOT part of any aggregate target: a CAModel decode
-  # launch is minutes, so a default `--iters 100` run would take days. Run it
+  # launch is minutes, so a default context sweep would take days. Run it
   # with small counts, as scripts/run_decode_splitk_bench.sh does.
   ascendc_library(camodel_splitk_reduce_kernel SHARED
       kernels/ops/turboquant/turboquant_splitk_reduce.cpp)
@@ -257,14 +256,36 @@ function(add_ascend_micro_sim_targets)
   ascendc_compile_options(camodel_splitk_reduce_kernel PRIVATE
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
 
+  ascendc_library(camodel_single_token_decode_splitk_kernel SHARED
+      kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp)
+  # Keep warnings strict in our source while classifying CANN's own headers
+  # as system headers, matching the physical-device target.
+  set(splitk_system_options "")
+  foreach(path IN ITEMS
+      asc/impl/adv_api asc/impl/basic_api asc/impl/c_api
+      asc/impl/basic_api/reg_compute asc/impl/simt_api asc/impl/utils
+      asc asc/include asc/include/adv_api asc/include/basic_api
+      asc/include/aicpu_api asc/include/c_api
+      asc/include/basic_api/reg_compute asc/include/simt_api asc/include/utils
+      tikcpp/tikcfw tikcpp/tikcfw/interface tikcpp/tikcfw/impl)
+    list(APPEND splitk_system_options
+        "-isystem${ASCEND_HOME_PATH}/x86_64-linux/${path}")
+  endforeach()
+  ascendc_compile_definitions(camodel_single_token_decode_splitk_kernel PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(camodel_single_token_decode_splitk_kernel PRIVATE
+      -std=c++17 -Wall -Werror ${splitk_system_options}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
   add_executable(bench_decode_splitk_sim
       tests/npu/bench/bench_turboquant_decode_splitk.cpp)
+  add_executable(test_splitk_decode_probe tests/cpu/test_splitk_decode_probe.cpp)
+  target_compile_options(test_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
   target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM)
   target_include_directories(bench_decode_splitk_sim PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(bench_decode_splitk_sim PRIVATE
-      camodel_splitk_reduce_kernel camodel_paged_decode_attention_kernel
-      camodel_single_token_decode_aiv_kernel ascendcl
+      camodel_single_token_decode_splitk_kernel ascendcl
       "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
   target_link_options(bench_decode_splitk_sim PRIVATE
       "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")

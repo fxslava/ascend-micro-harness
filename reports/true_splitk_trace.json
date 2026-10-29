@@ -1,0 +1,65 @@
+[
+  {
+    "core": "core0.veccore0.instr_log.dump",
+    "begin": 36500,
+    "end": 39896,
+    "hold_ticks": 3396,
+    "failed_exchanges": 0,
+    "state_reads": 0,
+    "state_writes": 0
+  },
+  {
+    "core": "core0.veccore0.instr_log.dump",
+    "begin": 87188,
+    "end": 91603,
+    "hold_ticks": 4415,
+    "failed_exchanges": 0,
+    "state_reads": 1,
+    "state_writes": 0
+  },
+  {
+    "core": "core0.veccore0.instr_log.dump",
+    "begin": 137511,
+    "end": 141833,
+    "hold_ticks": 4322,
+    "failed_exchanges": 17,
+    "state_reads": 1,
+    "state_writes": 0
+  },
+  {
+    "core": "core0.veccore1.instr_log.dump",
+    "begin": 77052,
+    "end": 80735,
+    "hold_ticks": 3683,
+    "failed_exchanges": 0,
+    "state_reads": 0,
+    "state_writes": 1
+  },
+  {
+    "core": "core0.veccore1.instr_log.dump",
+    "begin": 127194,
+    "end": 131928,
+    "hold_ticks": 4734,
+    "failed_exchanges": 0,
+    "state_reads": 1,
+    "state_writes": 1
+  },
+  {
+    "core": "core1.veccore0.instr_log.dump",
+    "begin": 131938,
+    "end": 136876,
+    "hold_ticks": 4938,
+    "failed_exchanges": 6,
+    "state_reads": 1,
+    "state_writes": 1
+  },
+  {
+    "core": "core1.veccore1.instr_log.dump",
+    "begin": 117434,
+    "end": 121509,
+    "hold_ticks": 4075,
+    "failed_exchanges": 0,
+    "state_reads": 0,
+    "state_writes": 1
+  }
+]

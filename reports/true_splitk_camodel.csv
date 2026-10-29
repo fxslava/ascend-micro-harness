@@ -1,0 +1,4 @@
+N,K,grid,p50_us,p95_us,speedup,KV_GB_s,tail_p50_ticks,tail_p95_ticks,lock_region_p50_ticks,lock_region_p95_ticks,failed_exchanges,timeouts
+48,1,1,NA,NA,NA,NA,0,0,4646,4646,0,0
+48,2,2,NA,NA,NA,NA,30756,30756,5180,5608,0,0
+48,4,4,NA,NA,NA,NA,40239,40239,7570,14723,23,0

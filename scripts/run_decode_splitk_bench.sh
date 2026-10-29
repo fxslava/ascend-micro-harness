@@ -94,12 +94,13 @@ sim|smoke)
     cd "${build_dir}"
     rm -f core*.dump excp_log*.dump
     if [[ "${mode}" == "smoke" ]]; then
-        # The cheapest arguments that still reach every code path: both sync
-        # modes, three split counts, the AIV decode over one page. A CAModel
+        # Three real 16-token pages exercise uneven ranges and empty splits.
+        # A CAModel
         # decode launch is minutes, so the iteration counts are 0 and 1 -- this
         # is a functional check, and the percentiles it prints are over a
         # single sample and mean nothing as performance.
-        set -- --impl aiv --context 128 --splitk "2,4,8" --warmup 0 --iters 1
+        set -- --context 48 --page-tokens 16 --heads 1 --rows 6 \
+            --splitk "1,2,4" --warmup 0 --iters 1
     fi
     timeout "${run_timeout}" ./lib/bench_decode_splitk_sim "$@"
     ;;
