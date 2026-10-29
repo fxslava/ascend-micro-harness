@@ -833,9 +833,10 @@ Files:
 | `CMakeLists.txt` | add the five new TUs; keep the `ascend950` gate; drop `turboquant_paged_attention_opt.cpp` once №4 lands |
 | `vllm_ascend/attention/turboquant_v1.py` | the dispatch below |
 | `vllm_ascend/attention/turboquant_layout.py` | the three plane accessors (RFC §9.1) |
-| `vllm_ascend/platform.py` | validation (RFC §9.2) |
+| `vllm_ascend/quantization/methods/kv_cache/turboquant/config.py` | a third validator branch for dense GQA, and the A5 capability grant (RFC §9.2) — **not** `platform.py::_validate_turboquant_config`, which is a main-clean symbol |
+| `vllm_ascend/platform.py` | port `_apply_turboquant_graph_mode` from main-clean (RFC §9.2) |
 | `vllm_ascend/patch/worker/patch_qwen3_5.py` | gate hand-off (RFC §9.3) |
-| `vllm_ascend/worker/model_runner_v1.py` | per-tensor `hybrid_with_attn_and_mamba` |
+| `vllm_ascend/worker/model_runner_v1.py` | a TurboQuant branch on the single-tensor path (RFC §9.4); `hybrid_with_attn_and_mamba` itself is correct as it stands |
 
 ### 5.1 The two selection rules
 
@@ -910,6 +911,12 @@ own. Per the repo's patching rule this stays in `patch/worker/`, never in a mode
    expected shapes, and `VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS=1` clean across a ragged batch.
 4. End-to-end and accuracy gates belong to whoever has hardware. This phase does not claim
    them.
+5. The A5 capability grant is the **last** line of this phase. Until
+   `HardwareCapability.TURBOQUANT_4BIT_NC_CACHE` is added to the A5 profile
+   (`hardware_profile.py:338-385`), a 950PR run raises
+   `"only supported on Ascend A2/A3"` at config validation and nothing above ever
+   executes — audit F7. Flipping it early to see a kernel run converts a clean config
+   error into a mid-run failure, so it is landed only once gates 1–3 pass.
 
 ---
 

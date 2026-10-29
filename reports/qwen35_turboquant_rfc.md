@@ -982,23 +982,66 @@ New validation, raised at `__init__` rather than discovered at the first launch:
 * `sliding_window is None`, `attn_type == DECODER`, `logits_soft_cap` unset;
 * `kv_sharing_target_layer_name is None`.
 
-### 9.2 `vllm_ascend/platform.py::_validate_turboquant_config`
+### 9.2 Config-time validation — `validate_turboquant`
 
-* an explicit statement for `model_config.is_hybrid` — either support under the chosen
-  Phase-0 allocator option, or a clean rejection naming the three-plane carve. Today the
-  engine passes validation and fails at cache reshape with `len(raw_planes) == 3`.
-* keep the existing rejections of prefix caching and chunked prefill **until** №2's §5.2/§5.3
-  changes land, then lift them: a ragged-tail, `cu_seqlens`-aware writer is exactly what
-  chunked prefill needs. Note in the message that the dependency is №2, so the rejection has
-  a visible exit.
-* spec decoding moves from "rejected" to "supported with `query_tokens_per_req = 1 + k`",
-  which is the Qwen3.5 MTP case and the regime №4 is best shaped for (audit §4.2).
-* keep the PIECEWISE/NONE graph downgrade.
+**The hook an earlier draft of this section named does not exist on the branch these kernels
+come from.** `vllm_ascend/platform.py::_validate_turboquant_config` is a `feat/tq-main-clean`
+and `develop-turboquant` symbol. On `feat/tq-cube-clean` (HEAD `7e5cecf20`, the branch the
+harness probes and `turboquant_torch_adpt.h` were vendored from) validation has moved to
+`vllm_ascend/quantization/methods/kv_cache/turboquant/config.py::validate_turboquant`, called
+from `platform.py:508-510`, and split three ways: `_validate_turboquant_common`,
+`_validate_turboquant_sfa`, `_validate_turboquant_dsa`.
+
+On that branch the Qwen3.5-on-950PR target is rejected at config time, twice over. Neither
+rejection is a bug; each is a true statement about code that does not exist yet.
+
+1. **SoC capability.** `_validate_turboquant_common` (`config.py:20-21`) requires
+   `HardwareCapability.TURBOQUANT_4BIT_NC_CACHE`. That capability is granted inside
+   `_STANDARD_CAPABILITIES` (`hardware_profile.py:275`), which A2 takes directly and A3 by
+   union. The **A5 profile spells its 33 capabilities out explicitly and does not include
+   it** (`hardware_profile.py:338-385`), and `"ascend950…" -> AscendDeviceType.A5` is the
+   whole of the 950 mapping (`hardware.py:53-58`; `is_950()` is `== A5`,
+   `device_config.py:61-62`). So the target raises `"only supported on Ascend A2/A3"` — and
+   on this branch that message is literally true.
+2. **Model family.** `validate_turboquant`'s dispatch is binary and total: SFA-sparse models
+   to `_validate_turboquant_sfa`, **everything else** to `_validate_turboquant_dsa`, whose
+   first check (`config.py:63`) raises `"currently requires DeepSeek V4"`. A dense-GQA model
+   is not SFA-sparse, so Qwen3.5 reaches the DeepSeek validator by falling off the end of an
+   `if` (`config.py:107`) rather than by being chosen.
+
+So §9.2's ask is not "lift a rejection" but **add a third branch**:
+
+* grant `TURBOQUANT_4BIT_NC_CACHE` to the A5 profile, gated on the §4 operators existing.
+  This single line is what turns the feature on for 950PR, so it is the **last** thing
+  flipped, after Phase 4 — not a bring-up convenience.
+* make the dispatch three-way, `_validate_turboquant_gqa` for the dense-GQA page layout,
+  selected on something narrower than "not SFA" — the spec class
+  (`AscendTurboQuantAttentionSpec`, `core/kv_cache_interface.py:373`) or an explicit
+  model-family predicate. Falling into a sibling family's validator by default is what makes
+  today's message misleading rather than merely premature.
+* in that branch: `num_heads // num_kv_heads == 6` (I1), `head_size == 256`,
+  `num_kv_heads == 4`, `block_size == 128`, bf16 (already covered by the common path), and an
+  explicit statement for `model_config.is_hybrid` — either support under the chosen Phase-0
+  allocator option, or a clean rejection naming the three-plane carve (§9.4).
+* prefix caching and chunked prefill stay rejected **until** No.2's §5.2/§5.3 changes land,
+  then lift: a ragged-tail, `cu_seqlens`-aware writer is exactly what chunked prefill needs.
+  Name No.2 in the message so the rejection has a visible exit.
+* spec decoding is "supported with `query_tokens_per_req = 1 + k`", the Qwen3.5 MTP case and
+  the regime No.4 is best shaped for (audit §4.2).
+* the PIECEWISE/NONE graph downgrade is a **port, not a keep**: there is no TurboQuant
+  graph-mode hook on the cube branch. `_apply_turboquant_graph_mode`
+  (`feat/tq-main-clean:platform.py:556-614`) holds a TurboQuant run to a replayable ACL
+  graph mode, and it must come across with the backend (audit §4.1).
+
+The `feat/tq-main-clean` observation that "the engine passes validation and fails at cache
+reshape with `len(raw_planes) == 3`" is branch-specific and does not hold here: on the cube
+branch nothing reaches the allocator. The three-plane conflict is still real (§9.4); it is
+simply not the first thing a run hits.
 
 ### 9.3 `vllm_ascend/patch/worker/patch_qwen3_5.py`
 
 The current file has no TurboQuant hook: the gate is `torch.sigmoid(gate)` followed by a
-multiply (`:92-95`). Add the `feat/tq-main-clean` branch, guarded:
+multiply (`:93-95`). Add the `feat/tq-main-clean` branch, guarded:
 
 ```python
 if self.attn_output_gate and turboquant_fuses_output_gate(self.attn):
@@ -1022,13 +1065,48 @@ Both entry ops stay graph-splitting custom ops with `mutates_args=["output"]` an
 
 ### 9.4 `vllm_ascend/worker/model_runner_v1.py`
 
-* make `hybrid_with_attn_and_mamba` **per-tensor**. It is currently a global flag set while
-  iterating tensors, so once any tensor mixes mamba and attention, later pure-attention
-  tensors also take the flat single-tensor path — ordering-dependently.
-* the three-plane carve must become reachable on the hybrid path (Phase 0; out of scope
-  here, N1) and the plane views must follow §3.1.
-* nothing else: `slot_mapping`, `block_tables`, `seq_lens_gpu` and the padding convention
-  are all already what the operators want.
+**Correction to an earlier draft of this section**, which said
+`hybrid_with_attn_and_mamba` is "a global flag set while iterating tensors" and asked for it
+to be made per-tensor. Both halves are wrong. It is one expression over every spec in the
+model (`:4987-4989`):
+
+```python
+self.hybrid_with_attn_and_mamba = any(
+    isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values()
+) and any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
+```
+
+It is model-wide **by design**, and the comment above it says why: vLLM #51718 stopped
+listing layers from different cache groups in one descriptor, so detecting hybridity per
+descriptor is precisely what broke. There is no ordering dependence — `any` over a dict's
+values does not have one. Making it per-tensor would re-introduce the bug that comment
+records.
+
+The conflict is at the **consumer**, not the definition. At `:5157-5163` the flag is read
+once per layer:
+
+```python
+if ("linear_attn" in layer_name
+        or self.hybrid_with_attn_and_mamba
+        or layer_name in strided_attention_cache_layers
+        or ...) and layer_name not in kv_cache_raw_tensors:
+    # ... one private contiguous buffer per layer
+```
+
+Because the flag is model-wide, in a hybrid model **every** layer takes the single-tensor
+path — the 16 full-attention layers included. That path hands each layer one contiguous
+buffer, and `AscendTurboQuantAttentionSpec` needs three planes carved out of its allocation
+(§3.1, §3.2). The ask is therefore narrower than the draft's, and does not touch the flag:
+
+* the single-tensor path needs a TurboQuant-aware branch: for a layer whose spec is
+  `AscendTurboQuantAttentionSpec`, carve `(key, value, scale)` per §3.1/§3.2 instead of
+  returning one buffer. Equivalently, add that spec to whatever predicate selects the carve.
+  The flag keeps its current model-wide meaning either way.
+* that carve must become reachable on the hybrid path at all (Phase 0; out of scope here,
+  N1), and the plane views must follow §3.1 — byte ranges with accessors, not indexable
+  logical shapes (§9.1).
+* nothing else: `slot_mapping`, `block_tables`, `seq_lens_gpu` and the padding convention are
+  all already what the operators want.
 
 ### 9.5 Everything else
 

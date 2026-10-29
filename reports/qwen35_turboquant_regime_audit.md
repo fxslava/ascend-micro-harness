@@ -50,7 +50,7 @@ is write-only.
 impl, `rotate_q` / `paged_attention` / `cube_decode` schemas, the three-plane page carve).
 `feat/tq-cube-clean` is a clean rebase on v0.30.0rc2 carrying only the BF16 Cube writer —
 no `turboquant_v1.py`, no attention backend, and `patch_qwen3_5.py` with no TurboQuant
-hook at all (the gate is plain torch, `patch_qwen3_5.py:92-95`). The `turboquant`
+hook at all (the gate is plain torch, `patch_qwen3_5.py:93-95`). The `turboquant`
 package that *is* wired on cube-clean (`vllm_ascend/quantization/methods/kv_cache/turboquant/`,
 `ops/triton/turboquant_finalize.py`) is the **MLA/SFA latent** path: it validates
 `kv_lora_rank == 512` and `qk_rope_head_dim == 64` (`config.py:48-54`) and is irrelevant
@@ -103,6 +103,33 @@ unrolled (deliberately: unrolling 16 queries at 8 strip sites did not finish com
 25 minutes). So ten padded rows at `B=1`
 do not cost Cube throughput — they cost 62.5% of the critical path. §3.
 
+**F7 — On the branch these kernels come from, the target is rejected at config time, twice,
+before any kernel is reached — and the rejections are true.** The vendored branch is
+`feat/tq-cube-clean` (HEAD `7e5cecf20`), not `feat/tq-main-clean`, and on it TurboQuant
+validation lives in `vllm_ascend/quantization/methods/kv_cache/turboquant/config.py::validate_turboquant`
+(called from `platform.py:508-510`), split into a common path plus one validator per
+DeepSeek family. Two independent gates close on Qwen3.5-on-950PR:
+
+* **SoC.** `_validate_turboquant_common` (`config.py:20-21`) requires
+  `HardwareCapability.TURBOQUANT_4BIT_NC_CACHE`, which is granted inside
+  `_STANDARD_CAPABILITIES` (`hardware_profile.py:275`) — A2 directly, A3 by union. The A5
+  profile enumerates its 33 capabilities explicitly and omits it
+  (`hardware_profile.py:338-385`), and `"ascend950…" -> AscendDeviceType.A5` is the entire
+  950 mapping (`hardware.py:53-58`, `device_config.py:61-62`). The raised message,
+  `"only supported on Ascend A2/A3"`, is accurate.
+* **Model family.** `validate_turboquant`'s dispatch is binary and total — SFA-sparse to
+  `_validate_turboquant_sfa`, **everything else** to `_validate_turboquant_dsa`
+  (`config.py:107`), whose first check raises `"currently requires DeepSeek V4"`
+  (`config.py:63`). A dense-GQA model reaches the DeepSeek validator by falling off the end
+  of an `if`, not by being selected, which is what makes that message misleading rather than
+  merely premature.
+
+These two gates are what F2's branch split looks like from the engine's side, and they
+sharpen one thing F2 leaves open: the MLA/SFA validator is not merely *irrelevant* to a GQA
+model, it is the branch a GQA model is **sent down**. The consequence for anything reading
+this audit as a work plan is that nothing on this branch reaches the cache allocator, so the
+`len(raw_planes) == 3` hybrid conflict (RFC §9.4) is real but is not the first failure a run
+would hit — it sits behind both gates. RFC §9.2 says what to add.
 ---
 
 ## 1. Inventory, as built
