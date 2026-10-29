@@ -3,8 +3,11 @@
 # (MICROROUTINE_DESIGN_GUIDELINES.md section 6.5,
 #  REFINEMENT_OF_COMBAT_KERNELS.md section 6).
 #
-# This is what can be established on a machine with no CANN toolkit and no
-# Ascend950PR_9599 simulator. It is NOT the CAModel gate and it is not a
+# This is what can be established without a CANN toolkit that targets this
+# part. A CANN 8.5.0 install does exist in the WSL instance, but it has no
+# dav-3510 target, no Ascend950PR_9599 simulator and no ReduceRepeat at all,
+# so it cannot build these kernels -- see reports/decode_tail_masking.md
+# section 7. It is NOT the CAModel gate and it is not a
 # hardware claim: it compiles the protocol arithmetic the kernels are built on,
 # audits the cross-core id census for both channel policies, audits the scalar
 # fence in front of every cross-core announcement, compiles every host harness

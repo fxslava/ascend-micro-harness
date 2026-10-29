@@ -43,7 +43,8 @@ extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
 extern "C" void launch_turboquant_paged_decode_splitk_aic(
     void*, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
     std::uint32_t*, std::uint16_t*, float*, float*, std::uint32_t, std::uint32_t,
-    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t);
 
 struct AivRig {
     const Fixture& f;
@@ -195,7 +196,10 @@ struct AicRig {
             static_cast<float*>(scales.ptr), static_cast<std::uint32_t*>(table.ptr),
             static_cast<std::uint16_t*>(qrot.ptr), static_cast<float*>(state.ptr),
             static_cast<float*>(acc.ptr), f.requests, f.heads, f.page_tokens,
-            f.requests * f.pages, f.pages, splits, begin, pages);
+            f.requests * f.pages, f.pages, splits, begin, pages,
+            // The fixture's live token count. Equal to its capacity on an
+            // aligned fixture, so this is the pre-tail behaviour there.
+            static_cast<std::uint32_t>(f.seq_len));
     }
     AivRig::Census Validate(int)
     {

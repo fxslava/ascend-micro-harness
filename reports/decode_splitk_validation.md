@@ -117,8 +117,15 @@ rather than merely compile.
 
 ## 5. Verification matrix — what has actually been run
 
-This host has **no CANN toolchain and no 950PR**. Recorded per
-`AGENTS.md`: unavailable gates are named, not implied.
+This host has **no CANN toolchain that targets this part, and no 950PR**.
+Recorded per `AGENTS.md`: unavailable gates are named, not implied.
+
+Correction, made later: a CANN **8.5.0** install does exist in the WSL
+instance. It cannot build these kernels — no `dav-3510` target, no
+`Ascend950PR_9599` simulator, and no `ReduceRepeat` in its headers at all —
+so every NOT RUN row below stands, but the reason is the toolkit's version
+rather than its absence. `reports/decode_tail_masking.md` section 7 has the
+evidence.
 
 | gate | status | evidence |
 | --- | --- | --- |

@@ -12,6 +12,9 @@ tokens, masks the one partial strip, and records which gates ran.
 | the masking phase, shared by all three decode kernels | `routines/routine_vector_decode_recurrence.hpp` |
 | plain AIV decode, wired | `kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp` |
 | split-K AIV decode, wired | `kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp` |
+| Cube (MIX_AIC_1_2) decode, wired differently — see §5 | `kernels/ops/turboquant/turboquant_paged_decode_attention.cpp` |
+| the AIC partial oracle, masked | `tests/common/aic_splitk_decode_fixture.hpp` |
+| unaligned AIC rungs | `tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp` |
 | live tokens, beyond-S canaries, masked oracle | `tests/common/splitk_decode_fixture.hpp` |
 | exhaustive geometry check | `tests/cpu/test_decode_tail_geometry.cpp` |
 | fixture and oracle probe | `tests/cpu/test_decode_tail_probe.cpp` |
@@ -116,14 +119,16 @@ rather than by a margin. Both checks are in the harness; neither is redundant.
 
 ## 4. What has NOT run
 
-This host has **no CANN toolchain and no 950PR**. Recorded per `AGENTS.md`.
+There **is** a CANN toolkit on this machine — see §7, which corrects a claim
+carried through the earlier reports — but it is CANN 8.5.0 and it does not know
+this part. No 950PR either.
 
 | gate | status | why |
 | --- | --- | --- |
-| the masking phase compiles | **NOT RUN** | needs BiSheng; `routines/routine_vector_decode_recurrence.hpp` only compiles under `__CCE_AICORE__` |
-| the bit-mask assumption in §1 | **NOT ESTABLISHED** | the whole change rests on it and nothing here can test it |
-| either kernel compiles or links | **NOT RUN** | needs CANN 9.2 |
-| the unaligned ladder on CAModel | **NOT RUN** | needs Ascend950PR_9599 |
+| the masking phase compiles | **NOT RUN** | needs CANN 9.2 / dav-3510; the installed 8.5.0 has no such target, and no `ReduceRepeat` at all (§7) |
+| the bit-mask assumption in §1 | **NARROWED, NOT CLOSED** | the overload exists with exactly this parameter shape, and its implementation programs the hardware vector mask — but no header states what becomes of the deselected lanes (§7) |
+| any of the three kernels compiles or links | **NOT RUN** | needs CANN 9.2 |
+| the unaligned ladder on CAModel | **NOT RUN** | needs Ascend950PR_9599, which the installed simulator set does not include (§7) |
 | the unaligned ladder on silicon | **NOT RUN** | needs a 950PR |
 | `NpuTargets.cmake` / `SimTargets.cmake` parse | **PASS** | isolated `cmake` include; a **parse**, not a build — the targets live inside `function(...)` bodies that this never executes |
 | the new harness compiles strictly | **PASS** | host stubs, `-Wall -Wextra -Werror`, host gate stage 4 |
@@ -141,14 +146,53 @@ leaves the same instructions in the same order (`Mul`, barrier, `ReduceRepeat`,
 barrier, `Brcb`, barrier, `Max`, `Sub`, `Exp`), and both halves are
 `__aicore__ inline` and called back to back.
 
-## 5. Deliberately not done
+## 5. The Cube operator, and why it is wired differently
 
-- **The Cube decode operator is not wired.**
-  `turboquant_paged_decode_attention.cpp` still derives its trip count from
-  capacity and still rounds the context up. `vector_decode_recur_strip_masked`
-  exists in the shared routine so the fix is reachable from there, but its
-  strip loop, its launcher and its verified eight-strip ladder have not been
-  touched. The AIC leg of the directive's §1 is therefore **open**.
+`turboquant_paged_decode_attention.cpp` is now wired too, but not the way the
+two AIV kernels are, and the difference is forced by the cross-core protocol
+rather than chosen.
+
+In `KERNEL_TYPE_MIX_AIC_1_2` the Cube announces a score panel per strip
+(`kFlagScoreReady`) and waits for the Vector core to release the slot
+(`kFlagScoreFree`). The Cube's per-page strip count is **one value for the
+whole page range** — `run_cube_core(..., strips, range.count, true)` — while
+the live strip count varies per page, since only the last live page is short.
+Shortening the Vector core's trip count the way the AIV kernels do would leave
+the Cube's announcements unconsumed and its waits unsatisfied: a hang, not a
+wrong number. Giving the Cube a per-page count would mean restructuring the
+frozen, verified strip pipeline.
+
+So here the strip count stays at **capacity**, every flag edge is issued
+exactly as before, and only the arithmetic inside `RecurStrip` varies — three
+ways, on a runtime `active`:
+
+| `active` | what runs |
+| --- | --- |
+| 16 | `vector_decode_recur_strip`, the unchanged aligned path |
+| 1..15 | `vector_decode_recur_strip_masked` |
+| 0 | **no recurrence at all**; the flags are still exchanged |
+
+Skipping a fully dead strip rather than masking it is what makes this correct
+without the trip-count change. Masking all sixteen lanes has the degenerate
+failure of §2 — the centred row is exactly 0, `exp(0)` is 1, and the strip adds
+16 to the denominator — and in this kernel that case is reachable, because a
+split whose entire page range lies past the live tail has no live strip to
+precede the dead ones. Carrying `(m, l, Acc)` untouched is exactly a zero
+contribution and is right regardless of order.
+
+That also makes an all-dead split publish the same exact neutral element as an
+empty split, by a different path through the kernel. The AIC ladder now
+exercises both: `tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp`
+gained seven unaligned rungs, including two with whole dead pages, and counts
+the split ranges that have pages to walk but no live token in any of them.
+`ReferenceAicPartial` masks the same tokens, so its untouched neutral state is
+what the comparison expects.
+
+The legacy validation entry (`camodel_paged_decode_attention`) keeps its ABI
+and declares its whole strip window live, so its ladder is bit-identical.
+
+## 6. Deliberately not done
+
 - **`out_scores` and `out_state` are not compared** in the unaligned harness,
   only the end-to-end gated context plus the output guard band. There is a
   specific trap here worth recording: the score archive is written from the
@@ -179,7 +223,71 @@ barrier, `Brcb`, barrier, `Max`, `Sub`, `Exp`), and both halves are
   unchanged at an unaligned length. A live-page count would be a new field and
   a new census rule; neither was added.
 
-## 6. Reproducing
+## 7. The toolchain, and a correction
+
+Earlier reports in this directory, and the header of
+`scripts/run_reshape_wave_host_gate.sh`, state that this machine has **no CANN
+toolkit**. That is wrong, and it was inherited rather than checked. What is
+actually installed, in the WSL Ubuntu-22.04 instance:
+
+| | |
+| --- | --- |
+| root | `/usr/local/Ascend` — `cann-8.5.0`, `ascend-toolkit`, `driver` |
+| compiler | `cann-8.5.0/tools/bisheng_compiler/bin/bisheng`, plus `bishengir-compile` |
+| simulators | ~38 of them, from `Ascend310` through `Ascend910_939x` and `Ascend920A` |
+| env | `ASCEND_HOME_PATH` and friends **unset**; `set_env.sh` present but not sourced |
+
+The conclusion the reports draw is still correct — the device legs cannot run
+here — but for three specific reasons, not for the absence of a toolkit:
+
+1. **No `dav-3510`.** The project targets arch35 / dav-3510. The installed
+   BiSheng knows `dav-2002 2201 3101 310r6 c100 c310 l100 l210 m100 m201 n350
+   t100`, and a search for `dav-3510` in the binary returns **zero** hits. The
+   per-architecture API implementations are `dav_c100`, `dav_c220`, `dav_m200`,
+   `dav_m300`, `dav_m310` — again no arch35.
+2. **No `Ascend950PR_9599` simulator.** The set stops well short of it, so the
+   CAModel leg is unavailable regardless of the compiler.
+3. **No `ReduceRepeat`.** The shared decode routines use
+   `AscendC::ReduceRepeat` throughout, and it appears in **zero** files of the
+   8.5.0 headers. So even retargeted at a supported architecture, these
+   routines would not compile. 8.5.0 and 9.2 are different API generations.
+
+### What it did settle
+
+Reading the real headers narrowed §1's assumption, which no amount of
+host C++ could do.
+`asc/include/basic_api/kernel_operator_vec_duplicate_intf.h` declares, as a
+Level 0 API:
+
+> `Duplicate(const LocalTensor<T>& dst, const T& scalarValue, uint64_t mask[], const uint8_t repeatTime, const uint16_t dstBlockStride, const uint8_t dstRepeatStride)`
+
+which is exactly the parameter shape `mask_tail_scores` passes, in that order
+and with those widths. And the `dav_c220` implementation of it is
+
+> `SetMask<T, isSetMask>(mask[1], mask[0]);` then `vector_dup(dstLocal, scalarValue, repeatTime, dstBlockStride, 1, dstRepeatStride, 0);`
+
+— it programs the hardware vector mask registers and then issues the
+instruction, which is precisely the mechanism the tail mask relies on, and the
+same mechanism every other masked call in this codebase uses.
+
+What it does **not** settle: no header in the install says what happens to the
+destination lanes the mask excludes. The doc comment is `dst[i] = scalar` and
+nothing more, and a search of the whole implementation and interface tree for
+any statement about unselected lanes returns nothing. So the assumption is
+narrowed from "does this overload exist and is the call well-formed" — yes, on
+this API generation — to "are deselected lanes preserved", which still needs a
+device run on 9.2.
+
+### One sharp edge found while reading
+
+That implementation is wrapped in `if ASCEND_IS_AIV`, so the masked
+`Duplicate` is a **no-op on a Cube core**. It is harmless here because the
+recurrence runs on the Vector core in all three kernels, the MIX_AIC_1_2 one
+included — `RecurStrip` is reached from `run_value_core`, not `run_cube_core`.
+But anything that later moves softmax arithmetic onto the Cube would lose the
+mask silently, which is the failure mode this whole report is about.
+
+## 8. Reproducing
 
 ```bash
 # host: everything this machine can establish, stages 4 and 6
@@ -196,6 +304,9 @@ cmake --build build_sim --target test_decode_single_token_unaligned_sim
 # with a 950PR
 cmake --build build_npu --target test_npu_decode_single_token_unaligned
 ./build_npu/test_npu_decode_single_token_unaligned
+
+# the Cube leg's unaligned rungs ride on the existing AIC suite
+./build_sim/test_decode_splitk_aic_sim      # or build_npu/test_npu_decode_splitk_aic
 ```
 
 Check §1's bit-mask assumption first. If it does not hold, every rung fails the

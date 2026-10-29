@@ -13,6 +13,22 @@ struct AicPartial {
 // Direct FP64 softmax over the uploaded bytes, independently for each M row.
 // Empty ranges carry a finite neutral state so external log-sum-exp combines
 // never form inf-inf. Rows share one KV cache, as packed GQA queries do.
+//
+// Tokens at or past `f.seq_len` are masked out, which makes this the oracle
+// for an unaligned context as well. Two things to note about how:
+//
+//   * a dead token's score is set to -inf rather than computed, because its
+//     scale slot holds a 0x7FC0BEEF canary and reading it would poison the
+//     row. The device has the same hazard in the same place, which is why its
+//     mask overwrites the lane instead of scaling it;
+//   * the second loop SKIPS dead tokens rather than weighting them by zero.
+//     exp(-inf - m) is 0, but 0 times a NaN payload is NaN, so the weight
+//     alone is not enough.
+//
+// A range with no live tokens at all therefore returns the untouched neutral
+// state -- which is exactly what the kernel publishes for such a range, since
+// it skips the recurrence on every fully dead strip and carries its seeded
+// (m, l, Acc) through.
 inline AicPartial ReferenceAicPartial(const Fixture& f, int request, int head,
                                       unsigned begin, unsigned pages)
 {
@@ -26,6 +42,10 @@ inline AicPartial ReferenceAicPartial(const Fixture& f, int request, int head,
         const auto qbase = ((request * f.heads + head) * kAicRows + row) * kChannels;
         for (unsigned i = 0; i < count; ++i) {
             const unsigned t = first + i;
+            if (t >= static_cast<unsigned>(f.seq_len)) {
+                scores[i] = -std::numeric_limits<double>::infinity();
+                continue;
+            }
             const auto physical = f.table[request * f.pages + t / f.page_tokens];
             const auto base = (static_cast<std::size_t>(physical) * f.heads + head) *
                               f.page_tokens * 128 + (t % f.page_tokens / 16) * 2048;
@@ -40,6 +60,7 @@ inline AicPartial ReferenceAicPartial(const Fixture& f, int request, int head,
         }
         for (unsigned i = 0; i < count; ++i) {
             const unsigned t = first + i;
+            if (t >= static_cast<unsigned>(f.seq_len)) continue;  // payload is a canary
             const auto physical = f.table[request * f.pages + t / f.page_tokens];
             const auto base = (static_cast<std::size_t>(physical) * f.heads + head) *
                               f.page_tokens * 128 + (t % f.page_tokens / 16) * 2048;
