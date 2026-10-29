@@ -58,10 +58,22 @@ python3 scripts/audit_cross_core_fences.py \
     tests/research/kernel_cluster_sync_probe.cpp || status=1
 
 echo
-echo "=== 3. host harnesses, -Wall -Wextra -Werror ==="
+# Directive 1. The device link failed on a function that carried no core-type
+# attribute; this audits that every function in the protocol header carries
+# one, links the header from two translation units, and lists the device
+# objects when a CANN build has produced any. Only the first two stages can
+# run here, and the script says so rather than implying a device check.
+echo "=== 3. device callability and linkage of the protocol header ==="
+python3 scripts/audit_device_symbols.py || status=1
+
+echo
+echo "=== 4. host harnesses, -Wall -Wextra -Werror ==="
 for f in tests/npu/validation/test_turboquant_a8_validation.cpp \
          tests/npu/validation/test_turboquant_bf16_validation.cpp \
          tests/npu/bench/bench_turboquant_reshape_and_cache.cpp \
+         tests/npu/bench/bench_turboquant_decode_splitk.cpp \
+         tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp \
+         tests/npu/validation/test_turboquant_decode_splitk_aiv_validation.cpp \
          tests/camodel/test_camodel_turboquant_reshape_and_cache_a8.cpp \
          tests/camodel/test_camodel_turboquant_reshape_and_cache_bf16.cpp \
          tests/research/test_cluster_sync_probe.cpp; do
@@ -77,7 +89,7 @@ for f in tests/npu/validation/test_turboquant_a8_validation.cpp \
 done
 
 echo
-echo "=== 4. Tier-1 host probe: the operator's arithmetic contract is unchanged ==="
+echo "=== 5. Tier-1 host probe: the operator's arithmetic contract is unchanged ==="
 printf '%-62s ' tests/cpu/test_reshape_and_cache_a8_probe.cpp
 if g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
        tests/cpu/test_reshape_and_cache_a8_probe.cpp \
@@ -91,7 +103,7 @@ else
 fi
 
 echo
-echo "=== 5. token/queue models ==="
+echo "=== 6. token/queue models ==="
 python3 tests/cpu/test_reshape_wave_model.py || status=1
 echo
 python3 tests/cpu/test_decode_ring_model.py | tail -4 || status=1

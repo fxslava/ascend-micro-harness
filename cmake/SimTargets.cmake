@@ -314,6 +314,35 @@ function(add_ascend_micro_sim_targets)
       BUILD_WITH_INSTALL_RPATH TRUE
       INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 
+  # ------------------------ split-K decode validation twins, on CAModel
+  # The simulator legs of NpuTargets.cmake's test_npu_decode_splitk_aic and
+  # test_npu_decode_splitk_aiv. These matter more than most sim twins here:
+  # the NPU legs need a 950PR this harness's development host does not have, so
+  # for anyone without one these are the only place the two split-K ladders
+  # actually run rather than merely compile. They are slow -- every rung is a
+  # real launch on the model -- so run them with a narrowed matrix when
+  # iterating, and read reports/decode_splitk_validation.md for which rungs
+  # have been executed on which leg.
+  foreach(leg aic aiv)
+    add_executable(test_decode_splitk_${leg}_sim
+        tests/npu/validation/test_turboquant_decode_splitk_${leg}_validation.cpp)
+    target_compile_definitions(test_decode_splitk_${leg}_sim PRIVATE
+        ASCEND_MICRO_DECODE_SPLITK_SIM)
+    target_include_directories(test_decode_splitk_${leg}_sim PRIVATE
+        "${ASCEND_HOME_PATH}/include")
+    target_link_libraries(test_decode_splitk_${leg}_sim PRIVATE
+        camodel_single_token_decode_splitk_kernel
+        camodel_paged_decode_attention_kernel ascendcl
+        "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+    target_link_options(test_decode_splitk_${leg}_sim PRIVATE
+        "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+    target_compile_options(test_decode_splitk_${leg}_sim PRIVATE
+        -Wall -Wextra -Werror)
+    set_target_properties(test_decode_splitk_${leg}_sim PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+  endforeach()
+
   # ------------------------------------------- mode-4 research probe, on CAModel
   # The simulator twin of NpuTargets.cmake's test_cluster_sync_probe: the same
   # tests/research/kernel_cluster_sync_probe.cpp, built against the model

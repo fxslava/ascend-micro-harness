@@ -129,6 +129,36 @@ function(add_ascend_micro_npu_targets)
   target_compile_options(bench_turboquant_decode_splitk PRIVATE
       -Wall -Wextra -Werror)
 
+  # ------------------------------ split-K decode validation (directive 3)
+  # The correctness ladders for the two split-K decode kernels. HARDWARE ONLY,
+  # on the same footing as the benchmark above and for the same reason: each
+  # rung is a real launch whose every emitted value is compared against the
+  # FP64 oracles in tests/common, so a build on a host with no 950PR
+  # establishes that the harness compiles and nothing about the kernels.
+  # `add_ascend_micro_sim_targets` registers the simulator twins, which is
+  # where these can actually run without a device.
+  #
+  # Both link both kernel libraries: the rigs they share live in one header
+  # (tests/npu/turboquant_splitk_rigs.hpp), so either driver may reference
+  # either launcher as the ladders grow.
+  add_executable(test_npu_decode_splitk_aic
+      tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp)
+  target_include_directories(test_npu_decode_splitk_aic PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_npu_decode_splitk_aic PRIVATE
+      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
+  target_compile_options(test_npu_decode_splitk_aic PRIVATE
+      -Wall -Wextra -Werror)
+
+  add_executable(test_npu_decode_splitk_aiv
+      tests/npu/validation/test_turboquant_decode_splitk_aiv_validation.cpp)
+  target_include_directories(test_npu_decode_splitk_aiv PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_npu_decode_splitk_aiv PRIVATE
+      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
+  target_compile_options(test_npu_decode_splitk_aiv PRIVATE
+      -Wall -Wextra -Werror)
+
   # ------------------------------------------------- mode-4 research probe
   # tests/research/kernel_cluster_sync_probe.cpp: one physical AI Core block,
   # 1 Cube + 2 Vector cores, no data, and a cyclic bilateral handshake over
@@ -164,11 +194,13 @@ function(add_ascend_micro_npu_targets)
 
   foreach(target test_turboquant_a8_validation test_turboquant_bf16_validation
       bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
+      test_npu_decode_splitk_aic test_npu_decode_splitk_aiv
       test_cluster_sync_probe)
     set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
   endforeach()
   add_custom_target(turboquant_npu_all DEPENDS
       test_turboquant_a8_validation test_turboquant_bf16_validation
-      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk)
+      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
+      test_npu_decode_splitk_aic test_npu_decode_splitk_aiv)
 endfunction()
