@@ -281,6 +281,26 @@ TQ_TAIL_FN constexpr bool WindowCoversSeqLen(std::uint32_t seq_len,
            WholeWindowTokens(page_begin, seq_pages, block_size, strip_begin, strips);
 }
 
+// Does this window contain at least one live token?
+//
+// Needed only by the entry points that NORMALIZE. With a live-aware trip
+// count, a window entirely past the live tail walks no strip at all and leaves
+// the denominator at its seeded 0, so an operator that divides by it produces
+// 0/0 -- a NaN context indistinguishable at a glance from a canary leak.
+// `WindowCoversSeqLen` does not catch this: a window can cover every live
+// token by ending after them while still starting after them too.
+//
+// Split-K entry points must NOT use this. There a worker with no live page is
+// required to emit the neutral element, and only the tail worker normalizes.
+TQ_TAIL_FN constexpr bool WindowHasLiveToken(std::uint32_t seq_len,
+                                             std::uint32_t page_begin,
+                                             std::uint32_t block_size,
+                                             std::uint32_t strip_begin)
+{
+    return static_cast<std::uint64_t>(seq_len) >
+           StripTokenBase(page_begin, block_size, strip_begin);
+}
+
 // More live tokens than the cache was allocated to hold.
 TQ_TAIL_FN constexpr bool SeqLenInCapacity(std::uint32_t seq_len,
                                            std::uint32_t cache_pages,
@@ -395,6 +415,21 @@ static_assert(SeqLenInCapacity(1023u, 8u, 128u) &&
                   SeqLenInCapacity(1024u, 8u, 128u) &&
                   !SeqLenInCapacity(1025u, 8u, 128u),
               "live tokens must fit the allocated cache");
+
+// A window must contain a live token, not merely end after one.
+static_assert(WindowHasLiveToken(1u, 0u, 128u, 0u),
+              "one live token is in the window that starts at token 0");
+static_assert(!WindowHasLiveToken(1u, 1u, 128u, 0u),
+              "but not in the window that starts at page 1 -- the case that "
+              "would divide by a zero denominator");
+static_assert(!WindowHasLiveToken(128u, 1u, 128u, 0u) &&
+                  WindowHasLiveToken(129u, 1u, 128u, 0u),
+              "the boundary is exact at a page start");
+static_assert(!WindowHasLiveToken(32u, 0u, 128u, 2u) &&
+                  WindowHasLiveToken(33u, 0u, 128u, 2u),
+              "and at a strip start inside a page");
+static_assert(!WindowHasLiveToken(0u, 0u, 128u, 0u),
+              "a zero-length context has no live token anywhere");
 
 // Monotonicity, which the trip count depends on.
 static_assert(WalkIsMonotone(0u, 8u, 128u) && WalkIsMonotone(2u, 4u, 128u) &&

@@ -20,37 +20,73 @@ tokens, masks the one partial strip, and records which gates ran.
 | fixture and oracle probe | `tests/cpu/test_decode_tail_probe.cpp` |
 | the unaligned ladder | `tests/npu/test_npu_decode_single_token_unaligned.cpp` |
 
-## 1. The mask is a write, not a multiply
+## 1. The mask is a selection, and there were two NaN paths
 
-This is the one design decision in the change, and it is forced rather than
-chosen.
+The first revision of this work masked the score lanes with a bit-masked
+`Duplicate`, and recorded one unverified assumption: that a vector instruction
+leaves its *deselected* destination lanes unmodified. A physical 950PR run
+**disproved it**:
 
-The obvious masking is multiplicative: keep lanes `[0, active)` and multiply
-the rest by zero. That is wrong here, because the per-token key **scale** of a
-never-written cache slot is an arbitrary FP32 bit pattern, and under the
-isolated-canary protocol this harness already uses
-(`tests/camodel/test_camodel_single_token_decode_aiv.cpp`) it is deliberately
-`0x7FC0BEEF`, a quiet NaN. `0 * NaN` is NaN. A multiplicative mask would
-propagate the canary straight through `m`, `l`, `Acc`, the butterfly and the
-gate — and fail the very test meant to prove the mask works.
+```
+CANARY LEAK S=1 item=0 row=0 c=0: context is not finite,
+a cache slot past seq_len reached the softmax
+```
 
-So `mask_tail_scores` **overwrites** the dead lanes with `kMaskedScore`
-(`-3.0e38f`) using a bit-masked `Duplicate`, discarding whatever the unmasked
-`Mul` computed there. `exp(kMaskedScore - m)` then underflows to `+0`, so a
-masked lane adds exactly `0` to the denominator and exactly `0` to every
-channel of the accumulator. There is deliberately no second place where a lane
-count has to be right: phases 2 to 5 are the aligned ones, untouched.
+The CANN 9.2 `dav_3510` implementation shows why it was never a safe bet. The
+bit-mask form of `Duplicate` goes through `VecDupLevel0Template`, which
+allocates a temporary UB buffer and issues its own `V_S` fence — a great deal
+of hidden machinery to rest "the other lanes keep their old value" on, and a
+property no header in the toolkit states.
 
-The same NaN hazard exists on the host, and the oracle handles it the same way
-— it skips the dead payload rather than weighting it by zero. The comparison is
-therefore between two independently masked computations.
+It is now an explicit selection, and that is a different mechanism rather than
+a different spelling: a `Select` **writes every lane**, choosing per lane
+between two sources from a predicate, so there is no preserved lane to depend
+on and the canary cannot survive by omission.
 
-**The one assumption, and the first thing a device run must check:** that in
-bit-mask mode a vector instruction leaves the *deselected* destination lanes
-unmodified. If this part does not honour that, the fallback is `Compare` into a
-select mask plus `Select` in TENSOR_SCALAR mode — one more scratch operand and
-a 16-lane ramp, but no assumption about untouched lanes. The fallback is named
-in the code at the point it would be needed.
+```
+select_tail(active)   Compares(tail_sel, lane_index, active, CMPMODE::LT)
+mask_tail_scales()    Select(key_scale,   tail_sel, key_scale,   zero_fill)
+                      Select(value_scale, tail_sel, value_scale, zero_fill)
+mask_tail_scores()    Select(scaled_row,  tail_sel, scaled_row,  masked_fill)
+clamp_tail_probs()    Select(p_scaled,    tail_sel, p_scaled,    zero_fill)
+```
+
+### The second NaN path, which masking the scores did not close
+
+Equally important, and a mistake in the first revision's own reasoning. It
+claimed "phases 2 to 5 need no lane count at all". That is false:
+
+```
+fold_value_scale:  p_scaled = p * value_scale
+```
+
+reads the per-token **value** scale, and a dead slot holds the canary there
+too. The score mask makes `p` exactly `0` on a dead lane, but `0 * NaN` is
+NaN, so the accumulator was poisoned through a path the score mask never
+touched — while the denominator `l` stayed clean, because it sums `p`, not
+`p_scaled`. That is precisely the observed failure: a non-finite **context**
+with a plausible `l`. It would have leaked at S = 1 even if the `Duplicate`
+had behaved.
+
+### Why the scales are masked before the multiplies, not after
+
+Masking only the *results* left both multiplies reading a dead lane's canary
+and relying on a later `Select` to discard the answer. That passes, and the
+CAModel still logged **306** `vec_err_idata_inf_nan_t0` errors — NaN reaching
+a vector instruction's input. Masking the two scale vectors first takes that to
+18 (§5). A kernel that hands NaN to the vector unit and overwrites the result
+is one assertion away from failing, and it fills the model's error log so a
+real hazard could not be seen in it.
+
+`mask_tail_scales` runs once per strip, in the strip entry point, because the
+two scales are strip inputs shared by all 16 queries. The probability clamp is
+now redundant by construction — a zeroed value scale already gives
+`p_scaled = 0` — and is kept anyway: one instruction on one strip, on a path
+that has leaked once.
+
+The host oracle masks the same tokens and skips the dead payload rather than
+weighting it by zero, for the same NaN reason. The comparison is between two
+independently masked computations.
 
 ## 2. Dead strips are dropped, not masked
 
@@ -117,28 +153,36 @@ arithmetic comparison is close to being unable to tell a masked kernel from an
 unmasked one, and the real discriminator is the NaN canary, which fails hard
 rather than by a margin. Both checks are in the harness; neither is redundant.
 
-## 4. What has NOT run
+## 4. The device gates: what has run, and what has not
 
-There **is** a CANN toolkit on this machine — see §7, which corrects a claim
-carried through the earlier reports — but it is CANN 8.5.0 and it does not know
-this part. No 950PR either.
+This table changed substantially once the CANN 9.2 container was used (§7).
+The device half of this work is now compiled and **run**.
 
-| gate | status | why |
+| gate | status | evidence |
 | --- | --- | --- |
-| the masking phase compiles | **NOT RUN** | needs CANN 9.2 / dav-3510; the installed 8.5.0 has no such target, and no `ReduceRepeat` at all (§7) |
-| the bit-mask assumption in §1 | **NARROWED, NOT CLOSED** | the overload exists with exactly this parameter shape, and its implementation programs the hardware vector mask — but no header states what becomes of the deselected lanes (§7) |
-| any of the three kernels compiles or links | **NOT RUN** | needs CANN 9.2 |
-| the unaligned ladder on CAModel | **NOT RUN** | needs Ascend950PR_9599, which the installed simulator set does not include (§7) |
-| the unaligned ladder on silicon | **NOT RUN** | needs a 950PR |
-| `NpuTargets.cmake` / `SimTargets.cmake` parse | **PASS** | isolated `cmake` include; a **parse**, not a build — the targets live inside `function(...)` bodies that this never executes |
-| the new harness compiles strictly | **PASS** | host stubs, `-Wall -Wextra -Werror`, host gate stage 4 |
-| the three already-committed split-K harnesses still compile | **PASS** | the fixture change is source-compatible |
+| the bit-mask `Duplicate` assumption | **DISPROVED** | a physical 950PR run leaked the canary at S = 1; see §1 |
+| all three decode kernels compile for `dav-3510` | **PASS** | CANN 9.2.0-beta.2 container, `ccec` + `ld.lld -m aicorelinux`, zero errors |
+| the masking phase compiles | **PASS** | same build; `CreateVecIndex`, `Compares` and `Select` all resolve for `dav_3510` |
+| the UB arena still fits | **PASS** | the four new operands are inside `kArenaEnd`, which every kernel `static_assert`s |
+| S = 1 on CAModel (`Ascend950PR_9589`, `dav_3510`) | **PASS** | 1 live token, 15 canary lanes; context finite and within tolerance of the FP64 oracle |
+| S = 17 on CAModel | **PASS** | one full strip then a strip with 1 live lane |
+| canaries beyond S untouched | **PASS** | the runner asserts it per rung; `0x7FC0BEEF` in both scale planes |
+| the zero-active bypass | **PASS** | 2 split ranges per rung landed entirely past the live tail and published the exact neutral element |
+| NaN never reaches a vector instruction's input | **NOT CLEAN** | 306 → 18 `vec_err_idata_inf_nan_t0`, still 18 at 2 PCs; see §5 |
+| the full ladder (S up to 1023) on CAModel | **NOT RUN** | deliberately: hours of model time, and longer rungs add pages, not tail cases |
+| anything on silicon | **NOT RUN** | the leak that started this was reported from a 950PR; the fix has not been back-tested there |
+| `NpuTargets.cmake` / `SimTargets.cmake` parse | **PASS** | and now a real build, not just a parse |
+| every harness compiles strictly on the host | **PASS** | host stubs, `-Wall -Wextra -Werror`, host gate stage 4 |
 
-**No rung of the unaligned ladder has executed.** The device half of this
-change — the two instructions that do the masking — has not been compiled, let
-alone run. What has been established is which tokens are live, that the oracle
-masks them correctly, and that masking is observable. That is the half this
-machine can settle, and it is not the half that proves the kernel.
+Run detail, from `scripts/run_decode_tail_container.sh`: 2 rungs, 2 plain-AIV
+launches and 4 split-K launches, 16 AICs × 2 vector cores, 427,102 ticks,
+545,790 ms of model time, `run status: 0`.
+
+**What a pass here does and does not mean.** It means the mask works at the two
+tail shapes, on the real `dav_3510` model, against an independently masked FP64
+oracle, with a quiet-NaN canary in every dead slot. It does not mean the
+operator is clean: §5 records 18 remaining NaN-input errors, and nothing here
+has run on silicon since the fix.
 
 The frozen Cube path is unchanged by reading rather than by compiling:
 splitting `update_max_and_alpha` into `scale_row` + `reduce_max_and_alpha`
@@ -191,6 +235,45 @@ what the comparison expects.
 The legacy validation entry (`camodel_paged_decode_attention`) keeps its ABI
 and declares its whole strip window live, so its ladder is bit-identical.
 
+## 5a. The 18 that are left
+
+Masking the two scales took `vec_err_idata_inf_nan_t0` from 306 occurrences at
+6 PCs down to **18 at 2 PCs** — 6 at one site and 12 at another, across 6
+launches, so once and twice per launch respectively. The run passes; these are
+the model reporting NaN or Inf reaching a vector instruction's *input*, which a
+kernel can do and still emit a correct answer if it overwrites the result.
+
+It is not diagnosed. The two sites are not the four that masking the scales
+removed, and the PCs shifted with the code change, so they cannot be mapped
+back from the earlier log. The obvious candidates are ruled out: the GEMV
+multiplies dequantised int4 by a BF16 query, both finite by construction, and
+`p_scaled`, `p_x4` and the value page are all clean once the scales are. A
+per-launch count points at the prologue or the epilogue rather than the strip
+loop.
+
+Resolving it needs a trace with symbols — `ccec -g` and the instruction dump
+the trace audit already parses for the reshape operator — not another guess.
+Until then this is an open hazard with a known bound, recorded rather than
+implied, and it is the reason the matrix above says NOT CLEAN rather than PASS.
+
+## 5b. A hole the live-aware trip count opened
+
+Worth recording because it did not exist before this work and is not a tail
+bug at all. With a live-aware trip count, a window that starts past the last
+live token walks no strip, so the plain single-token operator carries `l = 0`
+into an epilogue that divides by it: 0/0, a NaN context from an entirely
+different cause, easily mistaken for a canary leak.
+
+`WindowCoversSeqLen` does not catch it — a window can cover every live token by
+ending after them while also starting after them. `WindowHasLiveToken` does,
+with its own static_asserts, and it is refused at both the device guard and the
+launcher.
+
+Split-K deliberately does **not** use it: there a worker with no live page is
+required to emit the neutral element, and only the tail worker normalizes. As
+long as `seq_len >= 1`, page 0 is live and the split owning it is not neutral,
+so the sum the tail divides by is nonzero.
+
 ## 6. Deliberately not done
 
 - **`out_scores` and `out_state` are not compared** in the unaligned harness,
@@ -223,12 +306,34 @@ and declares its whole strip window live, so its ladder is bit-identical.
   unchanged at an unaligned length. A live-page count would be a new field and
   a new census rule; neither was added.
 
-## 7. The toolchain, and a correction
+## 7. The toolchain: a CANN 9.2 container, and two corrections
 
-Earlier reports in this directory, and the header of
-`scripts/run_reshape_wave_host_gate.sh`, state that this machine has **no CANN
-toolkit**. That is wrong, and it was inherited rather than checked. What is
-actually installed, in the WSL Ubuntu-22.04 instance:
+**The correction that matters most: there is a CANN 9.2 container on this
+machine, and it builds and runs this project.**
+
+```
+ascendai/cann:9.2.0-beta.2-910b-ubuntu22.04-py3.12   (image b82c08f530f9)
+```
+
+It is CANN 9.2.0-beta.2 — the version the project targets — and it has
+everything the earlier reports said was missing: `dav-3510` in BiSheng's target
+list, a `dav_3510` per-architecture API tree, and the `Ascend950PR_9599`
+simulator. `CMakeLists.txt` already defaults `ASCEND_HOME_PATH` to
+`/usr/local/Ascend/cann-9.2.0-beta.2` and `SOC_VERSION` to
+`Ascend950PR_9599`, so the build needs no arguments at all inside it;
+`scripts/run_decode_tail_container.sh` is the whole recipe. Every "needs CANN
+9.2" and "needs Ascend950PR_9599" row in the earlier reports was therefore
+answerable all along, and several are now answered.
+
+The image is tagged `910b`, which is a red herring: the toolkit it carries is
+not limited to that part.
+
+### The second correction, about the WSL instance
+
+Separately, earlier reports and the header of
+`scripts/run_reshape_wave_host_gate.sh` state that this machine has **no CANN
+toolkit** at all. That is also wrong. What is installed directly in the WSL
+Ubuntu-22.04 instance — distinct from the container above — is:
 
 | | |
 | --- | --- |
@@ -237,8 +342,10 @@ actually installed, in the WSL Ubuntu-22.04 instance:
 | simulators | ~38 of them, from `Ascend310` through `Ascend910_939x` and `Ascend920A` |
 | env | `ASCEND_HOME_PATH` and friends **unset**; `set_env.sh` present but not sourced |
 
-The conclusion the reports draw is still correct — the device legs cannot run
-here — but for three specific reasons, not for the absence of a toolkit:
+That 8.5.0 install cannot build this project, for three specific reasons — but
+note that the conclusion the earlier reports drew from it, that the device legs
+cannot run *at all on this machine*, was wrong, because of the container above.
+The three reasons 8.5.0 itself is unusable here:
 
 1. **No `dav-3510`.** The project targets arch35 / dav-3510. The installed
    BiSheng knows `dav-2002 2201 3101 310r6 c100 c310 l100 l210 m100 m201 n350
@@ -252,10 +359,12 @@ here — but for three specific reasons, not for the absence of a toolkit:
    8.5.0 headers. So even retargeted at a supported architecture, these
    routines would not compile. 8.5.0 and 9.2 are different API generations.
 
-### What it did settle
+### What reading 8.5.0's headers settled
 
-Reading the real headers narrowed §1's assumption, which no amount of
-host C++ could do.
+This was done before the container was found, and it narrowed §1's assumption
+without closing it. The container then closed it the other way: the
+assumption was **false**, and the physical run had already shown it. Kept here
+because the mechanism is still the explanation.
 `asc/include/basic_api/kernel_operator_vec_duplicate_intf.h` declares, as a
 Level 0 API:
 
@@ -290,7 +399,14 @@ mask silently, which is the failure mode this whole report is about.
 ## 8. Reproducing
 
 ```bash
-# host: everything this machine can establish, stages 4 and 6
+# the device leg: build for dav-3510 and run the two tail-tile rungs
+docker run --rm -v "$(pwd)":/workspace -w /workspace \
+    ascendai/cann:9.2.0-beta.2-910b-ubuntu22.04-py3.12 \
+    bash scripts/run_decode_tail_container.sh
+# then grep the log for vec_err_idata_inf_nan -- a pass with those in it is
+# not a clean run (section 5a)
+
+# host: the arithmetic and the oracle, stages 4 and 6
 bash scripts/run_reshape_wave_host_gate.sh
 
 # the two tail checks on their own

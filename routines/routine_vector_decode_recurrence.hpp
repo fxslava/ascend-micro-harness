@@ -123,6 +123,17 @@ struct NativeDecodeRecurrenceEngine {
     AscendC::LocalTensor<float> weighted_sum;  // kDecodeChannels
     AscendC::LocalTensor<float> acc_scaled;    // kDecodeChannels
 
+    // ---- tail-mask scratch, for a partial strip --------------------------
+    // Four operands, primed once per kernel by `prime_tail_mask` and then read
+    // without being rewritten. The three float buffers each need a 256-byte
+    // WRITE pad, not 64 bytes: `CreateVecIndex` and `Duplicate` both write a
+    // whole vector register regardless of the lane count, which is the same
+    // rule this header already records for `Brcb`.
+    AscendC::LocalTensor<float> lane_index;     // kDecodeKeys: 0, 1, ... 15
+    AscendC::LocalTensor<float> masked_fill;    // kDecodeKeys of kMaskedScore
+    AscendC::LocalTensor<float> zero_fill;      // kDecodeKeys of +0.0f
+    AscendC::LocalTensor<std::uint8_t> tail_sel;  // one bit per key lane
+
     static constexpr std::int32_t kKeyLanes = static_cast<std::int32_t>(kDecodeKeys);
     static constexpr std::int32_t kKeyBlocks =
         static_cast<std::int32_t>(kDecodeKeyBlocks);
@@ -188,53 +199,106 @@ struct NativeDecodeRecurrenceEngine {
         AscendC::Mul(scaled_row, panel_row, key_scale, kKeyLanes);
     }
 
-    // Phase 1m. The tail mask, for the one strip of a sequence that is partly
-    // live: overwrite the score lanes at and past `active` with
-    // `masked_score`, so that `exp(masked_score - m)` underflows to +0 and the
-    // lane contributes exactly nothing to the denominator l or to any channel
-    // of the accumulator Acc.
+    // Primed once per kernel, before the first strip. Reads nothing that
+    // changes, so it is hoisted out of the strip loop entirely.
     //
-    // A bit-masked WRITE, not arithmetic, and that distinction is the whole
-    // point. A multiplicative keep-mask (`scaled_row * {1,..,1,0,..,0}`) would
-    // be enough if the dead lanes held finite garbage, but they do not: the
-    // per-token key SCALE of a never-written cache slot is an arbitrary FP32
-    // bit pattern, and under the isolated-canary protocol the harness uses it
-    // is deliberately 0x7FC0BEEF -- a quiet NaN. `0 * NaN` is NaN, so a
-    // multiplicative mask would propagate the canary into m, l and Acc and
-    // fail the very test that is supposed to prove the mask works. Overwriting
-    // the lane discards whatever `scale_row` computed there instead of scaling
-    // it, so the garbage cannot survive.
-    //
-    // `scale_row`'s unmasked `Mul` does read those lanes, and may produce NaN
-    // in them. That is harmless precisely because this phase overwrites them
-    // before the first reduction looks at the row; it is also why the mask
-    // cannot be deferred any later than here.
-    //
-    // THE ONE ASSUMPTION, and the first thing a device run must confirm: in
-    // bit-mask mode a vector instruction leaves the DESELECTED destination
-    // lanes unmodified. If that is not so on this part, the fallback is
-    // `Compare` into a select mask plus `Select` in TENSOR_SCALAR mode, which
-    // needs one more scratch operand and a 16-lane ramp constant but makes no
-    // assumption about untouched lanes.
-    //
-    // REQUIRES `0 < active < 16`. A fully live strip must take the unmasked
-    // path, and an entirely dead strip must not be walked at all -- with every
-    // lane masked, `m_new` would be `masked_score`, the centred row exactly 0,
-    // `exp(0)` exactly 1, and the strip would add 16 to l instead of 0.
-    // `turboquant_decode_tail::LiveStripsInWindow` is what keeps dead strips
-    // out of the trip count.
-    __aicore__ inline void mask_tail_scores(std::uint32_t active, float masked_score)
+    // `lane_index` is the key-lane ramp the predicate compares against;
+    // `masked_fill` and `zero_fill` are the two constants the selects pull
+    // from. All three are built by APIs that take a plain element count, which
+    // is the form that does not touch the hardware mask registers.
+    __aicore__ inline void prime_tail_mask(float masked_score)
     {
-        // Lanes [active, 16) of one repeat. The shift is bounded because
-        // `active` is at most 15 here, and the mask is a scalar computed from a
-        // kernel operand -- no Unified Buffer is read, so this is not the
-        // scalar trip the zero-scalar-compute invariant forbids.
-        std::uint64_t drop[2] = {
-            (static_cast<std::uint64_t>(0xFFFFu) &
-             ~((static_cast<std::uint64_t>(1u) << active) - 1u)),
-            0u};
-        AscendC::Duplicate(scaled_row, masked_score, drop, 1, 1,
-                           static_cast<std::uint8_t>(kKeyBlocks));
+        AscendC::CreateVecIndex(lane_index, 0.0f, kDecodeKeys);
+        AscendC::Duplicate(masked_fill, masked_score, kKeyLanes);
+        AscendC::Duplicate(zero_fill, 0.0f, kKeyLanes);
+    }
+
+    // Phase 1m-a. The predicate for this strip: lane < active, one bit per key
+    // lane. Computed ONCE per strip, in the strip-level entry point, because
+    // all 16 queries of a strip share the same live lane count.
+    //
+    // `active` reaches the vector unit as a scalar operand of `Compares`, not
+    // as a mask register and not through Unified Buffer, so this is the same
+    // permitted kind of scalar work as `select_query`'s address arithmetic.
+    __aicore__ inline void select_tail(std::uint32_t active)
+    {
+        AscendC::Compares(tail_sel, lane_index, static_cast<float>(active),
+                          AscendC::CMPMODE::LT, kDecodeKeys);
+    }
+
+    // Phase 1m-0. Replace the dead lanes of BOTH per-token scales with +0,
+    // before either multiply reads them.
+    //
+    // Without this the kernel is numerically correct but still feeds NaN into
+    // two F32 vector multiplies per partial strip, which the CAModel reports
+    // as `vec_err_idata_inf_nan_t0` -- 306 of them in the S=1/S=17 run that
+    // otherwise passed. The results were discarded by the Selects that follow,
+    // so the context came out clean, but an operator that hands NaN to the
+    // vector unit and relies on overwriting the answer is one assertion away
+    // from a failure, and it makes the model's error log useless for spotting
+    // a real hazard.
+    //
+    // Masking in place is safe: the recurrence is the last reader of both
+    // scale vectors in this ring slot, and the slot's MTE2 refill edge is not
+    // released until after it.
+    //
+    // Zero is the right fill for both. The key scale then makes the dead
+    // score lane exactly 0 -- which is why `mask_tail_scores` below is still
+    // needed to push it to `masked_score` -- and the value scale makes the
+    // dead probability lane exactly 0 before the contraction.
+    __aicore__ inline void mask_tail_scales()
+    {
+        AscendC::Select(key_scale, tail_sel, key_scale, zero_fill,
+                        AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, kDecodeKeys);
+        AscendC::Select(value_scale, tail_sel, value_scale, zero_fill,
+                        AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, kDecodeKeys);
+    }
+
+    // Phase 1m-b. Force the dead score lanes to `masked_score` by SELECTION.
+    //
+    // This replaces a bit-masked `Duplicate`, and the replacement is the whole
+    // point of this revision. The masked write rested on an unstated property
+    // -- that a vector instruction leaves its deselected destination lanes
+    // untouched -- and a physical 950PR run disproved it: at S = 1 the context
+    // came back non-finite, the canary having survived into the softmax. The
+    // CANN 9.2 dav_3510 implementation shows why it was never a safe bet; the
+    // bit-mask form allocates a temporary UB buffer and issues its own V_S
+    // fence rather than being the single gated instruction it looks like.
+    //
+    // A `Select` writes EVERY lane, choosing per lane between two sources from
+    // a predicate. There is no "preserved" lane to depend on, so the canary
+    // cannot survive by omission. It is also not arithmetic: the dead lane's
+    // NaN is discarded rather than multiplied, which a keep-mask could not do.
+    //
+    // REQUIRES `select_tail` to have run for this strip, and `0 < active < 16`.
+    // A fully live strip takes the unmasked path; an entirely dead strip must
+    // not be walked at all -- with every lane masked `m_new` would be
+    // `masked_score`, the centred row exactly 0, `exp(0)` exactly 1, and the
+    // strip would add 16 to l instead of 0.
+    __aicore__ inline void mask_tail_scores()
+    {
+        AscendC::Select(scaled_row, tail_sel, scaled_row, masked_fill,
+                        AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, kDecodeKeys);
+    }
+
+    // Phase 4m. Clamp the dead probability lanes to exactly +0, before the
+    // value contraction reads them.
+    //
+    // This is the SECOND NaN path, and the one masking the scores does not
+    // close. `p_scaled = p * value_scale` reads the per-token VALUE scale, and
+    // a never-written cache slot holds the 0x7FC0BEEF canary there too. The
+    // score mask makes `p` exactly 0 on a dead lane, but `0 * NaN` is NaN, so
+    // the product was poisoned and the NaN then spread over all 256 channels
+    // through `p_x4` and the repeat-form `Mul`. The denominator l was fine --
+    // it sums `p`, not `p_scaled` -- which is exactly why this leaked as a
+    // non-finite CONTEXT with a plausible l.
+    //
+    // Selecting +0 here means the contraction multiplies the value page by a
+    // true zero, so an uninitialised V line cannot interact with it at all.
+    __aicore__ inline void clamp_tail_probabilities()
+    {
+        AscendC::Select(p_scaled, tail_sel, p_scaled, zero_fill,
+                        AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, kDecodeKeys);
     }
 
     __aicore__ inline void reduce_max_and_alpha()
@@ -260,14 +324,16 @@ struct NativeDecodeRecurrenceEngine {
         reduce_max_and_alpha();
     }
 
-    // The same phase for a partial strip: one extra instruction and one extra
-    // barrier, issued only on the strip that needs them.
-    __aicore__ inline void update_max_and_alpha_masked(std::uint32_t active,
-                                                       float masked_score)
+    // The same phase for a partial strip. The predicate is already built, so
+    // this is one extra instruction and one extra barrier over the aligned
+    // path, on the one strip that needs them.
+    __aicore__ inline void update_max_and_alpha_masked()
     {
+        // `mask_tail_scales` has already run for this strip, in the entry
+        // point, so the scales reaching `scale_row` are finite.
         scale_row();
         AscendC::PipeBarrier<PIPE_V>();
-        mask_tail_scores(active, masked_score);
+        mask_tail_scores();
         AscendC::PipeBarrier<PIPE_V>();
         reduce_max_and_alpha();
     }
@@ -297,10 +363,17 @@ struct NativeDecodeRecurrenceEngine {
     // Phase 4. Fold the value scale into P, replicate P into one 64-lane
     // block, form all 4096 products in one repeat-form Mul, reduce over the
     // 16 contiguous keys of each channel, and rescale the accumulator.
-    __aicore__ inline void update_accumulator()
+    // Split into `fold_value_scale` and `contract_values` so that a partial
+    // strip can clamp the probabilities between the two. Both halves are
+    // `__aicore__ inline` and called back to back below, so the aligned path
+    // issues the same instructions in the same order as before the split.
+    __aicore__ inline void fold_value_scale()
     {
         AscendC::Mul(p_scaled, p, value_scale, kKeyLanes);
-        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void contract_values()
+    {
         // p_x4[j] = p_scaled[j % 16] for j < 64: four repeats of 16 lanes,
         // destination advancing two DataBlocks, source standing still.
         AscendC::Adds(p_x4, p_scaled, 0.0f, kKeyLanes, 4,
@@ -328,6 +401,24 @@ struct NativeDecodeRecurrenceEngine {
                      AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 0));
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(acc_cur, acc_scaled, weighted_sum, kChannelLanes);
+    }
+
+    __aicore__ inline void update_accumulator()
+    {
+        fold_value_scale();
+        AscendC::PipeBarrier<PIPE_V>();
+        contract_values();
+    }
+
+    // The same phase for a partial strip, with the dead probability lanes
+    // clamped to +0 before anything reads them.
+    __aicore__ inline void update_accumulator_masked()
+    {
+        fold_value_scale();
+        AscendC::PipeBarrier<PIPE_V>();
+        clamp_tail_probabilities();
+        AscendC::PipeBarrier<PIPE_V>();
+        contract_values();
     }
 
     // Phase 5. Commit the carried state. An Adds by 0.0f is an exact FP32 copy
@@ -392,35 +483,49 @@ __aicore__ inline void vector_decode_recur_rows(Engine& engine, std::uint32_t ro
 // One query's recurrence over a PARTIAL strip: the first `active` key lanes
 // are live, the rest are masked out of the softmax entirely.
 //
-// Only phase 1 differs. Phases 2 to 5 are the aligned ones, unchanged and
-// uninstrumented, because the mask has already done its work by then: the
-// masked lanes carry `masked_score`, so `exp` underflows them to +0, the
-// denominator adds 0 and `p_scaled` contracts 0 into every channel. There is
-// deliberately no second place where a lane count has to be got right.
+// TWO phases differ, not one, and the second was learned the hard way. Phase 1
+// forces the dead score lanes to `masked_score`, so `exp` underflows them to
+// +0 and the denominator adds nothing. Phase 4 then clamps the dead
+// PROBABILITY lanes to +0, because `p_scaled = p * value_scale` reads the
+// value scale of a dead slot -- a 0x7FC0BEEF canary -- and `0 * NaN` is NaN.
+// Masking the scores alone left that path open, and a physical 950PR run at
+// S = 1 found it as a non-finite context.
+//
+// Phases 2, 3 and 5 are the aligned ones, untouched. The caller must have run
+// `select_tail(active)` for this strip.
 template <class Engine>
-__aicore__ inline void vector_decode_recur_query_masked(Engine& engine,
-                                                        std::uint32_t active,
-                                                        float masked_score)
+__aicore__ inline void vector_decode_recur_query_masked(Engine& engine)
 {
-    engine.update_max_and_alpha_masked(active, masked_score);
+    engine.update_max_and_alpha_masked();
     engine.exponentiate_scores();
     engine.update_denominator();
-    engine.update_accumulator();
+    engine.update_accumulator_masked();
     engine.commit_state();
 }
 
 // The partial strip at a RUNTIME row count: the single-token decode
 // operators' tail strip. `active` must be in 1..15; a full strip takes
 // `vector_decode_recur_rows` and a dead strip is not walked.
+//
+// The predicate is built once here rather than per query: every query of a
+// strip shares the same live lane count, so 16 `Compares` would compute the
+// same 16 bits sixteen times.
 template <class Engine>
 __aicore__ inline void vector_decode_recur_rows_masked(Engine& engine,
                                                        std::uint32_t rows,
-                                                       std::uint32_t active,
-                                                       float masked_score)
+                                                       std::uint32_t active)
 {
+    engine.select_tail(active);
+    AscendC::PipeBarrier<PIPE_V>();
+    // Per strip, not per query: the two scale vectors are strip inputs shared
+    // by every query, so masking them inside the query loop would redo the
+    // same two Selects `rows` times -- and the second pass would be masking
+    // already-masked data.
+    engine.mask_tail_scales();
+    AscendC::PipeBarrier<PIPE_V>();
     for (std::uint32_t query = 0; query < rows; ++query) {
         engine.select_query(query);
-        vector_decode_recur_query_masked(engine, active, masked_score);
+        vector_decode_recur_query_masked(engine);
     }
 }
 
@@ -430,12 +535,15 @@ __aicore__ inline void vector_decode_recur_rows_masked(Engine& engine,
 // is a separate change and has NOT been made.
 template <class Engine>
 __aicore__ inline void vector_decode_recur_strip_masked(Engine& engine,
-                                                        std::uint32_t active,
-                                                        float masked_score)
+                                                        std::uint32_t active)
 {
+    engine.select_tail(active);
+    AscendC::PipeBarrier<PIPE_V>();
+    engine.mask_tail_scales();
+    AscendC::PipeBarrier<PIPE_V>();
     for (std::uint32_t query = 0; query < kDecodeQueries; ++query) {
         engine.select_query(query);
-        vector_decode_recur_query_masked(engine, active, masked_score);
+        vector_decode_recur_query_masked(engine);
     }
 }
 

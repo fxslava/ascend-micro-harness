@@ -50,6 +50,7 @@
 #include <cmath>
 #include <cstdio>
 #include <exception>
+#include <string>
 #include <vector>
 
 #include "../../kernels/ops/turboquant/turboquant_decode_tail.hpp"
@@ -204,12 +205,24 @@ struct TailRig {
 };
 
 // ------------------------------------------------------------------- ladder
-int run()
+// --single-tile-canary restricts the sweep to the two rungs that live inside
+// a single 16-token tile's worth of tail: S = 1, which is one live token and
+// fifteen canary lanes in the only strip, and S = 17, which is one full strip
+// followed by a strip holding a single live token. Those are the two shapes
+// the mask has to get right; every longer rung adds pages, not cases, and on
+// CAModel a full context costs hours for no extra coverage of the tail.
+int run(bool single_tile)
 {
     tq_npu::Session session;
 
-    const std::vector<int> ladder = {1, 7, 15, 17, 31, 33, 127, 129, 255, 257, 1023};
-    const std::vector<int> splits = {1, 2, 4, 8};
+    const std::vector<int> ladder =
+        single_tile ? std::vector<int>{1, 17}
+                    : std::vector<int>{1, 7, 15, 17, 31, 33, 127, 129, 255, 257, 1023};
+    const std::vector<int> splits =
+        single_tile ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 4, 8};
+
+    std::printf("=== single-token decode, unaligned context%s ===\n",
+                single_tile ? " (single-tile canary)" : "");
 
     int rungs = 0, plain_launches = 0, splitk_launches = 0, dead_splits = 0;
     for (const int seq_len : ladder) {
@@ -277,10 +290,24 @@ int run()
 
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    bool single_tile = false;
+    for (int arg = 1; arg < argc; ++arg) {
+        const std::string option = argv[arg];
+        if (option == "--single-tile-canary") {
+            single_tile = true;
+        } else {
+            std::fprintf(stderr,
+                         "usage: %s [--single-tile-canary]\n"
+                         "  --single-tile-canary  only S=1 and S=17, the two "
+                         "tail-tile shapes\n",
+                         argv[0]);
+            return 2;
+        }
+    }
     try {
-        return run();
+        return run(single_tile);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL single-token unaligned decode: %s\n", error.what());
         return 1;

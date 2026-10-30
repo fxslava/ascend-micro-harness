@@ -189,9 +189,20 @@ constexpr std::uint32_t kUbGate = NextSlot(kUbRotated, kMaxRows * kHeadSize * 4u
 constexpr std::uint32_t kUbGateA = NextSlot(kUbGate, kMaxRows * kHeadSize * 4u);
 constexpr std::uint32_t kUbGateB = NextSlot(kUbGateA, kMaxRows * kHeadSize * 4u);
 constexpr std::uint32_t kUbContext = NextSlot(kUbGateB, kMaxRows * kHeadSize * 4u);
+// ---- the tail mask ----
+// Four operands for a partial strip. The three float buffers are a whole
+// vector register each, not 16 lanes: `CreateVecIndex` and `Duplicate` write a
+// full register whatever the element count says, which is the same rule this
+// arena already honours behind `Brcb`'s destinations. `kUbTailSel` holds one
+// bit per key lane and needs only a DataBlock, but gets a whole slot so the
+// next offset stays aligned.
+constexpr std::uint32_t kUbLaneIndex = NextSlot(kUbContext, kMaxRows * kHeadSize * 2u);
+constexpr std::uint32_t kUbMaskedFill = NextSlot(kUbLaneIndex, kVecReg);
+constexpr std::uint32_t kUbZeroFill = NextSlot(kUbMaskedFill, kVecReg);
+constexpr std::uint32_t kUbTailSel = NextSlot(kUbZeroFill, kVecReg);
 // ---- the launch probe ----
 constexpr std::uint32_t kProbeLanes = 32;
-constexpr std::uint32_t kUbProbe = NextSlot(kUbContext, kMaxRows * kHeadSize * 2u);
+constexpr std::uint32_t kUbProbe = NextSlot(kUbTailSel, kBlock);
 constexpr std::uint32_t kArenaEnd = kUbProbe + kProbeLanes * 4u;
 
 static_assert(kUbPackedKey[1] % kBlock == 0u && kUbPackedVal[1] % kBlock == 0u &&
@@ -566,6 +577,10 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
     rec.m_base = kUbMPrev;
     rec.l_base = kUbLPrev;
     rec.acc_base = kUbAcc;
+    rec.lane_index = View<float>(kUbLaneIndex, kKeys);
+    rec.masked_fill = View<float>(kUbMaskedFill, kKeys);
+    rec.zero_fill = View<float>(kUbZeroFill, kKeys);
+    rec.tail_sel = View<std::uint8_t>(kUbTailSel, kKeys);
     rec.position = kUb;
 
     // Capacity-one feedback places, including unused slots (N=0/1).
@@ -581,6 +596,12 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
     // the index (see the header's monotonicity note, checked by Run_ before
     // this point). At an aligned seq_len the two agree exactly, which is how
     // the aligned callers keep their old trip count.
+    // The tail-mask constants, built once for the whole item. They are read
+    // but never rewritten by the strip loop, so this is hoisted entirely out
+    // of it -- and out of the per-query path, where sixteen queries would
+    // otherwise rebuild the same predicate.
+    rec.prime_tail_mask(turboquant_decode_tail::kMaskedScore);
+    AscendC::PipeBarrier<PIPE_V>();
     const std::uint32_t count = turboquant_decode_tail::LiveStripsInWindow(
         geom.seq_len, geom.page_begin, geom.seq_pages, geom.block_size,
         geom.strip_begin, geom.strips);
@@ -632,8 +653,7 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
             if (active == turboquant_decode_tail::kStripTokens)
                 ascend_micro::vector_decode_recur_rows(rec, rows);
             else
-                ascend_micro::vector_decode_recur_rows_masked(
-                    rec, rows, active, turboquant_decode_tail::kMaskedScore);
+                ascend_micro::vector_decode_recur_rows_masked(rec, rows, active);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
             const std::uint32_t index = tick - 1u + kStageDepth;
@@ -722,6 +742,12 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* q_rot_gm, __gm__ std::int8_t* key
                                                     block_size, strip_begin, strips))
         return;
     if (!turboquant_decode_tail::SeqLenInCapacity(live, cache_pages, block_size))
+        return;
+    // This operator normalizes by the denominator in its own epilogue, so a
+    // window with nothing live in it would divide 0 by 0. Refused rather than
+    // clamped: there is no context to compute over zero tokens.
+    if (!turboquant_decode_tail::WindowHasLiveToken(live, page_begin, block_size,
+                                                    strip_begin))
         return;
 
     Geometry geom;
@@ -975,6 +1001,11 @@ extern "C" void launch_turboquant_single_token_decode_tail_aiv(
     if (!turboquant_decode_tail::SeqLenInCapacity(seq_len, cache_pages, block_size))
         throw std::invalid_argument(
             "single_token_decode_tail: seqLen exceeds the allocated cache");
+    if (!turboquant_decode_tail::WindowHasLiveToken(seq_len, page_begin, block_size,
+                                                    strip_begin))
+        throw std::invalid_argument(
+            "single_token_decode_tail: the window starts past the last live "
+            "token, so this operator would normalize by a zero denominator");
     turboquant_single_token_decode_tail_aiv<<<block_dim, nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(q_rot), key_cache, value_cache, scale_cache,
         block_table, gate, pi_signs,

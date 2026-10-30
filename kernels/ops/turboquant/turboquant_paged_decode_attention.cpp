@@ -427,7 +427,15 @@ constexpr std::uint32_t kUbContext =
 // The rotated, pre-gate rows. They exist so the runner can separate the
 // rotation from the gate; the 24 KiB the signed dequant freed pays for them.
 constexpr std::uint32_t kUbRotated = NextSlot(kUbContext, kTokens * kHeadSize * kB16);
-constexpr std::uint32_t kArenaEnd = kUbRotated + kTokens * kHeadSize * kF32;
+// ---- the tail mask ----
+// Four operands for a partial strip; see the AIV operators for why the three
+// float buffers are a whole vector register each rather than 16 lanes.
+constexpr std::uint32_t kUbLaneIndex =
+    NextSlot(kUbRotated, kTokens * kHeadSize * kF32);
+constexpr std::uint32_t kUbMaskedFill = NextSlot(kUbLaneIndex, kReadPadBytes);
+constexpr std::uint32_t kUbZeroFill = NextSlot(kUbMaskedFill, kReadPadBytes);
+constexpr std::uint32_t kUbTailSel = NextSlot(kUbZeroFill, kReadPadBytes);
+constexpr std::uint32_t kArenaEnd = kUbTailSel + kBlock;
 
 // ------------------------------------------------------------------ V0 gates
 static_assert(kUbScoreRing % kBlock == 0 && kUbPackedKRing % kBlock == 0 &&
@@ -787,9 +795,20 @@ __aicore__ inline void RecurStrip(ValueEngine&, std::uint32_t active)
     es.weighted = {kUb, kUbWeighted, kPanel};
     es.weighted_sum = {kUb, kUbWeightedSum, kHeadSize};
     es.acc_scaled = {kUb, kUbAccScaled, kHeadSize};
+    es.lane_index = {kUb, kUbLaneIndex, kTokens};
+    es.masked_fill = {kUb, kUbMaskedFill, kTokens};
+    es.zero_fill = {kUb, kUbZeroFill, kTokens};
+    es.tail_sel = {kUb, kUbTailSel, kTokens};
 
     AscendC::LocalTensor<float> panel{kUb, kScoreSlot<Slot>, kScores};
     AscendC::LocalTensor<float> archived{kUb, kArchiveSlot<Strip>, kScores};
+
+    // The mask constants. This engine is constructed per strip, so unlike
+    // the AIV operators -- which keep one engine for the whole item -- there
+    // is no hoisting to be had here, and priming costs three instructions on a
+    // path that already issues several hundred.
+    es.prime_tail_mask(turboquant_decode_tail::kMaskedScore);
+    AscendC::PipeBarrier<PIPE_V>();
 
     AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagScoreReady<Slot>);
     // `active` is the live token count of this strip, 0..16. The flag edges
@@ -808,8 +827,7 @@ __aicore__ inline void RecurStrip(ValueEngine&, std::uint32_t active)
     if (active == kTokens)
         ascend_micro::vector_decode_recur_strip(es);
     else if (active != 0u)
-        ascend_micro::vector_decode_recur_strip_masked(
-            es, active, turboquant_decode_tail::kMaskedScore);
+        ascend_micro::vector_decode_recur_strip_masked(es, active);
     AscendC::PipeBarrier<PIPE_V>();
     // The RAW panel, before the key scale, so the runner can check what the
     // Cube produced rather than what the recurrence derived from it. Muls by
