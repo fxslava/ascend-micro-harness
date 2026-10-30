@@ -87,6 +87,14 @@ struct AivRig {
             // the sequence actually ends.
             static_cast<std::uint32_t>(f.seq_len));
     }
+    // The emitted context exactly as the device left it, for callers that
+    // compare two launches against each other rather than against an oracle.
+    std::vector<std::uint16_t> Context() const
+    {
+        std::vector<std::uint16_t> raw(out.bytes / 2);
+        out.download(raw);
+        return raw;
+    }
     struct Census {
         std::uint64_t failed = 0, timeouts = 0;
         std::vector<double> tail_ticks, lock_ticks;

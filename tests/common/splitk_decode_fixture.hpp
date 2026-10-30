@@ -15,12 +15,64 @@ constexpr int kHeads = 4, kRows = 6, kChannels = 256, kPageTokens = 128;
 // l, Acc and the context. So this constant is what separates a mask that
 // overwrites the dead lanes from one that merely scales them, and it is the
 // reason the device phase is a masked write rather than a masked multiply.
-inline float TailCanary()
+inline float FloatFromBits(std::uint32_t bits)
 {
-    const std::uint32_t bits = 0x7FC0BEEFu;
     float value = 0.0f;
     std::memcpy(&value, &bits, sizeof value);
     return value;
+}
+
+inline float TailCanary() { return FloatFromBits(0x7FC0BEEFu); }
+
+// What goes into a cache slot at or past `seq_len`.
+//
+//   kZero   every dead byte is 0. The benign baseline: whatever the kernel
+//           does with a dead lane, zero data cannot move the answer much, so
+//           this is the pass the dirty pass is compared AGAINST.
+//   kDirty  finite adversarial garbage. Large magnitudes of both signs so a
+//           leaked lane would dominate a softmax maximum rather than perturb
+//           it, and the two alternating bit patterns so a leaked lane that is
+//           reinterpreted rather than scaled is also wrong.
+//   kNaN    the quiet NaN 0x7FC0BEEF, the loud canary.
+enum class TailFill { kZero, kDirty, kNaN };
+
+// The FP32 scale planes. Cycles large positive, large negative, a very large
+// value, and the two bit patterns -- which as floats are about -2.9e-16 and
+// +1.5e16, so the cycle spans sixteen orders of magnitude in both directions.
+inline float DirtyScale(std::size_t index)
+{
+    switch (index % 5u) {
+        case 0: return 999.0f;
+        case 1: return -999.0f;
+        case 2: return 1.0e4f;
+        case 3: return FloatFromBits(0xA5A5A5A5u);
+        default: return FloatFromBits(0x5A5A5A5Au);
+    }
+}
+
+// The packed int4 planes. Alternating nibbles 0xA and 0x5 lay down exactly the
+// 0xA5A5A5A5 / 0x5A5A5A5A byte patterns; as signed int4 they are -6 and +5.
+inline int DirtyNibble(std::size_t index)
+{
+    return (index % 2u) == 0u ? -6 : 5;
+}
+
+inline float TailScaleFor(TailFill fill, std::size_t index)
+{
+    switch (fill) {
+        case TailFill::kZero: return 0.0f;
+        case TailFill::kDirty: return DirtyScale(index);
+        default: return TailCanary();
+    }
+}
+
+inline int TailNibbleFor(TailFill fill, std::size_t index)
+{
+    switch (fill) {
+        case TailFill::kZero: return 0;
+        case TailFill::kDirty: return DirtyNibble(index);
+        default: return 7;  // the largest the format holds
+    }
 }
 
 struct Fixture {
@@ -29,6 +81,7 @@ struct Fixture {
     // for every context length that is not a multiple of the page size, which
     // in generative decoding is almost all of them.
     int tokens, seq_len, pages, requests, heads, rows, page_tokens;
+    TailFill tail_fill;
     std::vector<std::uint16_t> q;
     std::vector<std::uint8_t> key, value;
     std::vector<float> scales, gate, signs;
@@ -39,13 +92,19 @@ struct Fixture {
     // is what every caller from before the tail change meant. Pass a smaller
     // value for an unaligned context: the pages are still allocated whole (the
     // cache has no notion of a part-page), the slots past `live` are flooded
-    // with TailCanary(), and the oracle masks them out.
+    // according to `fill`, and the oracle masks them out either way.
+    //
+    // An ALIGNED fixture has no dead slot, so `fill` cannot affect it at all.
+    // That is what makes changing the default safe for every caller that does
+    // not pass `live`.
     Fixture(int n, int batch, int head_count = kHeads, int row_count = kRows,
-            int page_size = kPageTokens, int live = -1)
+            int page_size = kPageTokens, int live = -1,
+            TailFill fill = TailFill::kDirty)
         : tokens(((n + page_size - 1) / page_size) * page_size),
           seq_len(live < 0 ? n : live),
           pages((n + page_size - 1) / page_size), requests(batch),
           heads(head_count), rows(row_count), page_tokens(page_size),
+          tail_fill(fill),
           q(batch * heads * rows * kChannels),
           key(static_cast<std::size_t>(batch) * pages * heads * page_tokens * 128),
           value(key.size()), scales(static_cast<std::size_t>(batch) * pages *
@@ -72,30 +131,32 @@ struct Fixture {
                             const int logical = page * page_tokens + strip * 16 + t;
                             const bool live = logical < seq_len;
                             for (int c = 0; c < kChannels; ++c) {
-                                paged_decode::PackNibble(key.data() + offset,
-                                    t * kChannels + c,
+                                const auto at_key =
+                                    static_cast<std::size_t>(t) * kChannels + c;
+                                const auto at_val =
+                                    static_cast<std::size_t>(c) * 16 + t;
+                                paged_decode::PackNibble(key.data() + offset, at_key,
                                     live ? single_token_decode::KeyNibbleAt(head, global_strip, t, c)
-                                         : 7);
-                                paged_decode::PackNibble(value.data() + offset,
-                                    c * 16 + t,
+                                         : TailNibbleFor(fill, at_key));
+                                paged_decode::PackNibble(value.data() + offset, at_val,
                                     live ? single_token_decode::ValueNibbleAt(head, global_strip, c, t)
-                                         : 7);
+                                         : TailNibbleFor(fill, at_val));
                             }
                             const auto at =
                                 (static_cast<std::size_t>(physical) * heads + head) *
                                 page_tokens + strip * 16 + t;
-                            // Dead slots get the largest nibble the format
-                            // holds and a NaN scale, so a kernel that lets one
-                            // through cannot produce a nearly-right answer:
-                            // either the NaN propagates, or the score is the
-                            // largest this fixture can make and dominates the
-                            // softmax.
+                            // A dead slot's scale decides whether a leak is
+                            // visible, so it is the adversarial one: under
+                            // kDirty a leaked lane gets a magnitude that
+                            // dominates the softmax maximum rather than
+                            // perturbing it, and under kZero it gets nothing.
+                            // The two passes must agree regardless.
                             scales[at] = live
                                 ? single_token_decode::KeyScale(head, global_strip, t)
-                                : TailCanary();
+                                : TailScaleFor(fill, at);
                             scales[scales.size() / 2 + at] = live
                                 ? single_token_decode::ValueScaleAt(head, global_strip, t)
-                                : TailCanary();
+                                : TailScaleFor(fill, at + 1u);
                         }
                     }
                 }

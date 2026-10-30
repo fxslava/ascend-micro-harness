@@ -166,23 +166,25 @@ The device half of this work is now compiled and **run**.
 | the UB arena still fits | **PASS** | the four new operands are inside `kArenaEnd`, which every kernel `static_assert`s |
 | S = 1 on CAModel (`Ascend950PR_9589`, `dav_3510`) | **PASS** | 1 live token, 15 canary lanes; context finite and within tolerance of the FP64 oracle |
 | S = 17 on CAModel | **PASS** | one full strip then a strip with 1 live lane |
-| canaries beyond S untouched | **PASS** | the runner asserts it per rung; `0x7FC0BEEF` in both scale planes |
+| the context is invariant to the dead cache bytes | **PASS** | bit-identical across zeroed and adversarial padding, 6 of 6 comparisons; §5c |
 | the zero-active bypass | **PASS** | 2 split ranges per rung landed entirely past the live tail and published the exact neutral element |
-| NaN never reaches a vector instruction's input | **NOT CLEAN** | 306 → 18 `vec_err_idata_inf_nan_t0`, still 18 at 2 PCs; see §5 |
+| NaN never reaches a vector instruction's input | **NOT CLEAN** | 3 per launch at 2 PCs, unchanged by a fixture containing no NaN at all; §5a |
 | the full ladder (S up to 1023) on CAModel | **NOT RUN** | deliberately: hours of model time, and longer rungs add pages, not tail cases |
 | anything on silicon | **NOT RUN** | the leak that started this was reported from a 950PR; the fix has not been back-tested there |
 | `NpuTargets.cmake` / `SimTargets.cmake` parse | **PASS** | and now a real build, not just a parse |
 | every harness compiles strictly on the host | **PASS** | host stubs, `-Wall -Wextra -Werror`, host gate stage 4 |
 
-Run detail, from `scripts/run_decode_tail_container.sh`: 2 rungs, 2 plain-AIV
-launches and 4 split-K launches, 16 AICs × 2 vector cores, 427,102 ticks,
-545,790 ms of model time, `run status: 0`.
+Run detail, from `scripts/run_decode_tail_container.sh`: 2 rungs × 2 padding
+patterns, 4 plain-AIV launches and 8 split-K launches, 16 AICs × 2 vector
+cores, `run status: 0`.
 
 **What a pass here does and does not mean.** It means the mask works at the two
 tail shapes, on the real `dav_3510` model, against an independently masked FP64
-oracle, with a quiet-NaN canary in every dead slot. It does not mean the
-operator is clean: §5 records 18 remaining NaN-input errors, and nothing here
-has run on silicon since the fix.
+oracle, and that the answer does not depend on the dead cache bytes at all —
+checked bit-exactly against adversarial padding, not inferred from a NaN not
+propagating. It does not mean the operator is clean: §5a records three
+NaN-or-Inf inputs per launch whose cause is now known *not* to be the fixture,
+and nothing here has run on silicon since the fix.
 
 The frozen Cube path is unchanged by reading rather than by compiling:
 splitting `update_max_and_alpha` into `scale_row` + `reduce_max_and_alpha`
@@ -235,26 +237,92 @@ what the comparison expects.
 The legacy validation entry (`camodel_paged_decode_attention`) keeps its ABI
 and declares its whole strip window live, so its ladder is bit-identical.
 
-## 5a. The 18 that are left
+## 5a. The residual NaN inputs, and what the dirty fixture ruled out
 
-Masking the two scales took `vec_err_idata_inf_nan_t0` from 306 occurrences at
-6 PCs down to **18 at 2 PCs** — 6 at one site and 12 at another, across 6
-launches, so once and twice per launch respectively. The run passes; these are
-the model reporting NaN or Inf reaching a vector instruction's *input*, which a
-kernel can do and still emit a correct answer if it overwrites the result.
+Three runs, and the third one is the informative one.
 
-It is not diagnosed. The two sites are not the four that masking the scales
-removed, and the PCs shifted with the code change, so they cannot be mapped
-back from the earlier log. The obvious candidates are ruled out: the GEMV
-multiplies dequantised int4 by a BF16 query, both finite by construction, and
-`p_scaled`, `p_x4` and the value page are all clean once the scales are. A
-per-launch count points at the prologue or the epilogue rather than the strip
-loop.
+| fixture fill | launches | `vec_err_idata_inf_nan_t0` | PCs | per launch |
+| --- | --- | --- | --- | --- |
+| NaN canary, scales masked only after use | 6 | 306 | 6 | 51 |
+| NaN canary, scales masked before use | 6 | 18 | 2 | 3 |
+| **finite dirty garbage, no NaN anywhere** | 12 | **36** | **the same 2** | **3** |
 
-Resolving it needs a trace with symbols — `ccec -g` and the instruction dump
-the trace audit already parses for the reshape operator — not another guess.
-Until then this is an open hazard with a known bound, recorded rather than
-implied, and it is the reason the matrix above says NOT CLEAN rather than PASS.
+Masking the scales before the multiplies removed 288 of the 306 — those were
+real reads of the canary, and they are gone.
+
+The third row is the one that matters. Under `TailFill::kDirty` the fixture
+contains **no NaN and no Inf at all**, in any plane, live or dead. The residual
+errors nonetheless occur at exactly the same two PCs and exactly the same rate
+per launch: 12 and 24 over twelve launches, against 6 and 12 over six. So the
+obvious hypothesis — that these are benign SIMD over-reads of canary slots — is
+**disproved**. Whatever Inf or NaN those two instructions see, it does not come
+from the cache contents.
+
+That leaves two candidates, and the project has a documented precedent for the
+second:
+
+* the kernel's own arithmetic producing an overflow. `kMaskedScore` is
+  `-3.0e38f`, and FP32 tops out near `3.4e38`, so a subtraction of two such
+  magnitudes would reach `-Inf`;
+* an operand's **read pad**. This header already warns that `Brcb` and
+  `Duplicate` read a whole 256-byte register from their source base whatever
+  the lane count says, so the caller owns the padding behind every such
+  operand. Uninitialised UB in one of those pads would be read by a later
+  64-lane instruction, and if it happens to hold an Inf or NaN bit pattern the
+  model reports exactly this.
+
+Neither is confirmed. One and two occurrences per launch, on two vector cores
+only (`core1.veccore0` and `core2.veccore0`), points at a prologue or epilogue
+rather than the strip loop. The emitted context is correct and provably
+invariant to the dead cache contents (§5c), so these are inputs whose results
+do not reach the output — but a kernel that hands Inf or NaN to the vector unit
+three times per launch, on data that contains neither, is a defect with an
+unknown cause rather than a tolerable one.
+
+Resolving it needs a symbolised trace — `ccec -g` plus the instruction dump the
+trace audit already parses for the reshape operator — not another guess. This
+is why the matrix says NOT CLEAN rather than PASS, and the directive's
+criterion that the count reach strictly 0 under the dirty pattern is **not
+met**.
+
+## 5c. The dual-pass invariance check
+
+Stronger than comparing either pass to the oracle, and the reason the fixture
+no longer defaults to a NaN canary.
+
+Each rung now runs twice with identical live tokens and different dead bytes:
+once with the padding zeroed, once with finite adversarial garbage — `+999`,
+`-999`, `1e4`, and the bit patterns `0xA5A5A5A5` and `0x5A5A5A5A`, which as
+floats are about `-2.9e-16` and `+1.5e16`. The emitted BF16 context must be
+**bit-identical** between the two.
+
+Why bit-exact rather than within a tolerance: each pass separately agreeing
+with the FP64 oracle to 0.5% would still permit the dead bytes to move the
+answer. Requiring the two outputs to be identical says they move nothing.
+
+Why finite garbage rather than a quiet NaN: a NaN is a loud canary but a coarse
+one. It catches dead data that reaches an arithmetic path and misses dead data
+that changes the answer without producing a NaN — an exponent that shifts the
+running maximum, say. It also makes the CAModel log unreadable, since a benign
+over-read of a canary slot raises the same error as a real hazard.
+
+Two controls keep the comparison from being vacuous, and both are asserted
+before either launch:
+
+* the two **oracles must be identical**. The oracle reads only live tokens, so
+  equal oracles prove both kernels are being asked the same question and a
+  difference in output cannot be blamed on a difference in input;
+* the dead bytes **must actually differ**, across all three planes. Without
+  this the check would pass trivially for a kernel that reads the tail avidly.
+
+`tests/cpu/test_decode_tail_probe.cpp` adds the matching host claim: the dirty
+pattern moves the gated context by more than the device tolerance at 5 of 5
+rungs, so it could catch a kernel ignoring `seqLen` rather than merely failing
+to crash on one. `TailFill::kNaN` is kept and is what that probe's canary
+assertions ask for explicitly.
+
+Result on CAModel: **6 of 6 comparisons bit-identical**, at S = 1 and S = 17,
+over 4 plain-AIV and 8 split-K launches, each pass also matching the oracle.
 
 ## 5b. A hole the live-aware trip count opened
 

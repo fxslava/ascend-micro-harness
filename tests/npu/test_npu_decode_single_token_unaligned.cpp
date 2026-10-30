@@ -147,6 +147,16 @@ struct TailRig {
             static_cast<std::uint32_t>(f.seq_len));
     }
 
+    // As AivRig::Context: the raw emitted context, for a launch-to-launch
+    // comparison. Includes the guard-band rows, which both passes canary-fill
+    // identically, so the whole vector is comparable.
+    std::vector<std::uint16_t> Context() const
+    {
+        std::vector<std::uint16_t> raw(out_context.bytes / 2);
+        out_context.download(raw);
+        return raw;
+    }
+
     // The gated BF16 context against the oracle, plus the guard band.
     void Validate() const
     {
@@ -225,13 +235,38 @@ int run(bool single_tile)
                 single_tile ? " (single-tile canary)" : "");
 
     int rungs = 0, plain_launches = 0, splitk_launches = 0, dead_splits = 0;
+    int invariance_checks = 0;
     for (const int seq_len : ladder) {
-        // Capacity is rounded up to whole pages; seq_len is what is live.
-        Fixture f(seq_len, kRequests, kHeads, kRows, kPageTokens);
-        require(f.seq_len == seq_len, "fixture did not take the live token count");
-        require(f.pages == static_cast<int>(tail::PagesForTokens(
-                               static_cast<std::uint32_t>(seq_len), kPageTokens)),
+        // TWO fixtures per rung, identical in their live tokens and different
+        // in every dead byte: one padded with zeros, one with adversarial
+        // finite garbage. Capacity is rounded up to whole pages; seq_len is
+        // what is live.
+        Fixture zero(seq_len, kRequests, kHeads, kRows, kPageTokens, seq_len,
+                     splitk_decode_test::TailFill::kZero);
+        Fixture dirty(seq_len, kRequests, kHeads, kRows, kPageTokens, seq_len,
+                      splitk_decode_test::TailFill::kDirty);
+
+        require(zero.seq_len == seq_len && dirty.seq_len == seq_len,
+                "fixture did not take the live token count");
+        require(zero.pages == static_cast<int>(tail::PagesForTokens(
+                                  static_cast<std::uint32_t>(seq_len), kPageTokens)),
                 "fixture page count disagrees with the tail geometry");
+
+        // The two controls that make the comparison below mean something.
+        //
+        // The oracles must be IDENTICAL: it reads only live tokens, so equal
+        // oracles say the live inputs are the same and the kernels are being
+        // asked the same question. Without this, a difference in output could
+        // simply be a difference in input.
+        require(zero.expected == dirty.expected,
+                "the two passes do not share their live data, so an invariance "
+                "comparison between them would measure the fixture");
+        // And the dead bytes must actually DIFFER, or the comparison is
+        // vacuous -- it would pass for a kernel that reads the tail avidly.
+        require(zero.scales != dirty.scales && zero.key != dirty.key &&
+                    zero.value != dirty.value,
+                "the dirty pass is not dirty: no dead byte differs, so the "
+                "invariance check would prove nothing");
 
         const std::uint32_t last_strip =
             tail::StripsForTokens(static_cast<std::uint32_t>(seq_len)) - 1u;
@@ -239,29 +274,64 @@ int run(bool single_tile)
             static_cast<std::uint64_t>(last_strip) * 16u,
             static_cast<std::uint32_t>(seq_len));
 
-        // ---- leg A: the plain AIV decode ---------------------------------
-        {
-            TailRig rig(f);
+        const Fixture* const passes[2] = {&zero, &dirty};
+        const char* const names[2] = {"zero", "dirty"};
+
+        // ---- leg A: the plain AIV decode, both passes --------------------
+        std::vector<std::uint16_t> plain[2];
+        for (int pass = 0; pass < 2; ++pass) {
+            TailRig rig(*passes[pass]);
             rig.Reset();
             check(aclrtSynchronizeStream(session.stream), "pre-launch synchronize");
             rig.Launch(session.stream);
             check(aclrtSynchronizeStream(session.stream), "post-launch synchronize");
-            rig.Validate();
+            rig.Validate();  // against the FP64 oracle, per pass
+            plain[pass] = rig.Context();
             ++plain_launches;
         }
+        // BIT-exact, not within a tolerance. Each pass separately agreeing
+        // with the oracle to 0.5% would still allow the dead bytes to move the
+        // answer; this says they move nothing at all.
+        if (plain[0] != plain[1]) {
+            for (std::size_t at = 0; at < plain[0].size(); ++at)
+                if (plain[0][at] != plain[1][at]) {
+                    std::fprintf(stderr,
+                                 "TAIL LEAK S=%d plain AIV at %zu: zero-padded "
+                                 "0x%04X, dirty-padded 0x%04X -- the context "
+                                 "depends on bytes past seq_len\n",
+                                 seq_len, at, plain[0][at], plain[1][at]);
+                    break;
+                }
+            throw std::runtime_error("plain AIV context is not invariant to the "
+                                     "dead cache contents");
+        }
+        ++invariance_checks;
 
-        // ---- leg B: the same context, split K ways -----------------------
+        // ---- leg B: the same context, split K ways, both passes ----------
         int dead_here = 0;
         for (const int k : splits) {
-            tq_splitk_rig::AivRig rig(f, k);
-            rig.Reset();
-            check(aclrtSynchronizeStream(session.stream), "pre-launch synchronize");
-            rig.Launch(session.stream, k, 1000000);
-            check(aclrtSynchronizeStream(session.stream), "post-launch synchronize");
-            rig.Validate(k);
-            ++splitk_launches;
+            std::vector<std::uint16_t> sk[2];
+            for (int pass = 0; pass < 2; ++pass) {
+                tq_splitk_rig::AivRig rig(*passes[pass], k);
+                rig.Reset();
+                check(aclrtSynchronizeStream(session.stream), "pre-launch synchronize");
+                rig.Launch(session.stream, k, 1000000);
+                check(aclrtSynchronizeStream(session.stream), "post-launch synchronize");
+                rig.Validate(k);
+                sk[pass] = rig.Context();
+                ++splitk_launches;
+            }
+            if (sk[0] != sk[1]) {
+                std::fprintf(stderr,
+                             "TAIL LEAK S=%d split-K K=%d: the context differs "
+                             "between %s and %s padding\n",
+                             seq_len, k, names[0], names[1]);
+                throw std::runtime_error("split-K context is not invariant to the "
+                                         "dead cache contents");
+            }
+            ++invariance_checks;
             for (int split = 0; split < k; ++split) {
-                const auto range = turboquant_splitk::Partition(f.pages, k, split);
+                const auto range = turboquant_splitk::Partition(zero.pages, k, split);
                 if (tail::LiveStripsInWindow(
                         static_cast<std::uint32_t>(seq_len),
                         static_cast<std::uint32_t>(range.begin),
@@ -273,18 +343,20 @@ int run(bool single_tile)
         dead_splits += dead_here;
 
         std::printf("  ok  S=%-5d %2d pages, %2u strips, %2u live lanes in the last, "
-                    "%d dead splits over K=1/2/4/8\n",
-                    seq_len, f.pages, last_strip + 1u, active, dead_here);
+                    "%d dead splits; zero and dirty padding agree bit-exactly\n",
+                    seq_len, zero.pages, last_strip + 1u, active, dead_here);
         ++rungs;
     }
 
-    std::printf("PASS single-token decode at unaligned context lengths: %d rungs "
-                "(S=1..1023, none a multiple of 16), %d plain-AIV launches and %d "
-                "split-K launches, %d split ranges entirely past the live tail and "
-                "contributing the neutral element; every cache slot past seq_len "
-                "held a 0x7FC0BEEF canary in both scale planes and none reached the "
-                "gated BF16 context\n",
-                rungs, plain_launches, splitk_launches, dead_splits);
+    std::printf("PASS single-token decode at unaligned context lengths: %d rungs, "
+                "%d plain-AIV launches and %d split-K launches, %d split ranges "
+                "entirely past the live tail and contributing the neutral element. "
+                "Every rung ran twice -- dead slots zeroed, then filled with finite "
+                "adversarial garbage (+/-999, 1e4, 0xA5A5A5A5, 0x5A5A5A5A) -- and "
+                "the emitted BF16 context was BIT-IDENTICAL across all %d "
+                "comparisons, with each pass also matching the FP64 oracle\n",
+                rungs, plain_launches, splitk_launches, dead_splits,
+                invariance_checks);
     return 0;
 }
 

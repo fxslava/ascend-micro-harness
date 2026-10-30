@@ -72,7 +72,12 @@ int main()
 
     int rungs = 0;
     for (const int seq_len : ladder) {
-        splitk_decode_test::Fixture masked(seq_len, kRequests, kHeads, kRows, kPage);
+        // kNaN explicitly: this block asserts that dead slots carry the loud
+        // canary, which is no longer the fixture's default. The device harness
+        // runs on kDirty instead, and the loop below checks that pattern is
+        // observable too.
+        splitk_decode_test::Fixture masked(seq_len, kRequests, kHeads, kRows, kPage,
+                                           seq_len, splitk_decode_test::TailFill::kNaN);
         // The same capacity with every token live: what an oracle that ignored
         // seq_len would produce.
         splitk_decode_test::Fixture whole(masked.tokens, kRequests, kHeads, kRows,
@@ -132,6 +137,50 @@ int main()
         std::printf("  %-6d %-7d %-9d %-12.6g %.6g\n", seq_len, masked.pages, dead,
                     static_cast<double>(max_diff), static_cast<double>(tolerance));
         ++rungs;
+    }
+
+    // The same observability question for the DIRTY pattern, which is what the
+    // device harness actually runs on. A quiet NaN is trivially observable --
+    // it poisons anything it touches -- but finite garbage is not, so this is
+    // the check that says the dirty fixture could catch a kernel ignoring
+    // seqLen rather than merely failing to crash on one.
+    //
+    // It is also the stronger statement of the two: these are the magnitudes
+    // (+/-999, 1e4, and the two bit patterns) that a leaked lane would bring
+    // into the softmax, and they move the gated context by far more than the
+    // device tolerance.
+    {
+        int observable = 0;
+        const std::vector<int> rungs_dirty = {1, 15, 17, 127, 129};
+        for (const int seq_len : rungs_dirty) {
+            splitk_decode_test::Fixture dirty(seq_len, kRequests, kHeads, kRows,
+                                              kPage, seq_len,
+                                              splitk_decode_test::TailFill::kDirty);
+            splitk_decode_test::Fixture whole(dirty.tokens, kRequests, kHeads, kRows,
+                                              kPage);
+            float max_diff = 0, row_max = 0;
+            for (std::size_t at = 0; at < dirty.expected.size(); ++at) {
+                max_diff = std::max(max_diff,
+                                    std::abs(dirty.expected[at] - whole.expected[at]));
+                row_max = std::max(row_max, std::abs(dirty.expected[at]));
+            }
+            const float tolerance = 0.005f * row_max + 1e-6f;
+            for (const float value : dirty.expected)
+                if (!std::isfinite(value)) {
+                    report("the dirty reference is not finite", seq_len);
+                    break;
+                }
+            if (max_diff > tolerance) {
+                ++observable;
+            } else {
+                report("dirty padding is not observable above the device "
+                       "tolerance", seq_len);
+            }
+        }
+        std::printf("PASS dirty padding is numerically observable at %d of %zu "
+                    "rungs, so finite adversarial garbage would also catch a "
+                    "kernel that ignored seqLen\n",
+                    observable, rungs_dirty.size());
     }
 
     // A negative control for the observability check itself: at an ALIGNED
