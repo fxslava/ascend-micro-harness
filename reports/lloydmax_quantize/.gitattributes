@@ -1,0 +1,2 @@
+# Preserve simulator instruction dumps byte-for-byte and omit generated diffs.
+*.dump -text -diff

@@ -1,0 +1,11 @@
+include/routines/routine_vector_lloydmax_quantize.hpp: OK
+include/routines/routine_vector_gaussian_cdf_quantize.hpp: OK
+routines/routine_vector_icdf_quantize.hpp: OK
+kernels/camodel/lloydmax_quantize.cpp: OK
+tests/cpu/test_lloydmax_probe.cpp: OK
+tests/common/lloydmax_oracle.hpp: OK
+tests/camodel/test_camodel_lloydmax_quantize.cpp: OK
+tests/camodel/camodel_common.hpp: OK
+tests/cpu/icdf_fixture.hpp: OK
+cmake/SimTargets.cmake: OK
+CMakeLists.txt: OK

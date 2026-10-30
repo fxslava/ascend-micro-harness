@@ -104,6 +104,9 @@ function(add_ascend_micro_sim_targets)
   add_executable(test_icdf_quantize_probe tests/cpu/test_icdf_quantize_probe.cpp)
   target_compile_options(test_icdf_quantize_probe PRIVATE -Wall -Wextra -Werror)
   add_micro_camodel_probe(icdf_quantize)
+  add_executable(test_lloydmax_probe tests/cpu/test_lloydmax_probe.cpp)
+  target_compile_options(test_lloydmax_probe PRIVATE -Wall -Wextra -Werror)
+  add_micro_camodel_probe(lloydmax_quantize)
   # The fused operator uses the same runtime tile selection for its page count.
   add_micro_camodel_probe(fused_attention
       kernels/ops/turboquant/turboquant_paged_attention_opt.cpp)
