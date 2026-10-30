@@ -2,6 +2,7 @@ build/
 # CANN's ascendc cmake drops a ~31 MB tree of ExternalProject prefixes into the
 # source directory at configure time, named after RUN_MODE.
 build_*/
+build-*/
 bin/
 *.o
 *.obj

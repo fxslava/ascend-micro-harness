@@ -8,7 +8,7 @@
 
 extern "C" void launch_turboquant_splitk_boundary_aiv(
     void*, std::uint16_t*, std::int8_t*, std::int8_t*, float*, std::uint32_t*,
-    float*, float*, turboquant_splitk::AtomicHeadSlot*, turboquant_splitk::WorkerMetrics*,
+    float*, float*, float*, turboquant_splitk::WorkerMetrics*,
     std::uint16_t*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
     std::uint32_t, std::uint32_t);
 
@@ -51,10 +51,15 @@ int main(int argc, char** argv)
             key(paged_decode::kKeyCacheBytes), value(paged_decode::kValueCacheBytes),
             scale(paged_decode::kScaleCacheFloats * 4), table(32),
             gate(4 * rows * 256 * 4), signs(256 * 4),
-            slots(4 * sizeof(contract::AtomicHeadSlot)),
+            // The boundary entry launches one block at splits = 1, so it takes
+            // the fused path and must not touch the workspace at all. The
+            // buffer is allocated at the production stride anyway: an
+            // all-canary workspace afterwards is the evidence that the
+            // one-split bypass really does bypass it.
+            workspace(contract::WorkspaceFloats(1, 4, 1) * 4),
             metrics(4 * sizeof(contract::WorkerMetrics)), out(4 * rows * 256 * 2);
         const std::vector<camodel::GuardedDeviceBuffer*> buffers = {
-            &q, &key, &value, &scale, &table, &gate, &signs, &slots, &metrics, &out};
+            &q, &key, &value, &scale, &table, &gate, &signs, &workspace, &metrics, &out};
         for (auto* buffer : buffers) {
             // Include exterior guards in the qNaN flood for this protocol.
             std::fill(buffer->host.begin(), buffer->host.end(), decode_boundary::kCanary);
@@ -87,15 +92,13 @@ int main(int argc, char** argv)
                         paged_decode::ScaleOffset(plane, page, head, in_page * 16 + t)] = 1.0f;
             }
         }
-        auto* slot = static_cast<contract::AtomicHeadSlot*>(slots.host_payload()) + head;
-        slot->lock = slot->arrived_count = 0;
         std::vector<std::vector<std::uint32_t>> snapshots;
         for (auto* buffer : buffers) { snapshots.push_back(buffer->host); buffer->upload(); }
         launch_turboquant_splitk_boundary_aiv(session.stream,
             static_cast<std::uint16_t*>(q.payload()), static_cast<std::int8_t*>(key.payload()),
             static_cast<std::int8_t*>(value.payload()), static_cast<float*>(scale.payload()),
             static_cast<std::uint32_t*>(table.payload()), static_cast<float*>(gate.payload()),
-            static_cast<float*>(signs.payload()), static_cast<contract::AtomicHeadSlot*>(slots.payload()),
+            static_cast<float*>(signs.payload()), static_cast<float*>(workspace.payload()),
             static_cast<contract::WorkerMetrics*>(metrics.payload()),
             static_cast<std::uint16_t*>(out.payload()), head, rows, begin, 1, strips, strip_begin);
         camodel::check(aclrtSynchronizeStream(session.stream), "boundary synchronize");
@@ -105,13 +108,12 @@ int main(int argc, char** argv)
         for (unsigned lane = 0; lane < rows * 256; ++lane)
             check_boundary(context[head * rows * 256 + lane] == float_to_bfloat16_rne(expected.context[lane]),
                     "byte-exact Split-K context mismatch");
-        slot = static_cast<contract::AtomicHeadSlot*>(slots.host_payload()) + head;
-        check_boundary(slot->lock == 0 && slot->arrived_count == 1, "unfinished Split-K protocol");
         const auto* metric = static_cast<contract::WorkerMetrics*>(metrics.host_payload()) + head;
-        check_boundary(metric->acquired == 1 && metric->arrival == 1 && metric->timeout == 0 &&
-                metric->failed_exchanges == 0, "invalid Split-K metric");
         for (unsigned lane = 0; lane < 8; ++lane)
-            check_boundary(metric->tail[lane] == 1 && metric->pages[lane] == 1, "invalid tail/page replica");
+            check_boundary(metric->exported[lane] == 1 && metric->tail[lane] == 1 &&
+                    metric->pages[lane] == 1 && metric->reduced[lane] == 0 &&
+                    metric->partition[lane] == contract::kNoPartition,
+                    "invalid Split-K census replica");
         // Allow only the precise protocol/egress byte ranges. Compare all
         // other bytes, including input payloads, unused rows and both guards.
         std::size_t intact = 0;
@@ -121,11 +123,12 @@ int main(int argc, char** argv)
             for (std::size_t byte = 0; byte < buffers[b]->host.size() * 4; ++byte) {
                 const std::size_t payload = byte - camodel::kGuardBytes;
                 bool assigned = false;
-                if (b == 7) assigned = payload >= head * sizeof(contract::AtomicHeadSlot) &&
-                    payload < head * sizeof(contract::AtomicHeadSlot) + 8;
+                // b == 7 is the workspace, and nothing claims a byte of it:
+                // the fused path writes no partition, so every byte of it is
+                // held to the canary like any other unassigned region.
                 if (b == 8) {
                     const auto local = payload - head * sizeof(contract::WorkerMetrics);
-                    assigned = local < 16 || (local >= 32 && local < 224);
+                    assigned = local < sizeof(contract::WorkerMetrics);
                 }
                 if (b == 9) assigned = payload >= head * rows * 256 * 2 &&
                     payload < (head + 1) * rows * 256 * 2;

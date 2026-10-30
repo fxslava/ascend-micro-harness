@@ -462,6 +462,25 @@ static_assert(kRingScore % 256u != 0u && kRingPacked % 256u != 0u &&
               "a 256-byte ring stride puts every slot on one bank phase");
 static_assert(kArenaEnd + kReadPadBytes <= kUbWindow,
               "UB arena leaves no VECTOR_REG_WIDTH read pad behind the state");
+// ------------------------------- the Split-K partition export, by geometry
+// Every lane of the strided partial burst has to be a whole DataBlock at a
+// whole-DataBlock pitch, and this operator's M has to fit the shared record.
+static_assert(kTokens <= turboquant_splitk::kMaxStateRows,
+              "the shared partition stride must hold this operator's M");
+static_assert(kHeadSize == turboquant_splitk::kChannels &&
+                  kStateLanes == turboquant_splitk::kStateLanes,
+              "the shared row record is this operator's own row geometry");
+static_assert(turboquant_splitk::kRecordFloats ==
+                  2u * kStateLanes + kHeadSize,
+              "the row record is [m, l, acc] and nothing else");
+static_assert(kStateLanes * kF32 % kBlock == 0u && kHeadSize * kF32 % kBlock == 0u &&
+                  (turboquant_splitk::kRecordFloats - kStateLanes) * kF32 % kBlock == 0u &&
+                  (turboquant_splitk::kRecordFloats - kHeadSize) * kF32 % kBlock == 0u,
+              "the partition burst's lengths and pitches must be whole DataBlocks");
+// DataCopyParams carries blockCount, blockLen and both strides as uint16.
+static_assert(kTokens <= 0xFFFFu && kHeadSize * kF32 / kBlock <= 0xFFFFu &&
+                  (turboquant_splitk::kRecordFloats - kStateLanes) * kF32 / kBlock <= 0xFFFFu,
+              "the partition burst must fit the DataCopyParams fields");
 // Duplicate's tensor form over-reads a whole 256-byte vector register from its
 // source base, and the egress points it at the LAST query's state block.
 static_assert(kUbLPrev + (kTokens - 1u) * kStateLanes * kF32 + kReadPadBytes <= kUbWindow,
@@ -952,6 +971,11 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
                                       __gm__ float* gm_out_scores,
                                       __gm__ float* gm_out_state,
                                       __gm__ float* gm_out_acc,
+                                      // The split-K partition this task owns,
+                                      // read only when `partial`. The legacy
+                                      // validation entry keeps its separate
+                                      // state/acc tensors and passes nullptr.
+                                      __gm__ float* gm_partition,
                                       __gm__ bfloat16_t* gm_out_context,
                                       __gm__ float* gm_out_rotated,
                                       std::uint32_t strip_base_bytes,
@@ -1046,11 +1070,41 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
     }
     if (partial) {
         if (finalize) {
+            // The standardized Split-K partition, the same AoS record the
+            // Vector path exports: `kMaxStateRows` copies of
+            // [m(8) | l(8) | acc(256)], at `workspace + item * stride`.
+            //
+            // Three strided MTE3 bursts rather than one contiguous one, and
+            // deliberately so. The state lives in Unified Buffer as three
+            // separate planes -- m_prev, l_prev and acc are what the
+            // recurrence reads and writes -- and interleaving them into one
+            // buffer first would cost a 16 x 272-float staging area this
+            // arena does not have room for. A strided burst reaches the same
+            // layout with no staging at all: one DataBlock per row at a
+            // 272-float pitch for each state plane, and 32 blocks per row at
+            // the same pitch for the accumulator. All three land in lanes of
+            // a partition no other task addresses, so none of them contends
+            // with anything, which is the property that matters here.
+            AscendC::GlobalTensor<float> partition;
+            partition.SetGlobalBuffer(gm_partition);
+            constexpr std::uint32_t kRecord = turboquant_splitk::kRecordFloats;
+            AscendC::DataCopyParams lane;
+            lane.blockCount = static_cast<std::uint16_t>(kTokens);
+            lane.blockLen = static_cast<std::uint16_t>(kStateLanes * kF32 / kBlock);
+            lane.srcStride = 0;
+            lane.dstStride =
+                static_cast<std::uint16_t>((kRecord - kStateLanes) * kF32 / kBlock);
+            AscendC::DataCopyParams band;
+            band.blockCount = static_cast<std::uint16_t>(kTokens);
+            band.blockLen = static_cast<std::uint16_t>(kHeadSize * kF32 / kBlock);
+            band.srcStride = 0;
+            band.dstStride =
+                static_cast<std::uint16_t>((kRecord - kHeadSize) * kF32 / kBlock);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kEvtStatic);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kEvtStatic);
-            AscendC::DataCopy(out_state, m_prev, kTokens * kStateLanes);
-            AscendC::DataCopy(out_state[kTokens * kStateLanes], l_prev, kTokens * kStateLanes);
-            AscendC::DataCopy(out_acc, acc, kPanel);
+            AscendC::DataCopy(partition, m_prev, lane);
+            AscendC::DataCopy(partition[kStateLanes], l_prev, lane);
+            AscendC::DataCopy(partition[2u * kStateLanes], acc, band);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtStatic);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtStatic);
         }
@@ -1329,7 +1383,7 @@ extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
         run_value_core(value_cache, scale_cache, gate, gather_offsets, gather_signs,
                        pi_sign, out_scores + block * kStrips * kScores,
                        out_state + block * 2u * kTokens * kStateLanes,
-                       out_acc + out_base, out_context + out_base,
+                       out_acc + out_base, nullptr, out_context + out_base,
                        out_rotated + out_base,
                        strip_base_bytes + strip_begin * kPackedBytes, scale_base,
                        scale_plane + scale_base, q_base, strips,
@@ -1349,7 +1403,7 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
     __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table,
     __gm__ std::int8_t* key, __gm__ std::int8_t* value, __gm__ float* scales,
     __gm__ uint32_t* table, __gm__ bfloat16_t* qrot,
-    __gm__ float* state, __gm__ float* acc, uint32_t requests, uint32_t heads,
+    __gm__ float* workspace, uint32_t requests, uint32_t heads,
     uint32_t block_size, uint32_t cache_pages, uint32_t seq_pages,
     uint32_t splits, uint32_t page_begin, uint32_t page_count, uint32_t seq_len)
 {
@@ -1394,8 +1448,10 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
                 turboquant_decode_tail::ActiveInPage(
                     page_begin + range.begin + p, block_size, live_seq);
             run_value_core(value, scales, nullptr, nullptr, nullptr, nullptr,
-                nullptr, state + item * 2u * kTokens * kStateLanes,
-                acc + item * kPanel, nullptr, nullptr, base * kHeadSize / 2u,
+                nullptr, nullptr, nullptr,
+                workspace + static_cast<std::uint64_t>(item) *
+                    turboquant_splitk::kPartitionFloats,
+                nullptr, nullptr, base * kHeadSize / 2u,
                 base, cache_pages * heads * block_size + base, 0u,
                 range.count == 0u ? 0u : strips, live_tokens, true, p == 0u,
                 p + 1u == iterations);
@@ -1459,13 +1515,13 @@ extern "C" void launch_camodel_paged_decode_attention(
 extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
     __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*,
     __gm__ std::int8_t*, __gm__ float*, __gm__ uint32_t*, __gm__ bfloat16_t*,
-    __gm__ float*, __gm__ float*, uint32_t, uint32_t, uint32_t, uint32_t,
+    __gm__ float*, uint32_t, uint32_t, uint32_t, uint32_t,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 
 extern "C" void launch_turboquant_paged_decode_splitk_aic(
     void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key,
     std::int8_t* value, float* scales, std::uint32_t* table,
-    std::uint16_t* qrot, float* state, float* acc, std::uint32_t requests,
+    std::uint16_t* qrot, float* workspace, std::uint32_t requests,
     std::uint32_t heads, std::uint32_t block_size, std::uint32_t cache_pages,
     std::uint32_t seq_pages, std::uint32_t splits, std::uint32_t page_begin,
     std::uint32_t page_count, std::uint32_t seq_len)
@@ -1490,7 +1546,7 @@ extern "C" void launch_turboquant_paged_decode_splitk_aic(
     }
     turboquant_paged_decode_splitk_aic<<<requests * heads * splits, nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(q), reinterpret_cast<bfloat16_t*>(pi_table),
-        key, value, scales, table, reinterpret_cast<bfloat16_t*>(qrot), state, acc,
+        key, value, scales, table, reinterpret_cast<bfloat16_t*>(qrot), workspace,
         requests, heads, block_size, cache_pages, seq_pages, splits, page_begin,
         page_count, seq_len);
 }

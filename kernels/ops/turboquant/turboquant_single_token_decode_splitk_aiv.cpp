@@ -2,16 +2,44 @@
 #include "../../../include/turboquant_splitk_contract.hpp"
 
 // True single-launch paged Split-K decode, Ascend 950PR / dav-3510 / CANN 9.2.
-// Each block computes one disjoint page range; only the last arrival emits
-// the normalized, register-butterfly-rotated, sigmoid-gated BF16 context.
+// Each block computes one disjoint page range and exports its partial softmax
+// state to a task-indexed workspace partition of its own; a grid-wide barrier
+// separates that pass from the reduction, which merges a head's K partials and
+// emits the normalized, register-butterfly-rotated, sigmoid-gated BF16 context.
 // Derived from single_token_decode_aiv; production kernels remain unchanged.
+//
+// WHY THERE IS NO LOCK HERE ANY MORE
+//
+// The first revision of this kernel reduced in place: a Global Memory
+// test-and-set per (request, KV head), the arriving worker merging its state
+// into the shared record inside the critical section, and the last arrival
+// running the egress. It is correct and it does not scale. Every worker of a
+// head serializes through one cache line, the merge itself -- 6 x 272 floats
+// of Gather/Max/Exp/Mul/Add -- runs INSIDE the lock, and the line bounces
+// between the competing cores on every handoff. Benchmarking on Ascend 950PR
+// put the cost above 43,000 cycles at N <= 2048, where the decode itself is
+// short enough that the contention dominates the launch.
+//
+// What replaces it is two passes over disjoint memory. Pass one: every worker
+// packs its own (m, l, Acc) and writes it to `workspace + item *
+// kPartitionFloats`, a partition no other worker addresses, as one contiguous
+// MTE3 burst. No atomic, no spin, no shared line, and no worker waits for
+// another. Pass two, after `AscendC::SyncAll`: one worker per (request, KV
+// head) reads that head's K partitions, merges them with the same recurrence
+// the lock used to run, and writes the context. The merge is now on the
+// critical path of exactly one worker per head instead of all K of them, and
+// it is reading its own partitions rather than contending for a line.
+//
+// The barrier is what the grid bound in the contract header is about: it only
+// completes if every launched block is resident, so a split launch is capped
+// at the physical block count. A single-split launch never reaches it -- that
+// path runs the egress straight out of the decode pass and never touches the
+// workspace at all.
 #if defined(__CCE_AICORE__)
 #include "kernel_operator.h"
 // After kernel_operator.h so TQ_TAIL_FN carries the device core-type
 // attribute; see the header's note on the link error it otherwise produces.
 #include "turboquant_decode_tail.hpp"
-#include "simt_api/asc_simt.h"
-#include "simt_api/common_functions.h"
 #include "../../../routines/routine_vector_decode_gemv.hpp"
 #include "../../../routines/routine_vector_decode_recurrence.hpp"
 #include "../../../routines/routine_vector_rotate_butterfly.hpp"
@@ -221,9 +249,20 @@ static_assert(kUbKeyScale[0] + kVecReg <= kUbKeyScale[1] &&
 
 // Event ids, static code 0..5 (6 and 7 reserved). One token in flight per
 // (route, id).
+//
+// The reduction's record ring gets ids of its own rather than reusing the
+// strip ring's. Both rings run in the same block -- a reducing worker is a
+// worker that already decoded a split -- and the strip ring's credits are
+// fully drained before the barrier, so reuse would be legal. It would also
+// make the trace census of section 5 unreadable: that audit keys events by
+// (route, id) and expects a fixed SET/WAIT count per strip-ring id, and two
+// phases sharing an id would be indistinguishable from a double SET.
 constexpr std::int32_t kEvtIngressReady = 0;  // MTE2_V
 constexpr std::int32_t kEvtPackedFree = 0;    // V_MTE2
 constexpr std::int32_t kEvtScaleFree = 2;     // V_MTE2
+constexpr std::int32_t kEvtRecordReady = 2;   // MTE2_V, the reduction's ring
+constexpr std::int32_t kEvtRecordFree = 4;    // V_MTE2, the reduction's ring
+constexpr std::int32_t kEvtReduceGate = 4;    // MTE2_V, the reducer's gate load
 constexpr std::int32_t kEvtEgressReady = 1;   // V_MTE3
 constexpr std::int32_t kEvtDrain = 0;         // MTE3_S
 
@@ -515,152 +554,196 @@ __aicore__ inline void Egress(const Geometry& geom)
 }
 
 
-// A single SIMT lane owns the TAS operation. All VF traffic bypasses the
-// noncoherent per-core DataCache. No SIMT UB accesses / dynamic UB allocation.
-__simt_vf__ __launch_bounds__(32) inline void Acquire(
-    __gm__ turboquant_splitk::AtomicHeadSlot* slot,
-    __gm__ turboquant_splitk::WorkerMetrics* metric, std::uint32_t max_attempts)
-{
-    if (threadIdx.x != 0u) return;
-    std::uint32_t failed = 0u, arrival = 0u, got = 0u;
-    while (failed < max_attempts) {
-        if (asc_atomic_exch(&slot->lock, 1u) == 0u) {
-            got = 1u;
-            arrival = asc_atomic_add(&slot->arrived_count, 1u) + 1u;
-            break;
-        }
-        ++failed;
-    }
-    asc_stcg(&metric->acquired, got);
-    asc_stcg(&metric->arrival, arrival);
-    asc_stcg(&metric->failed_exchanges, failed);
-    asc_stcg(&metric->timeout, 1u - got);
-    asc_threadfence();
-}
-
-__simt_vf__ __launch_bounds__(32) inline void Release(
-    __gm__ turboquant_splitk::AtomicHeadSlot* slot)
-{
-    if (threadIdx.x != 0u) return;
-    asc_threadfence();
-    (void)asc_atomic_exch(&slot->lock, 0u);
-}
-
+// ------------------------------------------------------------- the census
+// Nine replicated DataBlocks in one MTE3 burst. Every lane is written by the
+// Vector pipe from an immediate scalar -- no SIMT store, no scalar read of
+// Unified Buffer -- and every field is replicated eight ways, so a reader that
+// finds two lanes of a field disagreeing saw a torn burst rather than a value.
 __aicore__ inline void FinishMetric(
-    __gm__ turboquant_splitk::WorkerMetrics* metric, bool tail, std::uint32_t pages,
-    std::uint64_t lock_region)
+    __gm__ turboquant_splitk::WorkerMetrics* metric, std::uint32_t partition,
+    bool reduced, bool tail, std::uint32_t pages, std::uint64_t export_region)
 {
-    // The caller has retired the unlock VF or the out_context MTE3 burst.
+    // The caller has retired the partition burst, or the out_context burst.
     const auto stamp = static_cast<std::uint64_t>(AscendC::GetSystemCycle());
-    auto buf = View<std::uint32_t>(kUbPackedKey[0], 48);
-    AscendC::Duplicate(buf, static_cast<std::uint32_t>(stamp >> 32), 8);
-    AscendC::Duplicate(buf[8], static_cast<std::uint32_t>(stamp), 8);
-    AscendC::Duplicate(buf[16], static_cast<std::uint32_t>(tail), 8);
+    auto buf = View<std::uint32_t>(kUbPackedKey[0], turboquant_splitk::kMetricLanes);
+    AscendC::Duplicate(buf, 1u, 8);
+    AscendC::Duplicate(buf[8], partition, 8);
+    AscendC::Duplicate(buf[16], static_cast<std::uint32_t>(reduced), 8);
     AscendC::Duplicate(buf[24], pages, 8);
-    AscendC::Duplicate(buf[32], static_cast<std::uint32_t>(lock_region >> 32), 8);
-    AscendC::Duplicate(buf[40], static_cast<std::uint32_t>(lock_region), 8);
+    AscendC::Duplicate(buf[32], static_cast<std::uint32_t>(tail), 8);
+    AscendC::Duplicate(buf[40], static_cast<std::uint32_t>(stamp >> 32), 8);
+    AscendC::Duplicate(buf[48], static_cast<std::uint32_t>(stamp), 8);
+    AscendC::Duplicate(buf[56], static_cast<std::uint32_t>(export_region >> 32), 8);
+    AscendC::Duplicate(buf[64], static_cast<std::uint32_t>(export_region), 8);
     AscendC::GlobalTensor<std::uint32_t> dst;
-    dst.SetGlobalBuffer(metric->finish_hi);
+    dst.SetGlobalBuffer(metric->exported);
     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(2);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(2);
-    AscendC::DataCopy(dst, buf, 48);
+    AscendC::DataCopy(dst, buf, turboquant_splitk::kMetricLanes);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(2);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(2);
 }
 
-__aicore__ inline void ReduceAndFinish(
-    __gm__ turboquant_splitk::AtomicHeadSlot* slots,
-    __gm__ turboquant_splitk::WorkerMetrics* metrics,
-    const AscendC::GlobalTensor<bfloat16_t>& out_context, std::uint32_t item,
-    std::uint32_t head_item, std::uint32_t splits, std::uint32_t max_attempts,
-    const Geometry& geom)
+// ---------------------------------------------------------- the egress DMA
+// `rows` consecutive rows of the [requests][H_q][d] context panel, which is
+// one contiguous burst for the same reason the query ingress is.
+__aicore__ inline void StoreContext(const AscendC::GlobalTensor<bfloat16_t>& out_context,
+                                    std::uint32_t head_item, const Geometry& geom)
 {
-    auto* slot = slots + head_item;
-    auto* metric = metrics + item;
-    // Pack the local state before entering the critical section. Strip
-    // scratch is dead; both full-head packed buffers fit in existing slots.
-    PackHeadState(
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbValuePage[0], geom.rows * turboquant_splitk::kRecordFloats).GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbMPrev, 64).GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbLPrev, 64).GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbAcc, geom.rows * kHeadSize).GetPhyAddr()),
-        static_cast<std::uint16_t>(geom.rows));
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(3);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(3);
-    const auto lock_begin = static_cast<std::uint64_t>(AscendC::GetSystemCycle());
-    asc_vf_call<Acquire>(dim3{32u, 1u, 1u}, slot, metric, max_attempts);
-    // asc_vf_call is asynchronous and returns void in CANN 9.2. Wait once
-    // for protocol completion, invalidate the scalar cache line, and read the
-    // SIMT-published arrival directly from GM into a scalar register. There
-    // is no UB scalar load, status DMA, GetValue, or MTE2_S rendezvous.
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(4);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(4);
-    AscendC::GlobalTensor<std::uint32_t> control;
-    control.SetGlobalBuffer(&metric->arrival);
-    AscendC::DataCacheCleanAndInvalid<std::uint32_t,
-        AscendC::CacheLine::SINGLE_CACHE_LINE>(control);
-    const std::uint32_t arrival = *reinterpret_cast<__gm__ volatile std::uint32_t*>(&metric->arrival);
-    if (arrival == 0u) {
-        FinishMetric(metric, false, geom.seq_pages, 0u);
-        return;
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kEvtEgressReady);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kEvtEgressReady);
+    AscendC::DataCopy(out_context[static_cast<std::uint64_t>(head_item) * geom.rows *
+                                  kHeadSize],
+                      View<bfloat16_t>(kUbContext, geom.rows * kHeadSize),
+                      geom.rows * kHeadSize);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
+}
+
+// ------------------------------------------------- pass one: the export
+// The whole of what used to be the critical section. There is no acquire, no
+// arrival ticket, no merge and no release: the worker packs its own state and
+// writes it to a partition nothing else addresses.
+//
+// `splits == 1` has no partition to write and no second pass to wait for, so
+// it bypasses the workspace entirely and runs the egress here. That is not an
+// optimisation bolted on the side; it is the same `Egress` the reduction
+// calls, over the same buffers, so the one-split answer and the K-split answer
+// come out of identical code.
+//
+// It returns the region it cost rather than publishing it, because a block
+// that goes on to reduce must publish its census once, at the end, with every
+// field final: two `FinishMetric` calls would leave the second overwriting the
+// export measurement this one exists to take.
+__aicore__ inline std::uint64_t ExportPartial(
+    const AscendC::GlobalTensor<float>& workspace,
+    const AscendC::GlobalTensor<bfloat16_t>& out_context, std::uint32_t item,
+    std::uint32_t head_item, std::uint32_t splits, const Geometry& geom)
+{
+    const auto export_begin = static_cast<std::uint64_t>(AscendC::GetSystemCycle());
+    if (splits == 1u) {
+        Egress(geom);
+        StoreContext(out_context, head_item, geom);
+        return static_cast<std::uint64_t>(AscendC::GetSystemCycle()) - export_begin;
     }
-    const bool tail = arrival == splits;
+
+    // Strip scratch is dead by now, so the packed record lands in a retired
+    // value page: kMaxRows * kRecordFloats floats fit one strip panel, which
+    // the arena asserts.
     const std::uint32_t state_lanes = geom.rows * turboquant_splitk::kRecordFloats;
     auto packed = View<float>(kUbValuePage[0], state_lanes);
-    if (arrival > 1u) {
-        // One contiguous 6x272-float MTE2 burst for the entire head state.
-        AscendC::GlobalTensor<float> state;
-        state.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(slot->row));
-        packed = View<float>(kUbKeyPage[0], state_lanes);
-        AscendC::DataCopy(packed, state, state_lanes);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(3);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(3);
+    PackHeadState(
+        reinterpret_cast<__ubuf__ float*>(packed.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(View<float>(kUbMPrev, 64).GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(View<float>(kUbLPrev, 64).GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(
+            View<float>(kUbAcc, geom.rows * kHeadSize).GetPhyAddr()),
+        static_cast<std::uint16_t>(geom.rows));
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(3);
+    // One contiguous rows x 272-float burst into this task's own partition.
+    AscendC::DataCopy(workspace[static_cast<std::uint64_t>(item) *
+                                turboquant_splitk::kPartitionFloats],
+                      packed, state_lanes);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(3);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(3);
+    return static_cast<std::uint64_t>(AscendC::GetSystemCycle()) - export_begin;
+}
+
+// ------------------------------------------------ pass two: the reduction
+// One worker per (request, KV head), reading that head's K partitions and
+// merging them with `MergeHeadState` -- the same log-sum-exp recurrence the
+// lock used to run, unchanged, now over partitions this worker owns rather
+// than a line K workers contend for.
+//
+// The running state is seeded exactly as the decode seeds it, so split 0 goes
+// through the merge like every other split: exp(-3e38 - m0) is 0 and l starts
+// at 0, which makes the seed the neutral element of the recurrence rather than
+// a case the loop has to special-case.
+//
+// A two-slot record ring, not a lock-step fetch. A record is rows * 1088 bytes
+// and there are up to kMaxSplits of them, so the MTE2 of record i + 1 is worth
+// overlapping with the merge of record i. The two retired key pages are the
+// slots; the ring is primed, drained and capacity-one on both routes,
+// including the slot a K below the ring depth never fills.
+__aicore__ inline void ReduceHead(const AscendC::GlobalTensor<float>& workspace,
+                                  const AscendC::GlobalTensor<float>& gate,
+                                  const AscendC::GlobalTensor<bfloat16_t>& out_context,
+                                  std::uint32_t head_item, std::uint32_t splits,
+                                  const Geometry& geom)
+{
+    const std::uint32_t rows = geom.rows;
+    const std::uint32_t lanes = rows * kHeadSize;
+    const std::uint32_t state_lanes = rows * turboquant_splitk::kRecordFloats;
+    const std::uint64_t row_base =
+        static_cast<std::uint64_t>(head_item) * rows * kHeadSize;
+
+    // This block decoded some OTHER head's split, so every buffer the egress
+    // reads has to be re-established for the head being reduced. The gate is
+    // the one egress input that is not carried by the partials.
+    AscendC::DataCopy(View<float>(kUbGate, kMaxRows * kHeadSize), gate[row_base], lanes);
+    AscendC::Duplicate(View<float>(kUbMPrev, kMaxRows * kStateLanes), -3.0e38f,
+                       static_cast<std::int32_t>(rows * kStateLanes));
+    AscendC::Duplicate(View<float>(kUbLPrev, kMaxRows * kStateLanes), 0.0f,
+                       static_cast<std::int32_t>(rows * kStateLanes));
+    AscendC::Duplicate(View<float>(kUbAcc, kMaxRows * kHeadSize), 0.0f,
+                       static_cast<std::int32_t>(lanes));
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtReduceGate);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtReduceGate);
+    AscendC::PipeBarrier<PIPE_V>();
+
+    for (std::uint32_t slot = 0; slot < kStageDepth; ++slot)
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtRecordFree + slot);
+    for (std::uint32_t split = 0; split < splits && split < kStageDepth; ++split) {
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtRecordFree + split);
+        AscendC::DataCopy(View<float>(kUbKeyPage[split], state_lanes),
+                          workspace[turboquant_splitk::PartitionOffset(head_item, split,
+                                                                       splits)],
+                          state_lanes);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtRecordReady + split);
+    }
+    for (std::uint32_t split = 0; split < splits; ++split) {
+        const std::uint32_t slot = split % kStageDepth;
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtRecordReady + slot);
         MergeHeadState(
-            reinterpret_cast<__ubuf__ float*>(packed.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(
+                View<float>(kUbKeyPage[slot], state_lanes).GetPhyAddr()),
             reinterpret_cast<__ubuf__ float*>(View<float>(kUbMPrev, 64).GetPhyAddr()),
             reinterpret_cast<__ubuf__ float*>(View<float>(kUbLPrev, 64).GetPhyAddr()),
-            reinterpret_cast<__ubuf__ float*>(View<float>(kUbAcc, geom.rows * kHeadSize).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(View<float>(kUbAcc, lanes).GetPhyAddr()),
             reinterpret_cast<__ubuf__ float*>(View<float>(kUbProducts, 128).GetPhyAddr()),
-            static_cast<std::uint16_t>(geom.rows));
+            static_cast<std::uint16_t>(rows));
+        // The merge reads this slot to its last register; the refill DMA may
+        // not overwrite it until that read has retired on the Vector pipe.
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtRecordFree + slot);
+        const std::uint32_t next = split + kStageDepth;
+        if (next < splits) {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtRecordFree + slot);
+            AscendC::DataCopy(View<float>(kUbKeyPage[slot], state_lanes),
+                              workspace[turboquant_splitk::PartitionOffset(head_item, next,
+                                                                           splits)],
+                              state_lanes);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtRecordReady + slot);
+        }
     }
-    if (!tail) {
-        AscendC::GlobalTensor<float> state;
-        state.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(slot->row));
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(3);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(3);
-        // One contiguous MTE3 writeback; the tail retains its state in UB.
-        AscendC::DataCopy(state, packed, state_lanes);
-    }
-    // Publication must retire on MTE3 before the release VF clears the lock.
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(5);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(5);
-    asc_vf_call<Release>(dim3{32u, 1u, 1u}, slot);
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(5);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(5);
-    const auto lock_region = static_cast<std::uint64_t>(AscendC::GetSystemCycle()) - lock_begin;
-    if (tail) {
-        Egress(geom);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kEvtEgressReady);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kEvtEgressReady);
-        AscendC::DataCopy(out_context[static_cast<std::uint64_t>(head_item) *
-                                     geom.rows * kHeadSize],
-                          View<bfloat16_t>(kUbContext, geom.rows * kHeadSize),
-                          geom.rows * kHeadSize);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
-    }
-    FinishMetric(metric, tail, geom.seq_pages, lock_region);
+    // Consume exactly the final credit in every reuse place, including the
+    // slot a K below the ring depth never filled.
+    for (std::uint32_t slot = 0; slot < kStageDepth; ++slot)
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtRecordFree + slot);
+
+    Egress(geom);
+    StoreContext(out_context, head_item, geom);
 }
-__aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_rot,
+__aicore__ inline std::uint64_t ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_rot,
                                    const AscendC::GlobalTensor<std::int8_t>& key_cache,
                                    const AscendC::GlobalTensor<std::int8_t>& value_cache,
                                    const AscendC::GlobalTensor<float>& scale_cache,
                                    __gm__ const std::uint32_t* block_table,
                                    const AscendC::GlobalTensor<float>& gate,
-                                   __gm__ turboquant_splitk::AtomicHeadSlot* slots,
-                                   __gm__ turboquant_splitk::WorkerMetrics* metrics,
+                                   const AscendC::GlobalTensor<float>& workspace,
                                    const AscendC::GlobalTensor<bfloat16_t>& out_context,
-                                   std::uint32_t splits, std::uint32_t max_attempts,
+                                   std::uint32_t splits,
                                    std::uint32_t item, std::uint32_t request,
                                    std::uint32_t head, const Geometry& geom)
 {
@@ -827,8 +910,8 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
     }
 
-    ReduceAndFinish(slots, metrics, out_context, item,
-                    request * geom.num_kv_heads + head, splits, max_attempts, geom);
+    return ExportPartial(workspace, out_context, item,
+                         request * geom.num_kv_heads + head, splits, geom);
 }
 
 
@@ -837,25 +920,34 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
 extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
     __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
     __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
-    __gm__ float* signs, __gm__ turboquant_splitk::AtomicHeadSlot* slots,
+    __gm__ float* signs, __gm__ float* workspace,
     __gm__ turboquant_splitk::WorkerMetrics* metrics, __gm__ bfloat16_t* out,
     uint32_t requests, uint32_t heads, uint32_t rows,
     uint32_t block_size, uint32_t cache_pages, uint32_t pages,
-    uint32_t splits, uint32_t max_attempts, uint32_t seq_len)
+    uint32_t splits, uint32_t seq_len)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     AscendC::InitSocState();
     using namespace turboquant_splitk_device;
+    // Every guard below is a function of the launch operands alone, so all
+    // blocks evaluate it identically and either all of them return or none
+    // does. That is what makes the barrier further down safe to place after
+    // them: a grid in which some blocks returned early and the rest entered
+    // `SyncAll` is a hung launch, not a wrong answer.
     if (requests == 0u || heads == 0u || rows == 0u || rows > kMaxRows ||
         block_size == 0u || block_size % kKeys != 0u || pages == 0u ||
-        pages > cache_pages || splits == 0u || splits > turboquant_splitk::kMaxSplits ||
-        max_attempts == 0u) return;
+        pages > cache_pages || splits == 0u ||
+        splits > turboquant_splitk::kMaxSplits) return;
+    // The barrier only completes with every launched block resident, so a
+    // split launch may not span hardware waves. See the contract header.
+    if (!turboquant_splitk::GridFitsOneWave(requests, heads, splits)) return;
     // `seq_len == 0` means every token of the `pages` allocated pages is live:
     // the pre-tail contract, so existing callers keep their exact behaviour.
     const uint32_t live = seq_len == 0u ? pages * block_size : seq_len;
     if (!turboquant_decode_tail::SeqLenInCapacity(live, pages, block_size)) return;
     const auto item = static_cast<uint32_t>(AscendC::GetBlockIdx());
-    if (item >= requests * heads * splits) return;
+    const auto tasks = requests * heads * splits;
+    if (item >= tasks) return;
     const auto head_item = item / splits;
     const auto range = turboquant_splitk::Partition(pages, splits, item % splits);
     Geometry geom{heads, rows, kHeadSize, block_size, cache_pages,
@@ -863,7 +955,7 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
                   range.begin, pages, 0u, live};
     AscendC::GlobalTensor<bfloat16_t> q, context;
     AscendC::GlobalTensor<std::int8_t> key_cache, value_cache;
-    AscendC::GlobalTensor<float> scale_cache, gate_tensor, pi_signs;
+    AscendC::GlobalTensor<float> scale_cache, gate_tensor, pi_signs, partials;
     AscendC::GlobalTensor<uint32_t> block_table;
     q.SetGlobalBuffer(q_rot);
     context.SetGlobalBuffer(out);
@@ -872,20 +964,60 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
     scale_cache.SetGlobalBuffer(scales);
     gate_tensor.SetGlobalBuffer(gate);
     pi_signs.SetGlobalBuffer(signs);
+    partials.SetGlobalBuffer(workspace);
     AscendC::DataCopy(View<float>(kUbSign, kHeadSize), pi_signs, kHeadSize);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
-    ProcessItem(q, key_cache, value_cache, scale_cache, table, gate_tensor,
-                slots, metrics, context, splits, max_attempts, item,
-                head_item / heads, head_item % heads, geom);
+    const auto export_region =
+        ProcessItem(q, key_cache, value_cache, scale_cache, table, gate_tensor,
+                    partials, context, splits, item,
+                    head_item / heads, head_item % heads, geom);
+
+    bool reduced = false;
+    if (splits > 1u) {
+        // Grid-wide: every partition is in Global Memory once this returns.
+        // The condition is `splits > 1`, which every block computes from the
+        // same operand, so the barrier is entered by all of them or by none.
+        //
+        // `isAIVOnly = true`, which is where this departs from the reference
+        // operator's `SyncAll<false>()`. That template parameter is not a
+        // strictness knob: `false` raises SYNC_AIC_AIV_FLAG and waits for the
+        // Cube cores to answer it, which is right for the reference because it
+        // is a MIX_AIC_1_2 kernel. This one is KERNEL_TYPE_AIV_ONLY, so its
+        // launch has no Cube core to answer, and `false` here would wait for a
+        // participant that does not exist. `true` raises SYNC_AIV_ONLY_ALL.
+        //
+        // The default config's trigger pipe is PIPE_ALL, so the barrier opens
+        // with its own `PipeBarrier<PIPE_ALL>()` and this block's export MTE3
+        // is drained before the flag is raised. Nothing here needs to repeat
+        // that drain on either side.
+        AscendC::SyncAll<true>();
+
+        // One reducer per (request, KV head). The reducing blocks are the
+        // first `requests * heads` of a grid `splits` times that size, so a
+        // reducer is a block that already decoded some split -- usually of a
+        // different head -- and has to re-establish every buffer the egress
+        // reads.
+        reduced = item < requests * heads;
+        if (reduced) ReduceHead(partials, gate_tensor, context, item, splits, geom);
+    }
+    // Once per block, with every field final: the fused worker and the
+    // reducer are the two that wrote this head's context.
+    FinishMetric(metrics + item,
+                 splits == 1u ? turboquant_splitk::kNoPartition : item, reduced,
+                 splits == 1u || reduced, geom.seq_pages, export_region);
 }
 
-// Diagnostic entry uses the production ProcessItem and reduction unchanged.
+// Diagnostic entry uses the production ProcessItem and export path unchanged.
 // Selects one logical-page/strip window without rebasing the block table.
+//
+// It launches one block at splits = 1, so it takes the fused path: no
+// partition is written, no barrier is entered, and the workspace operand is
+// present only to keep one signature between this entry and production.
 extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
     __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
     __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
-    __gm__ float* signs, __gm__ turboquant_splitk::AtomicHeadSlot* slots,
+    __gm__ float* signs, __gm__ float* workspace,
     __gm__ turboquant_splitk::WorkerMetrics* metrics, __gm__ bfloat16_t* out,
     uint32_t head, uint32_t rows, uint32_t page_begin, uint32_t page_count,
     uint32_t strips, uint32_t strip_begin)
@@ -904,7 +1036,7 @@ extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
                       page_begin, page_count, 128u, strip_begin, strips))};
     AscendC::GlobalTensor<bfloat16_t> q, context;
     AscendC::GlobalTensor<std::int8_t> keys, values;
-    AscendC::GlobalTensor<float> scale_tensor, gates, sign_tensor;
+    AscendC::GlobalTensor<float> scale_tensor, gates, sign_tensor, partials;
     q.SetGlobalBuffer(q_rot);
     context.SetGlobalBuffer(out);
     keys.SetGlobalBuffer(key);
@@ -912,11 +1044,15 @@ extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
     scale_tensor.SetGlobalBuffer(scales);
     gates.SetGlobalBuffer(gate);
     sign_tensor.SetGlobalBuffer(signs);
+    partials.SetGlobalBuffer(workspace);
     AscendC::DataCopy(View<float>(kUbSign, kHeadSize), sign_tensor, kHeadSize);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
-    ProcessItem(q, keys, values, scale_tensor, table, gates, slots, metrics,
-                context, 1u, 10000u, head, 0u, head, geom);
+    const auto export_region =
+        ProcessItem(q, keys, values, scale_tensor, table, gates, partials,
+                    context, 1u, head, 0u, head, geom);
+    FinishMetric(metrics + head, turboquant_splitk::kNoPartition, false, true,
+                 page_count, export_region);
 }
 
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
@@ -927,20 +1063,18 @@ extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
 
 extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
     __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
-    __gm__ uint32_t*, __gm__ float*, __gm__ float*,
-    __gm__ turboquant_splitk::AtomicHeadSlot*,
+    __gm__ uint32_t*, __gm__ float*, __gm__ float*, __gm__ float*,
     __gm__ turboquant_splitk::WorkerMetrics*, __gm__ bfloat16_t*,
     uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+    uint32_t, uint32_t, uint32_t, uint32_t);
 
 extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
     void* stream, std::uint16_t* q_rot, std::int8_t* key, std::int8_t* value,
     float* scales, std::uint32_t* table, float* gate, float* signs,
-    turboquant_splitk::AtomicHeadSlot* slots, turboquant_splitk::WorkerMetrics* metrics,
+    float* workspace, turboquant_splitk::WorkerMetrics* metrics,
     std::uint16_t* out, std::uint32_t requests, std::uint32_t heads,
     std::uint32_t rows, std::uint32_t block_size, std::uint32_t cache_pages,
-    std::uint32_t pages, std::uint32_t splits, std::uint32_t max_attempts,
-    std::uint32_t seq_len)
+    std::uint32_t pages, std::uint32_t splits, std::uint32_t seq_len)
 {
     // 0 means "the whole allocation is live", the pre-tail contract. Anything
     // else must fit the pages the caller says it allocated; the device returns
@@ -950,30 +1084,36 @@ extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
         throw std::invalid_argument(
             "single_token_decode_splitk: seqLen exceeds the pages allocated to "
             "the sequence");
+    // The in-launch reduction's barrier needs every block resident. The device
+    // guard returns rather than hanging, but a silent empty output is a worse
+    // diagnostic than a thrown argument, so the host refuses the launch.
+    if (!turboquant_splitk::GridFitsOneWave(requests, heads, splits))
+        throw std::invalid_argument(
+            "single_token_decode_splitk: a split launch must fit one hardware "
+            "wave (requests * heads * splits <= kMaxCoResidentBlocks)");
     turboquant_single_token_decode_splitk_aiv<<<requests * heads * splits,
                                              nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(q_rot), key, value, scales, table, gate, signs,
-        slots, metrics, reinterpret_cast<bfloat16_t*>(out), requests, heads, rows,
-        block_size, cache_pages, pages, splits, max_attempts, seq_len);
+        workspace, metrics, reinterpret_cast<bfloat16_t*>(out), requests, heads, rows,
+        block_size, cache_pages, pages, splits, seq_len);
 }
 extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
     __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
-    __gm__ uint32_t*, __gm__ float*, __gm__ float*,
-    __gm__ turboquant_splitk::AtomicHeadSlot*,
+    __gm__ uint32_t*, __gm__ float*, __gm__ float*, __gm__ float*,
     __gm__ turboquant_splitk::WorkerMetrics*, __gm__ bfloat16_t*,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 
 extern "C" void launch_turboquant_splitk_boundary_aiv(
     void* stream, std::uint16_t* q, std::int8_t* key, std::int8_t* value,
     float* scales, std::uint32_t* table, float* gate, float* signs,
-    turboquant_splitk::AtomicHeadSlot* slots, turboquant_splitk::WorkerMetrics* metrics,
+    float* workspace, turboquant_splitk::WorkerMetrics* metrics,
     std::uint16_t* out, std::uint32_t head, std::uint32_t rows,
     std::uint32_t begin, std::uint32_t count, std::uint32_t strips,
     std::uint32_t strip_begin)
 {
     turboquant_splitk_boundary_aiv<<<1, nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(q), key, value, scales, table, gate, signs,
-        slots, metrics, reinterpret_cast<bfloat16_t*>(out), head, rows, begin,
+        workspace, metrics, reinterpret_cast<bfloat16_t*>(out), head, rows, begin,
         count, strips, strip_begin);
 }
 #endif

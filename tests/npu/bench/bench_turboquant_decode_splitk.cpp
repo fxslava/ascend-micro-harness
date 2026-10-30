@@ -35,7 +35,7 @@ using AicDevice = tq_splitk_rig::AicRig;
 struct Options {
     std::vector<int> contexts{1024, 2048, 4096, 8192, 16384};
     std::vector<int> splits{1, 2, 4, 8, 12, 16};
-    int warmup = 5, iters = 30, requests = 1, watchdog = 1000000;
+    int warmup = 5, iters = 30, requests = 1;
     int heads = 4, rows = 6, page_tokens = 128;
     bool single = false;
     std::string impl = "aiv", csv_out;
@@ -72,7 +72,7 @@ Options parse(int argc, char** argv)
         const std::string_view arg(argv[i]);
         if (arg == "--help") {
             std::puts("--context N[,N...] --splitk K[,K...] --warmup N --iters N "
-                      "--requests N --watchdog N --heads N --rows N --page-tokens N\n"
+                      "--requests N --heads N --rows N --page-tokens N\n"
                       "--impl aiv|aic|both --single --csv-out PATH --page-begin P --page-count P\n"
                       "Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8,12,16.\n"
                       "Use --page-tokens 16 --heads 1 --context 48 for a short CAModel run.");
@@ -93,7 +93,6 @@ Options parse(int argc, char** argv)
         else if (arg == "--csv-out") o.csv_out = value;
         else if (arg == "--page-begin") o.page_begin = number(value);
         else if (arg == "--page-count") o.page_count = number(value);
-        else if (arg == "--watchdog") o.watchdog = number(value);
         else throw std::runtime_error("unknown option: " + std::string(arg));
     }
     if (o.single) { o.warmup = 0; o.iters = 1; }
@@ -111,8 +110,8 @@ Options parse(int argc, char** argv)
                 "partial page windows require --impl aic; both compares full contexts");
     }
     for (int k : o.splits) require(k >= 1 && k <= 16, "splitk must be 1..16");
-    require(o.iters > 0 && o.warmup >= 0 && o.requests > 0 && o.requests <= 16 &&
-            o.watchdog > 0, "invalid iteration, batch or watchdog bound");
+    require(o.iters > 0 && o.warmup >= 0 && o.requests > 0 && o.requests <= 16,
+            "invalid iteration or batch bound");
     return o;
 }
 
@@ -166,8 +165,12 @@ struct Events {
 
 struct Measurement {
     bool present = false, timed = false;
-    double us = 0, p95 = 0, tail = 0, lock = 0;
-    std::uint64_t failed = 0, timeouts = 0, launches = 0;
+    // `export_region` is the former `lock`: with the critical section gone,
+    // what the census times is the non-blocking partial write that replaced
+    // it. The spin and timeout counters went with the lock -- there is
+    // nothing left to fail to acquire and no watchdog to expire.
+    double us = 0, p95 = 0, tail = 0, export_region = 0;
+    std::uint64_t launches = 0;
 };
 
 template<class D>
@@ -183,12 +186,12 @@ Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& e
     for (int i = 0; i < o.warmup; ++i) {
         d.Reset();
         check(aclrtSynchronizeStream(stream), "warmup pre-launch synchronize");
-        d.Launch(stream, k, o.watchdog);
+        d.Launch(stream, k);
         check(aclrtSynchronizeStream(stream), "warmup post-launch synchronize");
         ++result.launches;
         d.Validate(k);
     }
-    std::vector<double> times, tails, locks;
+    std::vector<double> times, tails, exports;
     bool valid_events = true;
     for (int i = 0; i < o.iters; ++i) {
         d.Reset();
@@ -196,7 +199,7 @@ Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& e
 #if !defined(ASCEND_MICRO_BENCH_SIM)
         check(aclrtRecordEvent(events.start, stream), "record start");
 #endif
-        d.Launch(stream, k, o.watchdog);
+        d.Launch(stream, k);
 #if defined(ASCEND_MICRO_BENCH_SIM)
         check(aclrtSynchronizeStream(stream), "CAModel post-launch synchronize");
         const float ms = 0.0f;
@@ -211,23 +214,22 @@ Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& e
         require(std::isfinite(ms) && ms >= 0, "invalid event duration");
         valid_events = valid_events && ms > 0;
         const auto census = d.Validate(k);
-        result.failed += census.failed; result.timeouts += census.timeouts;
         if (o.single) {
             // No percentile sorting or multi-sample accumulation in profiling mode.
             result.us = ms * 1000.0;
             result.tail = census.tail_ticks.empty() ? 0 : *std::max_element(census.tail_ticks.begin(), census.tail_ticks.end());
-            result.lock = census.lock_ticks.empty() ? 0 : *std::max_element(census.lock_ticks.begin(), census.lock_ticks.end());
+            result.export_region = census.export_ticks.empty() ? 0 : *std::max_element(census.export_ticks.begin(), census.export_ticks.end());
         } else {
             times.push_back(ms * 1000.0);
             tails.insert(tails.end(), census.tail_ticks.begin(), census.tail_ticks.end());
-            locks.insert(locks.end(), census.lock_ticks.begin(), census.lock_ticks.end());
+            exports.insert(exports.end(), census.export_ticks.begin(), census.export_ticks.end());
         }
     }
     if (!o.single) {
         const auto latency = summarize(times);
         result.us = latency.p50; result.p95 = latency.p95;
         if (!tails.empty()) result.tail = summarize(tails).p50;
-        if (!locks.empty()) result.lock = summarize(locks).p50;
+        if (!exports.empty()) result.export_region = summarize(exports).p50;
     }
     result.timed = valid_events;
 #if defined(ASCEND_MICRO_BENCH_SIM)
@@ -253,16 +255,16 @@ void row(int n, int k, int grid, const Measurement& aiv, const Measurement& aic,
     const auto cr = field(aic.us, aic.timed);
     const auto cn = field(aic.us / 16.0, aic.timed);
     const auto cbw = field(aic.timed ? aic_bytes * 16 / aic.us / 1000 : 0, aic.timed);
-    const auto tail = field(aiv.tail, aiv.present, 0), lock = field(aiv.lock, aiv.present, 0);
-    const auto spins = aiv.present ? std::to_string(aiv.failed) : "NA";
-    std::printf("| %11d | %10d | %6d | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %12s |\n",
+    const auto tail = field(aiv.tail, aiv.present, 0);
+    const auto exported = field(aiv.export_region, aiv.present, 0);
+    std::printf("| %11d | %10d | %6d | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s |\n",
                 n, k, grid, av.c_str(), speed.c_str(), abw.c_str(), cr.c_str(), cn.c_str(),
-                cbw.c_str(), tail.c_str(), lock.c_str(), spins.c_str());
+                cbw.c_str(), tail.c_str(), exported.c_str());
     if (csv.is_open()) {
         csv << n << ',' << k << ',' << grid << ',' << av << ',' << speed << ',' << abw << ','
             << cr << ',' << cn << ',' << cbw << ','
             << field(aic.timed ? aic_bytes / aic.us / 1000 : 0, aic.timed) << ','
-            << tail << ',' << lock << ',' << spins << ',' << aiv.timeouts << ','
+            << tail << ',' << exported << ','
             << aiv.launches << ',' << aic.launches << '\n';
         csv.flush();
         require(static_cast<bool>(csv), "CSV write failed");
@@ -285,21 +287,21 @@ int main(int argc, char** argv)
         if (!o.csv_out.empty()) {
             csv.open(o.csv_out, std::ios::out | std::ios::trunc);
             require(csv.is_open(), "cannot open --csv-out path");
-            csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,lock_ticks,failed_spins,timeouts,aiv_launches,aic_launches\n";
+            csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,export_ticks,aiv_launches,aic_launches\n";
         }
         if (o.single) std::puts("[PROFILING MODE] Single launch mode active for msprof op.");
         std::puts("AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.");
         std::puts("AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.");
-        if (o.single) std::puts("Single samples replace p50; tail/lock show maxima. No implicit K=1 launch.");
+        if (o.single) std::puts("Single samples replace p50; tail/export show maxima. No implicit K=1 launch.");
         std::printf("impl=%s requests=%d heads=%d AIV_rows=%d AIC_rows=16 page_tokens=%d warmup=%d iters=%d\n",
                     o.impl.c_str(), o.requests, o.heads, o.rows, o.page_tokens, o.warmup, o.iters);
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+--------------+");
-        std::printf("| %11s | %10s | %6s | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %12s |\n",
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
+        std::printf("| %11s | %10s | %6s | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s |\n",
                     "Context (N)", "Splits (K)", "Grid", o.single ? "AIV (us)" : "AIV p50(us)",
                     "AIV Speedup", "AIV KV GB/s", "AIC Batch Raw(us)",
                     o.single ? "AIC Model(us/req)" : "AIC Model p50(us/req)", "AIC Model GB/s",
-                    "Tail (ticks)", o.single ? "Lock (ticks)" : "Lock p50(ticks)", "Failed Spins");
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+--------------+");
+                    "Tail (ticks)", o.single ? "Export (ticks)" : "Export p50(ticks)");
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
         tq_npu::Session session;
         Events events;
         struct Comparison { int n, k; double aiv, aic; };
@@ -336,7 +338,7 @@ int main(int argc, char** argv)
                     comparisons.push_back({n, k, aiv.us, aic.us / 16});
             }
         }
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+--------------+");
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
         for (const auto& c : comparisons)
             std::printf("Modeled comparison N=%d K=%d: AIC %.3f us/row vs AIV %.3f us/decode (%s).\n",
                         c.n, c.k, c.aic, c.aiv, c.aic < c.aiv ? "AIC amortized model lower" : "AIV lower");

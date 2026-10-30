@@ -315,7 +315,7 @@ int run(bool single_tile)
                 tq_splitk_rig::AivRig rig(*passes[pass], k);
                 rig.Reset();
                 check(aclrtSynchronizeStream(session.stream), "pre-launch synchronize");
-                rig.Launch(session.stream, k, 1000000);
+                rig.Launch(session.stream, k);
                 check(aclrtSynchronizeStream(session.stream), "post-launch synchronize");
                 rig.Validate(k);
                 sk[pass] = rig.Context();

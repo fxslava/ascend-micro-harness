@@ -87,7 +87,7 @@ int run()
                 tq_splitk_rig::AicRig rig(f, k, begin, count);
                 rig.Reset();
                 check(aclrtSynchronizeStream(session.stream), "pre-launch synchronize");
-                rig.Launch(session.stream, 0, 0);
+                rig.Launch(session.stream, 0);
                 check(aclrtSynchronizeStream(session.stream), "post-launch synchronize");
                 rig.Validate(0);
 
@@ -152,7 +152,7 @@ int run()
                 tq_splitk_rig::AicRig rig(f, k, begin, count);
                 rig.Reset();
                 check(aclrtSynchronizeStream(session.stream), "pre-launch synchronize");
-                rig.Launch(session.stream, 0, 0);
+                rig.Launch(session.stream, 0);
                 check(aclrtSynchronizeStream(session.stream), "post-launch synchronize");
                 rig.Validate(0);
 
