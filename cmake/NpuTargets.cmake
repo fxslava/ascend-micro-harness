@@ -72,6 +72,32 @@ function(add_ascend_micro_npu_targets)
       turboquant_a8_npu turboquant_bf16_npu turboquant_bf16_baseline_npu ascendcl)
   target_compile_options(bench_turboquant_reshape_and_cache PRIVATE -Wall -Wextra -Werror)
 
+  option(ASCEND_MICRO_NATIVE_INGEST "Enable the optional CANN native ingest comparator" ON)
+  if(ASCEND_MICRO_NATIVE_INGEST)
+    find_path(TQ_INGEST_ACLNN_INCLUDE aclnn_scatter_pa_kv_cache.h
+        HINTS "${ASCEND_HOME_PATH}/include/aclnnop"
+              "${ASCEND_HOME_PATH}/x86_64-linux/include/aclnnop" NO_DEFAULT_PATH)
+    find_library(TQ_INGEST_OPAPI NAMES opapi_transformer opapi
+        HINTS "${ASCEND_HOME_PATH}/lib64" NO_DEFAULT_PATH)
+    find_library(TQ_INGEST_NNOPBASE NAMES nnopbase
+        HINTS "${ASCEND_HOME_PATH}/lib64" NO_DEFAULT_PATH)
+    if(TQ_INGEST_ACLNN_INCLUDE AND TQ_INGEST_OPAPI AND TQ_INGEST_NNOPBASE)
+      target_compile_definitions(bench_turboquant_reshape_and_cache PRIVATE
+          ASCEND_MICRO_HAVE_NATIVE_INGEST
+          TQ_INGEST_OPAPI_PATH="${TQ_INGEST_OPAPI}"
+          TQ_INGEST_NNOPBASE_PATH="${TQ_INGEST_NNOPBASE}")
+      target_include_directories(bench_turboquant_reshape_and_cache PRIVATE
+          "${TQ_INGEST_ACLNN_INCLUDE}")
+      target_link_libraries(bench_turboquant_reshape_and_cache PRIVATE
+          ${CMAKE_DL_LIBS})
+    else()
+      message(STATUS "Native ingest comparator unavailable; audit will report N/A")
+    endif()
+  endif()
+
+  add_executable(test_ingest_audit_report tests/cpu/test_ingest_audit_report.cpp)
+  target_compile_options(test_ingest_audit_report PRIVATE -Wall -Wextra -Werror)
+
   # ---------------------------------------------------------- Split-K decode
   # Physical-device decode libraries. The AIC source retains its legacy
   # validation ABI and also exports the dynamic M=16 temporal split entry.
