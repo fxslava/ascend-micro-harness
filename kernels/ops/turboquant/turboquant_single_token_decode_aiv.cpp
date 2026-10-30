@@ -66,6 +66,11 @@
 
 #if defined(__CCE_AICORE__)
 #include "kernel_operator.h"
+// After kernel_operator.h so that TQ_TAIL_FN expands to the device core-type
+// attribute rather than plain `inline`; the header's own note records why that
+// include order is load-bearing and what the link error looks like when it is
+// not respected.
+#include "turboquant_decode_tail.hpp"
 #include "../../../routines/routine_vector_decode_gemv.hpp"
 #include "../../../routines/routine_vector_decode_recurrence.hpp"
 #include "../../../routines/routine_vector_rotate_butterfly.hpp"
@@ -304,6 +309,11 @@ struct Geometry {
     std::uint32_t strips;        // strips processed per page
     std::uint32_t strip_begin;
     std::uint32_t page_begin;
+    // Live tokens in the sequence, which is NOT seq_pages * block_size: in
+    // generative decoding S grows by one per step, so the last page and the
+    // last strip of that page are usually partly dead. Capacity decides what
+    // may be addressed; this decides what enters the softmax.
+    std::uint32_t seq_len;
 };
 
 // The packed strip's byte offset. Both planes share the layout
@@ -564,7 +574,16 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kEvtPanelFree + slot);
     }
-    const std::uint32_t count = geom.seq_pages * geom.strips;
+    // Live strips, not capacity strips. `seq_pages * strips` rounds the
+    // context up to the next whole strip and walks cache slots this sequence
+    // never wrote; `LiveStripsInWindow` stops at the first strip that holds no
+    // live token, which is sound because the walk's token base increases with
+    // the index (see the header's monotonicity note, checked by Run_ before
+    // this point). At an aligned seq_len the two agree exactly, which is how
+    // the aligned callers keep their old trip count.
+    const std::uint32_t count = turboquant_decode_tail::LiveStripsInWindow(
+        geom.seq_len, geom.page_begin, geom.seq_pages, geom.block_size,
+        geom.strip_begin, geom.strips);
     // Prefill both landings before the first Vector wait. Refill is issued
     // only after retiring that slot's recurrence, never ahead of its credit.
     for (std::uint32_t index = 0; index < count && index < kStageDepth; ++index) {
@@ -602,7 +621,19 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
             rec.key_scale = View<float>(kUbKeyScale[slot], kKeys);
             rec.value_scale = View<float>(kUbValueScale[slot], kKeys);
             rec.value_page = View<float>(kUbValuePage[slot], kPanelElems);
-            ascend_micro::vector_decode_recur_rows(rec, rows);
+            // At most one strip of a sequence is partial, and `active` is
+            // 16 on every other, so the aligned path takes the same entry
+            // point with the same instruction stream as before. `active` is
+            // never 0 here: `count` is the live prefix, so every index the
+            // loop reaches holds at least one live token.
+            const std::uint32_t active = turboquant_decode_tail::WalkActive(
+                tick - 1u, geom.strips, geom.page_begin, geom.strip_begin,
+                geom.block_size, geom.seq_len);
+            if (active == turboquant_decode_tail::kStripTokens)
+                ascend_micro::vector_decode_recur_rows(rec, rows);
+            else
+                ascend_micro::vector_decode_recur_rows_masked(
+                    rec, rows, active, turboquant_decode_tail::kMaskedScore);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
             const std::uint32_t index = tick - 1u + kStageDepth;
@@ -653,7 +684,8 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* q_rot_gm, __gm__ std::int8_t* key
                             std::uint32_t cache_pages, std::uint32_t seq_pages,
                             std::uint32_t strips, std::uint32_t strip_begin,
                             std::uint32_t item_begin, std::uint32_t item_count,
-                            std::uint32_t page_begin = 0u)
+                            std::uint32_t page_begin = 0u,
+                            std::uint32_t seq_len = 0u)
 {
     // `head_size` and `rows` are runtime operands while the butterfly's four
     // resident registers, the strip geometry and the GEMV's repeat strides are
@@ -666,6 +698,31 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* q_rot_gm, __gm__ std::int8_t* key
     if (block_size % kStripHeight != 0u) return;
     if (strips == 0u || seq_pages == 0u) return;
     if (strip_begin + strips > block_size / kStripHeight) return;
+    // The trip count below is a PREFIX of the walk, which holds only if the
+    // walk's token base rises with the index. The line above already implies
+    // it; this states it through the predicate the launcher checks too, so the
+    // two cannot drift apart.
+    if (!turboquant_decode_tail::WalkIsMonotone(strip_begin, strips, block_size))
+        return;
+
+    // `seq_len == 0` means "every token of the window is live", which is what
+    // every caller from before the tail change meant, and
+    // `WholeWindowTokens` is exactly that count. Spelling the default this way
+    // rather than branching later keeps ONE definition of the live set.
+    const std::uint32_t live =
+        seq_len == 0u
+            ? static_cast<std::uint32_t>(turboquant_decode_tail::WholeWindowTokens(
+                  page_begin, seq_pages, block_size, strip_begin, strips))
+            : seq_len;
+    // Both refusals are silent-wrong-answer shaped rather than crash shaped: a
+    // window that stops short of the live tail would return a context computed
+    // from a truncated sequence, and a seq_len past the cache would read pages
+    // that were never allocated.
+    if (!turboquant_decode_tail::WindowCoversSeqLen(live, page_begin, seq_pages,
+                                                    block_size, strip_begin, strips))
+        return;
+    if (!turboquant_decode_tail::SeqLenInCapacity(live, cache_pages, block_size))
+        return;
 
     Geometry geom;
     geom.num_kv_heads = num_kv_heads;
@@ -678,6 +735,7 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* q_rot_gm, __gm__ std::int8_t* key
     geom.strips = strips;
     geom.strip_begin = strip_begin;
     geom.page_begin = page_begin;
+    geom.seq_len = live;
 
     AscendC::GlobalTensor<bfloat16_t> q_rot;
     AscendC::GlobalTensor<float> scale_cache, gate, pi_signs;
@@ -796,7 +854,37 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_boundary_ai
                                   stripBegin, itemBegin, itemCount, pageBegin);
 }
 
+// An arbitrary context length: `seqLen` live tokens inside a window of
+// `seqPages` pages. The aligned entry points above are unchanged and keep
+// passing no seq_len at all, so their behaviour and their verified ladders are
+// untouched; this one exists because the tail is a different CONTRACT, not a
+// different algorithm -- it shares Run_ and therefore the whole pipeline.
+extern "C" __global__ __aicore__ void turboquant_single_token_decode_tail_aiv(
+    __gm__ bfloat16_t* __restrict__ qRot, __gm__ std::int8_t* __restrict__ keyCache,
+    __gm__ std::int8_t* __restrict__ valueCache, __gm__ float* __restrict__ scaleCache,
+    __gm__ std::uint32_t* __restrict__ blockTable, __gm__ float* __restrict__ gate,
+    __gm__ float* __restrict__ piSigns, __gm__ float* __restrict__ outScores,
+    __gm__ float* __restrict__ outState, __gm__ float* __restrict__ outAcc,
+    __gm__ float* __restrict__ outRotated, __gm__ bfloat16_t* __restrict__ outContext,
+    __gm__ std::int32_t* __restrict__ launchProbe, uint32_t numRequests,
+    uint32_t numKvHeads, uint32_t rows, uint32_t headSize, uint32_t blockSize,
+    uint32_t cachePages, uint32_t seqPages, uint32_t strips, uint32_t stripBegin,
+    uint32_t itemBegin, uint32_t itemCount, uint32_t pageBegin, uint32_t seqLen)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::InitSocState();
+    turboquant_single_token::Run_(qRot, keyCache, valueCache, scaleCache, blockTable,
+                                  gate, piSigns, outScores, outState, outAcc, outRotated,
+                                  outContext, launchProbe, numRequests, numKvHeads, rows,
+                                  headSize, blockSize, cachePages, seqPages, strips,
+                                  stripBegin, itemBegin, itemCount, pageBegin, seqLen);
+}
+
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
+
+#include <stdexcept>
+
+#include "turboquant_decode_tail.hpp"
 
 extern "C" __global__ __aicore__ void turboquant_single_token_decode_aiv(
     __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
@@ -848,6 +936,52 @@ extern "C" void launch_turboquant_single_token_decode_boundary_aiv(
         reinterpret_cast<bfloat16_t*>(out_context), launch_probe, num_requests,
         num_kv_heads, rows, head_size, block_size, cache_pages, seq_pages, strips,
         strip_begin, item_begin, item_count, page_begin);
+}
+
+extern "C" __global__ __aicore__ void turboquant_single_token_decode_tail_aiv(
+    __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
+    __gm__ std::uint32_t*, __gm__ float*, __gm__ float*, __gm__ float*, __gm__ float*,
+    __gm__ float*, __gm__ float*, __gm__ bfloat16_t*, __gm__ std::int32_t*, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t);
+
+// The host half of the arbitrary-context contract. The device refuses a
+// geometry it cannot honour by returning, which on a grid of blocks is silent;
+// here the same two predicates throw, so a caller learns which rule it broke
+// instead of reading an all-canary output buffer. The convention follows
+// `launch_turboquant_paged_decode_splitk_aic`, which refuses an invalid
+// temporal split the same way.
+extern "C" void launch_turboquant_single_token_decode_tail_aiv(
+    void* stream, std::uint32_t block_dim, std::uint16_t* q_rot, std::int8_t* key_cache,
+    std::int8_t* value_cache, float* scale_cache, std::uint32_t* block_table, float* gate,
+    float* pi_signs, float* out_scores, float* out_state, float* out_acc,
+    float* out_rotated, std::uint16_t* out_context, std::int32_t* launch_probe,
+    std::uint32_t num_requests, std::uint32_t num_kv_heads, std::uint32_t rows,
+    std::uint32_t head_size, std::uint32_t block_size, std::uint32_t cache_pages,
+    std::uint32_t seq_pages, std::uint32_t strips, std::uint32_t strip_begin,
+    std::uint32_t item_begin, std::uint32_t item_count, std::uint32_t page_begin,
+    std::uint32_t seq_len)
+{
+    if (!turboquant_decode_tail::WalkIsMonotone(strip_begin, strips, block_size))
+        throw std::invalid_argument(
+            "single_token_decode_tail: the strip window must lie inside a page "
+            "that is a whole number of 16-token strips, or the trip count is "
+            "not a prefix of the walk");
+    if (!turboquant_decode_tail::WindowCoversSeqLen(seq_len, page_begin, seq_pages,
+                                                    block_size, strip_begin, strips))
+        throw std::invalid_argument(
+            "single_token_decode_tail: seqLen has live tokens past the end of "
+            "the window; the launch would silently truncate the sequence");
+    if (!turboquant_decode_tail::SeqLenInCapacity(seq_len, cache_pages, block_size))
+        throw std::invalid_argument(
+            "single_token_decode_tail: seqLen exceeds the allocated cache");
+    turboquant_single_token_decode_tail_aiv<<<block_dim, nullptr, stream>>>(
+        reinterpret_cast<bfloat16_t*>(q_rot), key_cache, value_cache, scale_cache,
+        block_table, gate, pi_signs,
+        out_scores, out_state, out_acc, out_rotated,
+        reinterpret_cast<bfloat16_t*>(out_context), launch_probe, num_requests,
+        num_kv_heads, rows, head_size, block_size, cache_pages, seq_pages, strips,
+        strip_begin, item_begin, item_count, page_begin, seq_len);
 }
 
 #endif

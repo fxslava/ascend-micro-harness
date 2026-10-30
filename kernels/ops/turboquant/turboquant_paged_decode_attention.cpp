@@ -150,10 +150,17 @@
 //
 // **The risk.** Section 6.2c records a measured case where a mode-4 id reused
 // across ring slots released a wait 2179 cycles before the announcement it was
-// waiting for: a stale set from an earlier announcement on the same id. The
-// fix that holds under any reading of the mechanism is one id per
-// announcement, and with two-slot rings over eight strips each id here carries
-// **four** announcements. The 8-strip rung measured that risk coming true on
+// waiting for: a stale set from an earlier announcement on the same id. NOTE,
+// 2026-10-29: section 6.2c has since been corrected. That stale release was
+// section 6.2a's hazard -- an announcement issued on the scalar unit ahead of
+// the pipeline work it reported -- and not a non-consuming latch; recycled
+// mode-4 ids ARE sound when every announcement is drained first, which
+// tests/research/kernel_cluster_sync_probe.cpp measured on silicon and on
+// CAModel. So the id counts below are no longer a hazard in themselves. What
+// this kernel has NOT had is scripts/audit_cross_core_fences.py run over it,
+// which is the gate for the precondition; do that before relying on the
+// reasoning in the rest of this comment. With two-slot rings over eight
+// strips each id here carries **four** announcements. The 8-strip rung measured that risk coming true on
 // kFlagL1Free -- see the kL1End comment for the ticks -- and that edge is now
 // gone, its ring replaced by one L1 page per strip. The three surviving
 // channels still carry four announcements each, so the same risk applies to
@@ -239,6 +246,9 @@
 #if defined(__CCE_AICORE__)
 #include "tensor_api/tensor.h"
 #include "kernel_operator.h"
+// Before the routines but after kernel_operator.h, so TQ_TAIL_FN carries the
+// device core-type attribute. See the header's note on the link error.
+#include "turboquant_decode_tail.hpp"
 #include "../../../routines/routine_stage_page_zn_bf16.hpp"
 #include "../../../routines/routine_fractal_load_zn_bf16.hpp"
 #include "../../../routines/routine_cube_decode_score.hpp"
@@ -740,7 +750,7 @@ __aicore__ inline void DequantValueStrip(ValueEngine&)
 // The recurrence over one strip: all 16 queries, then the archive copy and the
 // two release edges.
 template <std::uint32_t Slot, std::uint32_t Strip>
-__aicore__ inline void RecurStrip(ValueEngine&)
+__aicore__ inline void RecurStrip(ValueEngine&, std::uint32_t active)
 {
     static_assert(Slot < kStageDepth && Strip < kStrips);
     constexpr std::int32_t evt = static_cast<std::int32_t>(Slot);
@@ -782,7 +792,24 @@ __aicore__ inline void RecurStrip(ValueEngine&)
     AscendC::LocalTensor<float> archived{kUb, kArchiveSlot<Strip>, kScores};
 
     AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagScoreReady<Slot>);
-    ascend_micro::vector_decode_recur_strip(es);
+    // `active` is the live token count of this strip, 0..16. The flag edges
+    // around this point are issued unconditionally, whatever it is: the Cube
+    // announces a score panel per strip of its own per-page count and waits
+    // for the matching free, so a strip this core declined to accumulate must
+    // still be acknowledged or the ring stalls. Only the arithmetic varies.
+    //
+    // A fully dead strip is SKIPPED rather than masked, and that is not an
+    // optimisation. With all sixteen lanes masked the centred row is exactly 0
+    // and exp(0) is 1, so the strip would add 16 to the denominator instead of
+    // 0 whenever no live strip had been seen yet -- which is the case for
+    // every strip of a split whose whole page range lies past the live tail.
+    // Carrying (m, l, Acc) untouched is exactly a zero contribution, and it is
+    // correct regardless of what came before.
+    if (active == kTokens)
+        ascend_micro::vector_decode_recur_strip(es);
+    else if (active != 0u)
+        ascend_micro::vector_decode_recur_strip_masked(
+            es, active, turboquant_decode_tail::kMaskedScore);
     AscendC::PipeBarrier<PIPE_V>();
     // The RAW panel, before the key scale, so the runner can check what the
     // Cube produced rather than what the recurrence derived from it. Muls by
@@ -801,7 +828,8 @@ __aicore__ inline void RecurStrip(ValueEngine&)
 }
 
 template <std::uint32_t Column>
-__aicore__ inline void StepColumnValue(ValueEngine& engine, std::uint32_t strips)
+__aicore__ inline void StepColumnValue(ValueEngine& engine, std::uint32_t strips,
+                                       std::uint32_t live_tokens)
 {
     // The recurrence is emitted FIRST, before this column's MTE2 ingress, and
     // the order is load-bearing rather than cosmetic.
@@ -828,7 +856,15 @@ __aicore__ inline void StepColumnValue(ValueEngine& engine, std::uint32_t strips
     // idle either way.
     if constexpr (Column >= kPipelineLag && Column - kPipelineLag < kStrips) {
         if (Column - kPipelineLag < strips)
-            RecurStrip<kSlotOf<Column - kPipelineLag>, Column - kPipelineLag>(engine);
+            // `live_tokens` is this PAGE's live token count, so the strip's own
+            // base is its index times 16 -- the same `ActiveInStrip` the two
+            // AIV decode kernels use, and the one the host test checks over
+            // four million inputs.
+            RecurStrip<kSlotOf<Column - kPipelineLag>, Column - kPipelineLag>(
+                engine, turboquant_decode_tail::ActiveInStrip(
+                            static_cast<std::uint64_t>(Column - kPipelineLag) *
+                                turboquant_decode_tail::kStripTokens,
+                            live_tokens));
     }
     if constexpr (Column >= 3u && Column - 3u < kStrips) {
         if (Column - 3u < strips) DequantValueStrip<kSlotOf<Column - 3u>>(engine);
@@ -840,9 +876,10 @@ __aicore__ inline void StepColumnValue(ValueEngine& engine, std::uint32_t strips
 
 template <std::uint32_t... Columns>
 __aicore__ inline void StepColumnsValue(ValueEngine& engine, std::uint32_t strips,
+                                        std::uint32_t live_tokens,
                                         std::integer_sequence<std::uint32_t, Columns...>)
 {
-    (StepColumnValue<Columns>(engine, strips), ...);
+    (StepColumnValue<Columns>(engine, strips, live_tokens), ...);
 }
 
 // ---------------------------------------------------------------- the egress
@@ -903,7 +940,26 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
                                       std::uint32_t key_scale_base,
                                       std::uint32_t value_scale_base,
                                       std::uint32_t gate_base,
-                                      std::uint32_t strips, bool partial = false,
+                                      std::uint32_t strips,
+                                      // Live tokens in THIS page, 0..strips*16,
+                                      // measured from the FIRST STRIP THIS CALL
+                                      // PROCESSES. That equals the page start
+                                      // only when the caller's strip window
+                                      // starts at strip 0, which is true of
+                                      // every caller here: the split-K entry
+                                      // always starts at 0, and the legacy
+                                      // validation entry, which does carry a
+                                      // strip_begin, declares its whole window
+                                      // live. A future caller that wants both a
+                                      // nonzero strip_begin and a real tail has
+                                      // to subtract strip_begin * 16 itself.
+                                      //
+                                      // No default: a caller that has not
+                                      // thought about the tail should not be
+                                      // able to get the aligned answer by
+                                      // omission.
+                                      std::uint32_t live_tokens,
+                                      bool partial = false,
                                       bool initialize = true, bool finalize = true)
 {
     ValueEngine engine;
@@ -965,7 +1021,7 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
         AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFree<0>);
         AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFree<1>);
 
-        StepColumnsValue(engine, strips, ColumnSeq{});
+        StepColumnsValue(engine, strips, live_tokens, ColumnSeq{});
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
@@ -1258,7 +1314,12 @@ extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
                        out_acc + out_base, out_context + out_base,
                        out_rotated + out_base,
                        strip_base_bytes + strip_begin * kPackedBytes, scale_base,
-                       scale_plane + scale_base, q_base, strips);
+                       scale_plane + scale_base, q_base, strips,
+                       // The legacy validation ABI has no seq_len operand, so
+                       // it declares every token of its strip window live --
+                       // which is what it meant before the tail change, and
+                       // keeps its verified ladder bit-identical.
+                       strips * kTokens);
     } else {
         run_key_core(key_cache, strip_base_bytes + strip_begin * kPackedBytes, strips);
     }
@@ -1272,7 +1333,7 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
     __gm__ uint32_t* table, __gm__ bfloat16_t* qrot,
     __gm__ float* state, __gm__ float* acc, uint32_t requests, uint32_t heads,
     uint32_t block_size, uint32_t cache_pages, uint32_t seq_pages,
-    uint32_t splits, uint32_t page_begin, uint32_t page_count)
+    uint32_t splits, uint32_t page_begin, uint32_t page_count, uint32_t seq_len)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     AscendC::InitSocState();
@@ -1287,6 +1348,13 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
     const uint32_t request = head_item / heads, head = head_item % heads;
     const auto range = turboquant_splitk::Partition(page_count, splits, item % splits);
     const uint32_t strips = block_size / kTokens;
+    // 0 means "every page of the sequence is live", the pre-tail contract.
+    // Note what is NOT done here: the Cube's per-page strip count stays at
+    // capacity, so the strip pipeline, the mode-4 announcements and their
+    // count are untouched. Only the Vector core's arithmetic per strip varies.
+    const uint32_t live_seq = seq_len == 0u ? seq_pages * block_size : seq_len;
+    if (!turboquant_decode_tail::SeqLenInCapacity(live_seq, cache_pages, block_size))
+        return;
     if ASCEND_IS_AIC {
         // Q rotation is amortized over the entire page range, not repeated
         // per page. The modulo-8 strip pipeline is primed/drained per page.
@@ -1300,11 +1368,19 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
             const uint32_t physical = range.count == 0u ? 0u :
                 table[request * seq_pages + page_begin + range.begin + p];
             const uint32_t base = (physical * heads + head) * block_size;
+            // The LOGICAL page, which is what the live tail is measured in --
+            // the physical page above is wherever the block table put it. A
+            // page past the tail yields 0 live tokens, so every strip of it is
+            // skipped while its flag edges are still exchanged.
+            const uint32_t live_tokens = range.count == 0u ? 0u :
+                turboquant_decode_tail::ActiveInPage(
+                    page_begin + range.begin + p, block_size, live_seq);
             run_value_core(value, scales, nullptr, nullptr, nullptr, nullptr,
                 nullptr, state + item * 2u * kTokens * kStateLanes,
                 acc + item * kPanel, nullptr, nullptr, base * kHeadSize / 2u,
                 base, cache_pages * heads * block_size + base, 0u,
-                range.count == 0u ? 0u : strips, true, p == 0u, p + 1u == iterations);
+                range.count == 0u ? 0u : strips, live_tokens, true, p == 0u,
+                p + 1u == iterations);
             if (range.count != 0u) {
                 AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagPageDrainedV0);
                 AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
@@ -1333,6 +1409,8 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
 
 #include <cassert>
 #include <stdexcept>
+
+#include "turboquant_decode_tail.hpp"
 
 extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
     __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*,
@@ -1364,7 +1442,7 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
     __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*,
     __gm__ std::int8_t*, __gm__ float*, __gm__ uint32_t*, __gm__ bfloat16_t*,
     __gm__ float*, __gm__ float*, uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t);
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 
 extern "C" void launch_turboquant_paged_decode_splitk_aic(
     void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key,
@@ -1372,16 +1450,31 @@ extern "C" void launch_turboquant_paged_decode_splitk_aic(
     std::uint16_t* qrot, float* state, float* acc, std::uint32_t requests,
     std::uint32_t heads, std::uint32_t block_size, std::uint32_t cache_pages,
     std::uint32_t seq_pages, std::uint32_t splits, std::uint32_t page_begin,
-    std::uint32_t page_count)
+    std::uint32_t page_count, std::uint32_t seq_len)
 {
     if (!requests || !heads || !splits || splits > 16 || !seq_pages ||
         !block_size || block_size > paged_decode::kBlockSize || block_size % 16 ||
         seq_pages > cache_pages || page_begin > seq_pages || page_count > seq_pages - page_begin)
         throw std::invalid_argument("invalid AIC temporal split geometry");
+    // The same two refusals the AIV launchers make, for the same reason: the
+    // device returns on a violation, which on a grid of blocks is silent, so a
+    // caller would read an all-canary output rather than learn what it broke.
+    // 0 keeps the pre-tail contract, where the whole allocation is live.
+    if (seq_len != 0u) {
+        if (!turboquant_decode_tail::SeqLenInCapacity(seq_len, cache_pages, block_size))
+            throw std::invalid_argument(
+                "paged_decode_splitk_aic: seqLen exceeds the allocated cache");
+        if (!turboquant_decode_tail::WindowCoversSeqLen(
+                seq_len, page_begin, page_count, block_size, 0u, block_size / 16u))
+            throw std::invalid_argument(
+                "paged_decode_splitk_aic: seqLen has live tokens past the end of "
+                "the page window; the launch would silently truncate the sequence");
+    }
     turboquant_paged_decode_splitk_aic<<<requests * heads * splits, nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(q), reinterpret_cast<bfloat16_t*>(pi_table),
         key, value, scales, table, reinterpret_cast<bfloat16_t*>(qrot), state, acc,
-        requests, heads, block_size, cache_pages, seq_pages, splits, page_begin, page_count);
+        requests, heads, block_size, cache_pages, seq_pages, splits, page_begin,
+        page_count, seq_len);
 }
 
 #endif

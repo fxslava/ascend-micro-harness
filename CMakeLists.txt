@@ -28,5 +28,13 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 include(cmake/SimTargets.cmake)
 include(cmake/NpuTargets.cmake)
 
+# The research probes under tests/research are registered inside these two
+# functions rather than through add_subdirectory, because RUN_MODE is set per
+# function: a subdirectory included here would pick up whichever mode happened
+# to be global and would give one build of the probe instead of the hardware
+# and simulator pair the evidence needs.
 add_ascend_micro_sim_targets()
 add_ascend_micro_npu_targets()
+
+include(cmake/CannRebuild.cmake)
+add_ascend_micro_cann_rebuild_steps()

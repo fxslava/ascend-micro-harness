@@ -19,16 +19,16 @@ void turboquant_reshape_and_cache_impl(
 }
 
 namespace {
-constexpr int kTokens = 1024;
+constexpr int kDefaultStrips = 64;  // 1024 tokens
 constexpr int kWarmups = 50;
 constexpr int kSamples = 500;
 constexpr std::size_t kEvictionBytes = 128u * 1024u * 1024u;
-// Our BF16 Cube kernel is driven in windows, like its validation harness: one
-// strip per grid block per launch, at most this many blocks at a time. At
-// kTokens that makes 64 strips two launches against the A8 kernel's one, and
-// the timed sample covers all of them, so the comparison is end-to-end work
-// rather than per-dispatch. The launch count is printed next to the timings.
-constexpr int kBenchWindow = 32;
+// All three kernels now dispatch one monolithic grid of one strip per block.
+// The BF16 Cube kernel used to be driven in capped windows here, so at 64
+// strips it paid two dispatches against the other two kernels' one and the
+// comparison carried a launch-count difference. It carries the inter-wave
+// protocol now (turboquant_wave_protocol.hpp), so every row below is one
+// launch of f.strips() blocks and the three kernels are timed on equal terms.
 
 std::int32_t float_word(float x) {
     const auto raw = tq_npu::bits(x);
@@ -106,12 +106,12 @@ Stats summarize(std::vector<double> samples) {
 }
 template <typename Launch>
 Stats measure(aclrtStream stream, Launch&& launch, tq_npu::Buffer& eviction_src,
-              tq_npu::Buffer& eviction_dst, bool evict) {
-    for (int i = 0; i < kWarmups; ++i) launch();
+              tq_npu::Buffer& eviction_dst, bool evict, int warmups, int samples) {
+    for (int i = 0; i < warmups; ++i) launch();
     tq_npu::check(aclrtSynchronizeStream(stream), "warmup synchronize");
     std::vector<double> timings;
-    timings.reserve(kSamples);
-    for (int i = 0; i < kSamples; ++i) {
+    timings.reserve(static_cast<std::size_t>(samples));
+    for (int i = 0; i < samples; ++i) {
         if (evict) {
             tq_npu::check(aclrtMemcpy(eviction_dst.ptr, eviction_dst.bytes,
                 eviction_src.ptr, eviction_src.bytes, ACL_MEMCPY_DEVICE_TO_DEVICE),
@@ -137,9 +137,33 @@ void report(const char* mode, const char* kernel, const Stats& s, double bytes) 
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    tq_npu::Options opts;
+    switch (tq_npu::parse_options(argc, argv, opts)) {
+    case tq_npu::ParseResult::kExitOk: return 0;
+    case tq_npu::ParseResult::kExitUsage: return 2;
+    case tq_npu::ParseResult::kRun: break;
+    }
+    // One geometry per run: the benchmark compares three kernels on the same
+    // grid, so the ladder's last rung is the grid and --strips/--tokens pick
+    // it. With neither, the default is kDefaultStrips rather than the
+    // validation ladder's widest rung, so the published numbers stay
+    // comparable with the ones already in reports/.
+    const int strips = opts.ladder.empty() ? kDefaultStrips : opts.ladder.back();
+    // --single: no warmup, one timed sample, so a profiler trace holds exactly
+    // one dispatch of each of the three kernels. The same flag and the same
+    // meaning as bench_turboquant_decode_splitk's.
+    const int warmups = opts.single ? 0 : kWarmups;
+    const int samples = opts.single ? 1 : kSamples;
+    // The two MIX kernels dispatch the recycled-channel entry point by
+    // default; --mode4-single-shot switches them to the fallback that gives
+    // every event its own id. Run the benchmark both ways to price recycling:
+    // the schedules are identical, so any difference is the id allocation and
+    // the arbiter's handling of it. The BF16 Vector baseline is AIV-only and
+    // has no mode-4 traffic at all, so it is unaffected and serves as the
+    // control row.
     try {
-        tq_npu::Fixture f(kTokens);
+        tq_npu::Fixture f(strips * tq_npu::kBlockSize);
         tq_npu::Session session;
         tq_npu::A8Device a8(f);
         tq_npu::Bf16Device bf16_cube(f);
@@ -159,26 +183,35 @@ int main() {
             tq_npu::kBlockSize * sizeof(float);
         const double a8_bytes = 2.0 * f.key.size() + 2.0 * written_cache + written_scales;
         const double bf16_bytes = 4.0 * f.key.size() + 2.0 * written_cache + written_scales;
-        const int cube_launches = (f.strips() + kBenchWindow - 1) / kBenchWindow;
+        const int waves = (f.strips() + 31) / 32;
         std::printf("%d tokens, %d strips over %d physical pages, %d warmups, "
-                    "%d device-event runs\n",
-                    f.shape.num_tokens, f.strips(), f.shape.num_blocks, kWarmups,
-                    kSamples);
-        std::printf("A8 and BF16-vec dispatch one launch of %d blocks; BF16-cube "
-                    "dispatches %d launch(es) of at most %d, all inside the timed "
-                    "sample\n",
-                    f.strips(), cube_launches, kBenchWindow);
+                    "%d device-event run%s%s\n",
+                    f.shape.num_tokens, f.strips(), f.shape.num_blocks, warmups,
+                    samples, samples == 1 ? "" : "s",
+                    opts.single ? " (--single)" : "");
+        std::printf("All three kernels dispatch one launch of %d grid blocks; the "
+                    "two MIX kernels span %d physical wave(s) of 32 and use %s\n",
+                    f.strips(), waves, tq_npu::mode4_name(opts.mode4_reuse));
         for (bool evict : {false, true}) {
             const char* mode = evict ? "pressure" : "warm";
-            const Stats sa = measure(session.stream, [&] { a8.launch(session.stream, f); },
-                                     eviction_src, eviction_dst, evict);
+            const Stats sa = measure(session.stream,
+                                     [&] {
+                                         a8.launch(session.stream, f,
+                                                   opts.mode4_reuse);
+                                     },
+                                     eviction_src, eviction_dst, evict, warmups,
+                                     samples);
             const Stats sc = measure(session.stream,
-                                     [&] { bf16_cube.launch(session.stream, f,
-                                                            kBenchWindow); },
-                                     eviction_src, eviction_dst, evict);
+                                     [&] {
+                                         bf16_cube.launch(session.stream, f,
+                                                          opts.mode4_reuse);
+                                     },
+                                     eviction_src, eviction_dst, evict, warmups,
+                                     samples);
             const Stats sv = measure(session.stream,
                                      [&] { bf16_vec.launch(session.stream, f); },
-                                     eviction_src, eviction_dst, evict);
+                                     eviction_src, eviction_dst, evict, warmups,
+                                     samples);
             report(mode, "A8", sa, a8_bytes);
             report(mode, "BF16-cube", sc, bf16_bytes);
             report(mode, "BF16-vec", sv, bf16_bytes);
@@ -198,10 +231,12 @@ int main() {
         // so it spends eight times the multiply-adds of the factored Vector form
         // and buys back the Vector passes. Both Cube paths do the same work; only
         // their input precision, and so their GM traffic, differs.
-        constexpr double cube_rotation_ops =
-            2.0 * kTokens * 2 * tq_npu::kHeads * tq_npu::kHeadSize * tq_npu::kHeadSize;
-        constexpr double vector_rotation_ops =
-            2.0 * kTokens * 2 * tq_npu::kHeads * 8 * (tq_npu::kHeadSize / 2);
+        const double cube_rotation_ops = 2.0 * f.shape.num_tokens * 2 *
+                                         tq_npu::kHeads * tq_npu::kHeadSize *
+                                         tq_npu::kHeadSize;
+        const double vector_rotation_ops = 2.0 * f.shape.num_tokens * 2 *
+                                           tq_npu::kHeads * 8 *
+                                           (tq_npu::kHeadSize / 2);
         std::printf("Rotation-only intensity: A8 Cube %.1f ops/GM byte, "
                     "BF16 Cube %.1f ops/GM byte, BF16 Vector %.1f ops/GM byte. "
                     "GM bytes exclude tables and slot metadata; every estimate "

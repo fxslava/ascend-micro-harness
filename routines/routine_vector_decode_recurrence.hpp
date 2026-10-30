@@ -176,10 +176,69 @@ struct NativeDecodeRecurrenceEngine {
     // ---------------------------------------------------------------- phases
     // Phase 1. Apply the key's per-token scale to the panel row, take the row
     // maximum, and fold it into the carried maximum.
-    __aicore__ inline void update_max_and_alpha()
+    //
+    // Split into `scale_row` and `reduce_max_and_alpha` so that a PARTIAL
+    // strip can mask the score row between the two. Both halves are
+    // `__aicore__ inline` and are called back to back below, so the aligned
+    // path issues the same instructions in the same order as before the split
+    // -- which matters because `vector_decode_recur_strip`, the Cube decode
+    // operator's frozen entry point, goes through here unchanged.
+    __aicore__ inline void scale_row()
     {
         AscendC::Mul(scaled_row, panel_row, key_scale, kKeyLanes);
-        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // Phase 1m. The tail mask, for the one strip of a sequence that is partly
+    // live: overwrite the score lanes at and past `active` with
+    // `masked_score`, so that `exp(masked_score - m)` underflows to +0 and the
+    // lane contributes exactly nothing to the denominator l or to any channel
+    // of the accumulator Acc.
+    //
+    // A bit-masked WRITE, not arithmetic, and that distinction is the whole
+    // point. A multiplicative keep-mask (`scaled_row * {1,..,1,0,..,0}`) would
+    // be enough if the dead lanes held finite garbage, but they do not: the
+    // per-token key SCALE of a never-written cache slot is an arbitrary FP32
+    // bit pattern, and under the isolated-canary protocol the harness uses it
+    // is deliberately 0x7FC0BEEF -- a quiet NaN. `0 * NaN` is NaN, so a
+    // multiplicative mask would propagate the canary into m, l and Acc and
+    // fail the very test that is supposed to prove the mask works. Overwriting
+    // the lane discards whatever `scale_row` computed there instead of scaling
+    // it, so the garbage cannot survive.
+    //
+    // `scale_row`'s unmasked `Mul` does read those lanes, and may produce NaN
+    // in them. That is harmless precisely because this phase overwrites them
+    // before the first reduction looks at the row; it is also why the mask
+    // cannot be deferred any later than here.
+    //
+    // THE ONE ASSUMPTION, and the first thing a device run must confirm: in
+    // bit-mask mode a vector instruction leaves the DESELECTED destination
+    // lanes unmodified. If that is not so on this part, the fallback is
+    // `Compare` into a select mask plus `Select` in TENSOR_SCALAR mode, which
+    // needs one more scratch operand and a 16-lane ramp constant but makes no
+    // assumption about untouched lanes.
+    //
+    // REQUIRES `0 < active < 16`. A fully live strip must take the unmasked
+    // path, and an entirely dead strip must not be walked at all -- with every
+    // lane masked, `m_new` would be `masked_score`, the centred row exactly 0,
+    // `exp(0)` exactly 1, and the strip would add 16 to l instead of 0.
+    // `turboquant_decode_tail::LiveStripsInWindow` is what keeps dead strips
+    // out of the trip count.
+    __aicore__ inline void mask_tail_scores(std::uint32_t active, float masked_score)
+    {
+        // Lanes [active, 16) of one repeat. The shift is bounded because
+        // `active` is at most 15 here, and the mask is a scalar computed from a
+        // kernel operand -- no Unified Buffer is read, so this is not the
+        // scalar trip the zero-scalar-compute invariant forbids.
+        std::uint64_t drop[2] = {
+            (static_cast<std::uint64_t>(0xFFFFu) &
+             ~((static_cast<std::uint64_t>(1u) << active) - 1u)),
+            0u};
+        AscendC::Duplicate(scaled_row, masked_score, drop, 1, 1,
+                           static_cast<std::uint8_t>(kKeyBlocks));
+    }
+
+    __aicore__ inline void reduce_max_and_alpha()
+    {
         AscendC::ReduceRepeat<AscendC::ReduceType::MAX, float>(
             tile_max_raw, scaled_row, kKeyLanes, 1, 1, 1, kKeyBlocks,
             AscendC::ReduceOrder::ORDER_ONLY_VALUE);
@@ -192,6 +251,25 @@ struct NativeDecodeRecurrenceEngine {
         AscendC::Max(m_new, m_cur, tile_max_bc, kStateLanes);
         AscendC::Sub(alpha_delta, m_cur, m_new, kStateLanes);
         AscendC::Exp(alpha, alpha_delta, kStateLanes);
+    }
+
+    __aicore__ inline void update_max_and_alpha()
+    {
+        scale_row();
+        AscendC::PipeBarrier<PIPE_V>();
+        reduce_max_and_alpha();
+    }
+
+    // The same phase for a partial strip: one extra instruction and one extra
+    // barrier, issued only on the strip that needs them.
+    __aicore__ inline void update_max_and_alpha_masked(std::uint32_t active,
+                                                       float masked_score)
+    {
+        scale_row();
+        AscendC::PipeBarrier<PIPE_V>();
+        mask_tail_scores(active, masked_score);
+        AscendC::PipeBarrier<PIPE_V>();
+        reduce_max_and_alpha();
     }
 
     // Phase 2. Centre the row on the new maximum and exponentiate.
@@ -308,6 +386,56 @@ __aicore__ inline void vector_decode_recur_rows(Engine& engine, std::uint32_t ro
     for (std::uint32_t query = 0; query < rows; ++query) {
         engine.select_query(query);
         vector_decode_recur_query(engine);
+    }
+}
+
+// One query's recurrence over a PARTIAL strip: the first `active` key lanes
+// are live, the rest are masked out of the softmax entirely.
+//
+// Only phase 1 differs. Phases 2 to 5 are the aligned ones, unchanged and
+// uninstrumented, because the mask has already done its work by then: the
+// masked lanes carry `masked_score`, so `exp` underflows them to +0, the
+// denominator adds 0 and `p_scaled` contracts 0 into every channel. There is
+// deliberately no second place where a lane count has to be got right.
+template <class Engine>
+__aicore__ inline void vector_decode_recur_query_masked(Engine& engine,
+                                                        std::uint32_t active,
+                                                        float masked_score)
+{
+    engine.update_max_and_alpha_masked(active, masked_score);
+    engine.exponentiate_scores();
+    engine.update_denominator();
+    engine.update_accumulator();
+    engine.commit_state();
+}
+
+// The partial strip at a RUNTIME row count: the single-token decode
+// operators' tail strip. `active` must be in 1..15; a full strip takes
+// `vector_decode_recur_rows` and a dead strip is not walked.
+template <class Engine>
+__aicore__ inline void vector_decode_recur_rows_masked(Engine& engine,
+                                                       std::uint32_t rows,
+                                                       std::uint32_t active,
+                                                       float masked_score)
+{
+    for (std::uint32_t query = 0; query < rows; ++query) {
+        engine.select_query(query);
+        vector_decode_recur_query_masked(engine, active, masked_score);
+    }
+}
+
+// The partial strip at the frozen 16-query bound, for the Cube decode
+// operator. Added so that the tail fix is reachable from that operator without
+// changing its aligned path; wiring its strip loop and launcher to a `seq_len`
+// is a separate change and has NOT been made.
+template <class Engine>
+__aicore__ inline void vector_decode_recur_strip_masked(Engine& engine,
+                                                        std::uint32_t active,
+                                                        float masked_score)
+{
+    for (std::uint32_t query = 0; query < kDecodeQueries; ++query) {
+        engine.select_query(query);
+        vector_decode_recur_query_masked(engine, active, masked_score);
     }
 }
 

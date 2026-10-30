@@ -20,23 +20,31 @@
 //     wrong-core or wrong-token read cannot produce the right page.
 
 #include "../common/turboquant_oracle.hpp"
+// Pure C++17, no CCE dependency: included here so the harness default and the
+// kernel default are one constant rather than two that can drift.
+#include "../../kernels/ops/turboquant/turboquant_wave_protocol.hpp"
 
 #include <acl/acl.h>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+// The trailing bool is `reuse_mode4_flags`: it picks between the kernel's two
+// __global__ entry points, and so between the two mode-4 channel policies.
+// true, the default everywhere, is the recycled bilateral two-slot ring;
+// false the single-shot allocation kept as the regression fallback and the
+// bisection control.
 extern "C" void launch_turboquant_reshape_and_cache_a8(
     void*, const std::int8_t*, const std::int8_t*, std::int8_t*, std::int8_t*,
     float*, const std::int32_t*, const float*, const std::int32_t*,
     std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-    std::uint32_t, std::uint32_t, float);
+    std::uint32_t, std::uint32_t, float, bool);
 
 // The BF16 input instance. Same output contract, and `tables` keeps the
 // std::int32_t* spelling the INT8 kernel published even though the blob is
@@ -45,7 +53,7 @@ extern "C" void launch_turboquant_reshape_and_cache_bf16(
     void*, const std::uint16_t*, const std::uint16_t*, std::int8_t*, std::int8_t*,
     float*, const std::int32_t*, const float*, const std::int32_t*,
     std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-    std::uint32_t, std::uint32_t, float);
+    std::uint32_t, std::uint32_t, float, bool);
 
 namespace tq_npu {
 
@@ -61,6 +69,161 @@ constexpr int kBlockSize = 16;
 // written page from a wholly missing one.
 constexpr std::uint8_t kCanaryByte = 0xAA;
 constexpr std::uint32_t kCanaryWord = 0xAAAAAAAAu;
+
+// ------------------------------------------------------------ the wave ladder
+// Every rung is ONE monolithic dispatch of that many grid blocks, and the
+// rungs are chosen for where they sit relative to the physical wave width --
+// 32 AI Core blocks on this part:
+//
+//     1  cold start: one block, one Cube, two Vector cores, no wave boundary
+//        anywhere in the run.
+//    32  exactly one full wave, and the rung where all 11 mode-4 ids of both
+//        sub blocks are used once by 32 different physical blocks.
+//    33  ONE strip in wave 1. This is the rung that matters: the first block
+//        of a second wave, dispatched immediately after a full wave, inside a
+//        SINGLE kernel launch. The old harness could only reach it as a
+//        separate launch behind --window 32, which re-entered the kernel and
+//        so re-armed everything; here the physical block carries straight on
+//        from its wave-0 block, and an unretired transfer, an unconsumed
+//        token or an uncleared flag shows up as a hang or a wrong page.
+//    48  a ragged second wave: 16 of the 32 physical blocks run twice.
+//    64  two full waves, every physical block used exactly twice, no ragged
+//        tail. 33 and 64 fail differently -- 33 needs a partial second wave,
+//        64 needs a complete reuse cycle.
+//   128  four waves, so a leak that needs more than one reuse to accumulate
+//        has somewhere to show.
+inline std::vector<int> default_ladder() { return {1, 32, 33, 48, 64, 128}; }
+
+constexpr int kMaxStrips = 4096;
+
+// Which mode-4 channel policy the harnesses dispatch by default: the shared
+// header's constant, so flipping it there flips every harness here too.
+// -DTQ_TEST_MODE4_SINGLE_SHOT=1 pins a whole CI job to the fallback without
+// touching a command line, and -DTQ_TEST_MODE4_REUSE=0/1 is honoured for the
+// jobs that already name it; --mode4-reuse and --mode4-single-shot override
+// per run. The recycled ring is the default because
+// tests/research/kernel_cluster_sync_probe.cpp settled its consuming premise
+// on silicon and on CAModel, and because every announcement in both kernels is
+// behind the x_S drain that made it sound
+// (scripts/audit_cross_core_fences.py).
+#if defined(TQ_TEST_MODE4_SINGLE_SHOT) && TQ_TEST_MODE4_SINGLE_SHOT
+constexpr bool kDefaultMode4Reuse = false;
+#elif defined(TQ_TEST_MODE4_REUSE)
+constexpr bool kDefaultMode4Reuse = (TQ_TEST_MODE4_REUSE != 0);
+#else
+constexpr bool kDefaultMode4Reuse = turboquant_wave::kReshapeDefaultReuse;
+#endif
+
+inline const char* mode4_name(bool reuse)
+{
+    return reuse ? "recycled two-slot mode-4 ring" : "single-shot mode-4 channels";
+}
+
+// One CLI for every harness, so a flag means the same thing in all three.
+struct Options {
+    std::vector<int> ladder;  // empty means default_ladder()
+    // Single-shot profiling, the same flag bench_turboquant_decode_splitk
+    // publishes: no warmup, and exactly one dispatch per execution path, so a
+    // profiler trace holds one grid instead of a warmed loop. In a validation
+    // runner that means the last rung of the ladder only; in the benchmark it
+    // means warmup 0 and one timed sample.
+    bool single = false;
+    // Which kernel entry point to dispatch, and so which mode-4 channel
+    // policy. See kDefaultMode4Reuse above.
+    bool mode4_reuse = kDefaultMode4Reuse;
+};
+
+// The rungs to run under --single: the last one only, so the process contains
+// exactly one kernel dispatch per path. With an explicit --strips list that is
+// the last one given, which is how a profiler run picks its grid.
+inline std::vector<int> single_rung(const std::vector<int>& ladder)
+{
+    return ladder.empty() ? ladder : std::vector<int>{ladder.back()};
+}
+
+enum class ParseResult { kRun, kExitOk, kExitUsage };
+
+inline void print_usage(std::FILE* out, const char* argv0)
+{
+    std::fprintf(out,
+                 "Usage: %s [--strips N]... [--tokens N]... [--single]\n"
+                 "  --strips N  one monolithic dispatch of N aligned %d-token\n"
+                 "              strips (repeatable; 1..%d)\n"
+                 "  --tokens N  the same, given in tokens; N must be a multiple\n"
+                 "              of %d\n"
+                 "  --single    no warmup, and exactly one dispatch per execution\n"
+                 "              path: a validation runner then checks the last\n"
+                 "              rung of the ladder only\n"
+                 "  --mode4-reuse        dispatch the recycled two-slot mode-4\n"
+                 "                       channel entry point\n"
+                 "  --mode4-single-shot  dispatch the single-shot fallback\n"
+                 "                       entry point (default here: %s)\n"
+                 "  With no --strips or --tokens the wave ladder is",
+                 argv0, kBlockSize, kMaxStrips, kBlockSize,
+                 mode4_name(kDefaultMode4Reuse));
+    for (const int rung : default_ladder()) std::fprintf(out, " %d", rung);
+    std::fprintf(out, " strips.\n");
+}
+
+inline ParseResult parse_options(int argc, char** argv, Options& opts)
+{
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        if (arg == "--help" || arg == "-h") {
+            print_usage(stdout, argv[0]);
+            return ParseResult::kExitOk;
+        }
+        if (arg == "--single") {
+            opts.single = true;
+            continue;
+        }
+        if (arg == "--mode4-reuse") {
+            opts.mode4_reuse = true;
+            continue;
+        }
+        if (arg == "--mode4-single-shot") {
+            opts.mode4_reuse = false;
+            continue;
+        }
+        const bool is_strips = arg == "--strips";
+        const bool is_tokens = arg == "--tokens";
+        if (!is_strips && !is_tokens) {
+            std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
+            print_usage(stderr, argv[0]);
+            return ParseResult::kExitUsage;
+        }
+        if (i + 1 >= argc) {
+            std::fprintf(stderr, "%s needs a value\n", argv[i]);
+            print_usage(stderr, argv[0]);
+            return ParseResult::kExitUsage;
+        }
+        const std::string text(argv[++i]);
+        int value = 0;
+        try {
+            std::size_t consumed = 0;
+            value = std::stoi(text, &consumed);
+            if (consumed != text.size()) throw std::invalid_argument(text);
+        } catch (const std::exception&) {
+            std::fprintf(stderr, "%s: not an integer: %s\n", arg.c_str(), text.c_str());
+            return ParseResult::kExitUsage;
+        }
+        if (is_tokens) {
+            if (value <= 0 || value % kBlockSize != 0) {
+                std::fprintf(stderr, "--tokens must be a positive multiple of %d, got %d\n",
+                             kBlockSize, value);
+                return ParseResult::kExitUsage;
+            }
+            value /= kBlockSize;
+        }
+        if (value <= 0 || value > kMaxStrips) {
+            std::fprintf(stderr, "strip count out of range: %d\n", value);
+            return ParseResult::kExitUsage;
+        }
+        opts.ladder.push_back(value);
+    }
+    if (opts.ladder.empty()) opts.ladder = default_ladder();
+    return ParseResult::kRun;
+}
 
 inline void check(aclError err, const char* op)
 {
@@ -229,7 +392,7 @@ struct A8Device {
         scale_cache.fill_canary();
     }
 
-    void launch(aclrtStream stream, const Fixture& f)
+    void launch(aclrtStream stream, const Fixture& f, bool reuse_mode4_flags = false)
     {
         launch_turboquant_reshape_and_cache_a8(
             stream, static_cast<const std::int8_t*>(key.ptr),
@@ -245,7 +408,8 @@ struct A8Device {
             static_cast<std::uint32_t>(f.shape.head_size),
             static_cast<std::uint32_t>(f.shape.block_size),
             static_cast<std::uint32_t>(f.shape.num_blocks),
-            static_cast<std::uint32_t>(f.shape.block_size), f.shape.inv_sqrt_len());
+            static_cast<std::uint32_t>(f.shape.block_size), f.shape.inv_sqrt_len(),
+            reuse_mode4_flags);
     }
 };
 
@@ -256,16 +420,18 @@ struct A8Device {
 // byte-identical pages and scales to the INT8 one. Nothing BF16-specific
 // reaches the oracle.
 //
-// Unlike A8Device this drives the context as several launches. The kernel
-// labels every cross-core event with its own mode-4 flag id, set once and
-// waited once, which bounds a schedule to one strip per grid block per launch
-// (turboquant_reshape_and_cache_bf16.cpp, "cross-core flag ids"); and a grid
-// wider than the device's AI core count does not dispatch in one go. Entering
-// the kernel again is also what re-arms the flags: each launch primes its own
-// tokens and drains them, so a window boundary is a clean restart rather than
-// a state carry-over. Launching in windows is therefore the normal mode here,
-// not a workaround -- which is why `window` is a parameter and the harness
-// reports how many launches a ladder rung took.
+// One monolithic dispatch, like A8Device. This used to drive the context as
+// several capped launches: the kernel's mode-4 ids are per physical AI Core
+// block and not cleared by the scheduler between waves, so a grid wider than
+// the physical block count was driven as repeated sub-launches to keep every
+// wave a fresh kernel entry. That workaround is gone. The kernel now carries
+// the inter-wave protocol itself -- a boundary guard taken before InitSocState,
+// bounded compile-time-checked channels, and an epilogue that
+// drains every queue of every role into the scalar stream before the block
+// retires (turboquant_wave_protocol.hpp, guidelines section 6.5) -- so a
+// 128-strip context is one dispatch of 128 blocks spanning four waves, and
+// that is exactly what the ladder must exercise. A `--window`-style cap would
+// now hide the behaviour the ladder exists to test.
 struct Bf16Device {
     Buffer key, value, key_cache, value_cache, scale_cache, slots, signs, tables;
     explicit Bf16Device(const Fixture& f)
@@ -292,48 +458,28 @@ struct Bf16Device {
         scale_cache.fill_canary();
     }
 
-    // One launch over `count` strips starting at strip `first`. The activation
-    // and slotMapping pointers advance by the strips already done, so each
-    // launch sees a context that starts at its own strip 0 and the kernel's
-    // one-strip-one-page contract holds inside every window.
-    void launch_window(aclrtStream stream, const Fixture& f, int first, int count)
+    // The whole context in one dispatch of f.strips() blocks, whatever number
+    // of physical waves that spans. Identical in shape to A8Device::launch:
+    // the two instances differ only in input encoding, and after the wave
+    // protocol landed they no longer differ in how they are driven.
+    void launch(aclrtStream stream, const Fixture& f, bool reuse_mode4_flags = false)
     {
-        require(first >= 0 && count > 0 && first + count <= f.strips(),
-                "launch window falls outside the context");
-        const std::size_t channels =
-            static_cast<std::size_t>(f.shape.num_kv_heads) * f.shape.head_size;
-        const std::size_t token_base =
-            static_cast<std::size_t>(first) * f.shape.block_size;
         launch_turboquant_reshape_and_cache_bf16(
-            stream,
-            static_cast<const std::uint16_t*>(key.ptr) + token_base * channels,
-            static_cast<const std::uint16_t*>(value.ptr) + token_base * channels,
+            stream, static_cast<const std::uint16_t*>(key.ptr),
+            static_cast<const std::uint16_t*>(value.ptr),
             static_cast<std::int8_t*>(key_cache.ptr),
             static_cast<std::int8_t*>(value_cache.ptr),
             static_cast<float*>(scale_cache.ptr),
-            static_cast<const std::int32_t*>(slots.ptr) + token_base,
+            static_cast<const std::int32_t*>(slots.ptr),
             static_cast<const float*>(signs.ptr),
             static_cast<const std::int32_t*>(tables.ptr),
-            static_cast<std::uint32_t>(count * f.shape.block_size),
+            static_cast<std::uint32_t>(f.shape.num_tokens),
             static_cast<std::uint32_t>(f.shape.num_kv_heads),
             static_cast<std::uint32_t>(f.shape.head_size),
             static_cast<std::uint32_t>(f.shape.block_size),
             static_cast<std::uint32_t>(f.shape.num_blocks),
-            static_cast<std::uint32_t>(f.shape.block_size), f.shape.inv_sqrt_len());
-    }
-
-    // The whole context in windows of at most `window` strips. Returns the
-    // launch count, which is what distinguishes a one-wave run from a tail
-    // wave and belongs in the report.
-    int launch(aclrtStream stream, const Fixture& f, int window)
-    {
-        require(window > 0, "the launch window must be positive");
-        int launches = 0;
-        for (int first = 0; first < f.strips(); first += window) {
-            launch_window(stream, f, first, std::min(window, f.strips() - first));
-            ++launches;
-        }
-        return launches;
+            static_cast<std::uint32_t>(f.shape.block_size), f.shape.inv_sqrt_len(),
+            reuse_mode4_flags);
     }
 };
 

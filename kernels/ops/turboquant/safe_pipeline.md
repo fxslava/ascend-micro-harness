@@ -149,31 +149,60 @@ Huawei's [CrossCoreWaitFlag documentation](https://www.hiascend.com/document/det
 describes counters and distinguishes AIC IDs from AIV-local IDs. A protocol
 that never has more than one outstanding notification also fits consuming
 counter semantics. It cannot prove correctness for a non-consuming level test.
-The repository's `MICROROUTINE_DESIGN_GUIDELINES.md` sections 6.2 and 6.2c record
-different endpoint observations and an unresolved stale-wait failure.
-Therefore the header exposes the endpoint conversion explicitly and hardware
-or CAModel validation against the installed CANN version remains necessary.
-The proof report must not be described as that hardware validation.
+That premise is now corroborated on this part by
+`tests/research/kernel_cluster_sync_probe.cpp` — recycled IDs, fenced
+announcements, clean on silicon and on CAModel with no early retirement — so
+the endpoint question is settled in the direction the proof assumed, and
+`MICROROUTINE_DESIGN_GUIDELINES.md` §6.2c carries the corrected diagnosis of
+the two stale releases. The header still exposes the endpoint conversion
+explicitly, because the conversion is where a sub-block renumbering error would
+land (§6.2d), and the proof report must still not be described as hardware
+validation: the probe is the hardware evidence, and it covers the flag
+semantics, not this kernel's net.
 
 ### CAModel integration counterexample (Ascend950PR_9599, CANN 9.2.0-beta.2)
+
+**The conclusion this section originally drew — that the consuming-wait premise
+is false on this part — is retracted. The measurement stands; its cause was
+elsewhere.**
 
 An attempted integration of the generated four-color mapping into
 `turboquant_reshape_and_cache_a8.cpp` built in Release mode and completed the
 16-token CAModel fixture with bit-exact caches and intact guards. Its
-instruction trace nevertheless refuted the required consuming-wait premise:
-on AIV1, READY channel 16 was set by AIC at cycle 4906, waited at 4916,
-**waited again at 7589**, and only set for the second chunk at 8621. The
-second wait therefore passed 1032 cycles before its matching notification.
-The old `analyze_reshape_trace.py` correctly rejected repeated IDs after the
-apparently successful numerical run. The attempted kernel integration was
-reverted; the existing one-ID-per-event schedule remains in place.
+instruction trace showed, on AIV1, READY channel 16 set by AIC at cycle 4906,
+waited at 4916, **waited again at 7589**, and only set for the second chunk at
+8621: the second wait passed 1032 cycles before its matching notification. The
+`analyze_reshape_trace.py` order check correctly rejected the run after the
+apparently successful numerical result, and the integration was reverted in
+favour of the one-ID-per-event schedule.
 
-The abstract proof in `safe_pipeline_proof.json` remains valid under its
-explicit consuming-latch semantics, but it is **not a hardware refinement
-proof** for this CAModel configuration. Reusing READY/FREE IDs in a production
-kernel requires an independently verified clear operation or another
-generation-aware handshake. Passing numerical output on one simulator run
-does not establish that property.
+What that integration lacked was an intra-pipe fence in front of the
+announcement. `CrossCoreSetFlag<4, PIPE_x>` lowers to `set_intra_block`, which
+issues on the scalar unit; the `pipe` template argument does not order it
+(`MICROROUTINE_DESIGN_GUIDELINES.md` §6.2a). So the Cube's "panel ready" became
+visible before the Fixpipe it reported had committed, and with one ID per ring
+slot the wait that observed it was the *next* generation's wait. Recycling
+converted a reordering into a stale release; it did not cause it.
+
+`tests/research/kernel_cluster_sync_probe.cpp` settled this directly: one
+physical AI Core block, `MIX_AIC_1_2`, 1 AIC + 2 AIV, no data, a multi-iteration
+cyclic handshake over **recycled** mode-4 IDs 0, 1, 16 and 17, with explicit
+intra-pipe drains before every announcement (`V_S` on each AIV, `MTE1_M` then
+`M_S` on the AIC). Physical silicon executed every iteration cleanly. CAModel
+completed cleanly at 176,061 ticks with no early wait retirement. **Mode-4
+flags do implement consuming-latch behaviour on Ascend 950PR and in the CANN
+9.2 CAModel, given those fences.**
+
+Consequently the generated protocol's premise is the one the hardware has, and
+2-slot cyclic recycling is valid for production pipelines when paired with the
+intra-pipe drains and the epilogue drain of §6.5. The recycled ring is now the
+default policy in both reshape-and-cache kernels, with the single-shot
+allocation retained as a second entry point for regression and bisection, and
+`scripts/audit_cross_core_fences.py` gates the fence discipline the result
+depends on. `safe_pipeline_proof.json` remains an abstract proof under explicit
+consuming-latch semantics and is still **not a hardware refinement proof** of
+the reference C++; what the probe adds is evidence that its premise holds on
+this part, not that this kernel implements its net.
 
 ## Negative controls
 

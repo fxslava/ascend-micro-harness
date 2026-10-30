@@ -3,7 +3,10 @@
 Applies to pipeline or buffer-lifetime refactors of real operators in this
 repository. Target for the decode baseline: CANN 9.2.0-beta.2, `dav-3510`,
 `Ascend950PR_9599`. Complete these gates before pushing a pipeline refactor
-or tagging it for physical NPU execution. A failed or unavailable
+or tagging it for physical NPU execution. Section 6 adds the gates a
+MIX_AIC_1_2 operator needs when its grid can exceed the physical AI Core
+block count and so runs in several execution waves; it applies in
+addition to sections 1-5, not instead of them. A failed or unavailable
 gate is recorded as pending; compilation or a host mock cannot replace CAModel.
 This procedure complements `SKELETON_KERNEL_WORKFLOW.md` and
 `MICROROUTINE_DESIGN_GUIDELINES.md`.
@@ -176,3 +179,152 @@ K=2 wrap/merge and K=4 empty-worker cases. It uses the baseline kernel libraries
 with the current benchmark ABI, checks model errors/exception dumps and audits
 each case's own traces. Full varied-score arithmetic uses its existing documented
 numerical budgets; exact boundary outputs remain a bitwise gate.
+
+## 6. Inter-wave gates for a MIX_AIC_1_2 grid
+
+Applies to any pipeline refactor of a `KERNEL_TYPE_MIX_AIC_1_2` operator whose
+grid can exceed the physical AI Core block count, which is every real prefill
+or paged operator at production shapes. The protocol itself is
+`MICROROUTINE_DESIGN_GUIDELINES.md` §6.5; these are its gates, and they are in
+addition to §1–§5, not instead of them.
+
+Above the block count the scheduler runs the grid in waves and a physical block
+executes a second grid block after its first. The mode-4 intra-block flag
+registers are local to that block and are not cleared by the hardware
+scheduler between waves, and nothing drains the block's engine queues either.
+Every address such a kernel uses is a compile-time constant, so wave 1 reuses
+wave 0's L1 ring slots, landing panels and egress slots.
+
+**A launch window is not a fix for this; it is a way of not testing it.**
+Driving a wide context as several capped launches re-enters the kernel at every
+wave boundary, which re-arms everything. Remove every `--window`, cyclic slice
+and staggered sub-launch before claiming anything about multi-wave behaviour,
+and treat any such parameter found in a harness as an open finding.
+
+### 6.1 Prove the boundary guard, in the same translation unit the kernel uses
+
+`total_strips = numTokens / tokensPerCore`, computed identically by all three
+roles, with the early return taken **before** `InitSocState`, before any tensor
+or SOC state exists, before a feedback cycle is primed and before any GM
+address is formed. A block past the end has no `slotMapping` entry; reading it
+kills an AIV and deadlocks that block's Cube on its next `CrossCoreWaitFlag`,
+so this is a hang gate, not an accuracy gate. A zero `tokensPerCore` must guard
+every block rather than fault the scalar unit.
+
+Put the arithmetic in a header with no CCE dependency, include it from the
+kernel, and compile that header from a host translation unit with
+`-Wall -Wextra -Werror`. This is the one part of §2 that survives on a machine
+with no CANN toolkit, and it is only worth anything if the kernel and the host
+gate share the declaration rather than each carrying a copy.
+
+### 6.2 Make the cross-core id budget a compile-time object
+
+Not a comment, and not inspection. The legal mode-4 space is 0..10 per sub
+block (11..14 and their +16 images are library reserved), so a budget
+expression plus one `static_assert` is what stops a longer schedule from
+silently renumbering a channel into id 13.
+
+Then audit the census over the actual schedule, per policy: every id legal,
+sets and waits balanced per id, the two sub blocks in disjoint halves, and
+**at most one outstanding notification per id** — the per-id operation
+sequence alternating `SET, WAIT, SET, WAIT`. §6.2c's finding is that an
+unfenced announcement on a recycled id balances every set/wait count and still
+releases a wait early, so a balance check alone is not this gate; the tick-order
+check and the fence audit of §6.6 are the rest of it.
+
+### 6.3 Model two waves, not one, and leave the flag semantics as a knob
+
+Extend §1's capacity-one token/queue model to the whole physical block — Cube
+plus both Vector cores — with a scalar stream that dispatches into in-order
+engine queues in program order and stalls on cross-core waits, and with
+generation ownership on every L1 slot, landing panel, packed slot, L0 page
+region and L0C. Then run **two** grid blocks on it, carrying the marking
+across, because that is what a multi-wave grid does.
+
+Two hardware properties decide whether channel recycling is usable at all,
+and a model that assumes either has assumed the answer: whether
+`wait_intra_block` consumes the flag it tested, and whether kernel entry clears
+the block's mode-4 registers. Keep both as knobs and report the verdict for
+each combination; they do not agree. For Ascend 950PR under CANN 9.2 the
+consuming half of that table is the measured one (§6.2c's probe), but the model
+keeps all four because the sticky rows are the signature to recognise if a
+toolkit revision reintroduces the fault, and because the next part is not this
+part.
+
+`tests/cpu/test_reshape_wave_model.py` is the instance of this for the
+reshape-and-cache operators. Exhaustive exploration is for bounded instances;
+say so, and say which geometries were only sampled.
+
+### 6.4 Audit the epilogue drain as a census, not as a comment
+
+Per role, every asynchronous queue it owns reaches the scalar stream through
+one `SetFlag<HardEvent::x_S>` / `WaitFlag<HardEvent::x_S>` pair before the
+kernel body returns, and the Vector cores wait for the Cube's drain first
+because the Cube is the only core writing their landing rings. There is no
+`MTE1_S`; MTE1 is covered transitively by the `M_MTE1` wait behind the Mmads.
+Drain an idle queue too — "this queue is empty" is the thing the wave boundary
+needs established. In the trace this appears as the last `x_S` pair on each
+engine of each core, with nothing issued after it but the cross-core join.
+
+### 6.5 Run a ladder with a ragged second wave, in single dispatches
+
+`grid = 1, 32, 33, 48, 64, 128` strips, each ONE kernel launch:
+
+```bash
+./build/lib/test_turboquant_a8_validation    --strips 1 --strips 32 --strips 33 \
+                                             --strips 48 --strips 64 --strips 128
+./build/lib/test_turboquant_bf16_validation  # same ladder by default
+```
+
+33 and 64 fail differently and both rungs are required: 33 is a *partial*
+second wave immediately after a full one, which catches a leak the first reuse
+exposes; 64 is a complete reuse cycle with no ragged tail. 48 is a ragged
+second wave that is not minimal. 128 gives a leak that needs more than one
+reuse somewhere to show. Verify that strip 33 — the first block of wave 1 — and
+every later strip are bit-exact against the integer Hadamard oracle, not merely
+that the launch returned.
+
+Keep the pages fragmented (`numBlocks = 2 * strips + 2`, strip `s` → page
+`2s + 1`) so a stray write lands on a canary page and the verifier can name the
+strip whose data arrived, which is the signature of a block-index error and is
+invisible in an aggregate byte count.
+
+### 6.6 Ship both channel policies, and gate the fence the recycled one needs
+
+Select the policy with a non-type template parameter and emit two `__global__`
+symbols from one body, differing in **nothing but the id allocation** — same
+schedule, same wait placement, same priming, same drain — so a behavioural
+difference isolates recycling. Expose it in the harnesses
+(`--mode4-single-shot`, or a build define for a whole CI job). The recycled
+ring is the default for these operators; keep the single-shot fallback
+dispatchable, because it is the bisection control for any later cross-core
+fault and the one policy no reading of the flag mechanism can break.
+
+**The recycled policy's precondition is a fence, so audit it.** Every
+announcement must be preceded by its `SetFlag`/`WaitFlag<HardEvent::x_S>` pair
+on the pipe whose work it reports; a priming set is the only exemption.
+`scripts/audit_cross_core_fences.py` checks this over the kernel sources with
+negative controls, and it is a gate of its own because nothing else here sees
+it: counts balance without it and the numbers can be bit-exact while a panel is
+read a generation early.
+
+A green run of either variant promotes nothing. Both revisions of this operator
+that recycled ids *without* the fence produced bit-exact caches and intact
+guards while their traces showed a second wait passing before its set, by 1032
+and 2179 cycles. What settled the semantics was an isolated probe —
+`tests/research/kernel_cluster_sync_probe.cpp`, one physical block, no data,
+recycled ids, fenced announcements, run on silicon and on CAModel — plus a
+trace audit that checks **tick order per id**, not per-id counts. Ship the
+probe as a target in both modes, not as a transcript, so a toolkit regression
+is reproducible; and record in `reports/` which leg produced which trace, since
+a data-free probe that merely exits cleanly does not distinguish a consuming
+latch from a sticky one.
+
+### 6.7 Record the unavailable gates explicitly
+
+Compilation of these kernels needs BiSheng and a CANN 9.2 toolkit, and the
+boundary canaries, depth/wrap tests and trace audit need the
+`Ascend950PR_9599` simulator. On a host without them, the host-side gates
+above are the whole of the evidence, and a report that does not say so is
+making a hardware claim it has not earned. List each gate as run, failed or
+unavailable, with the reason.

@@ -314,6 +314,101 @@ function(add_ascend_micro_sim_targets)
       BUILD_WITH_INSTALL_RPATH TRUE
       INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 
+  # ------------------------ split-K decode validation twins, on CAModel
+  # The simulator legs of NpuTargets.cmake's test_npu_decode_splitk_aic and
+  # test_npu_decode_splitk_aiv. These matter more than most sim twins here:
+  # the NPU legs need a 950PR this harness's development host does not have, so
+  # for anyone without one these are the only place the two split-K ladders
+  # actually run rather than merely compile. They are slow -- every rung is a
+  # real launch on the model -- so run them with a narrowed matrix when
+  # iterating, and read reports/decode_splitk_validation.md for which rungs
+  # have been executed on which leg.
+  foreach(leg aic aiv)
+    add_executable(test_decode_splitk_${leg}_sim
+        tests/npu/validation/test_turboquant_decode_splitk_${leg}_validation.cpp)
+    target_compile_definitions(test_decode_splitk_${leg}_sim PRIVATE
+        ASCEND_MICRO_DECODE_SPLITK_SIM)
+    target_include_directories(test_decode_splitk_${leg}_sim PRIVATE
+        "${ASCEND_HOME_PATH}/include")
+    target_link_libraries(test_decode_splitk_${leg}_sim PRIVATE
+        camodel_single_token_decode_splitk_kernel
+        camodel_paged_decode_attention_kernel ascendcl
+        "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+    target_link_options(test_decode_splitk_${leg}_sim PRIVATE
+        "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+    target_compile_options(test_decode_splitk_${leg}_sim PRIVATE
+        -Wall -Wextra -Werror)
+    set_target_properties(test_decode_splitk_${leg}_sim PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+  endforeach()
+
+  # ------------------------ unaligned context lengths, on CAModel
+  # The simulator twin of NpuTargets.cmake's
+  # test_npu_decode_single_token_unaligned, and the only leg that can RUN the
+  # unaligned ladder without a 950PR. It links both AIV decode kernels because
+  # the harness launches both: the plain operator through its arbitrary-context
+  # entry point, and the split-K operator at four split counts, where the
+  # partial strip lands in whichever split owns the last live page and the
+  # splits beyond it must contribute the neutral element.
+  add_executable(test_decode_single_token_unaligned_sim
+      tests/npu/test_npu_decode_single_token_unaligned.cpp)
+  target_compile_definitions(test_decode_single_token_unaligned_sim PRIVATE
+      ASCEND_MICRO_DECODE_SPLITK_SIM)
+  target_include_directories(test_decode_single_token_unaligned_sim PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_decode_single_token_unaligned_sim PRIVATE
+      camodel_single_token_decode_aiv_kernel
+      camodel_single_token_decode_splitk_kernel
+      camodel_paged_decode_attention_kernel ascendcl
+      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  target_link_options(test_decode_single_token_unaligned_sim PRIVATE
+      "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+  target_compile_options(test_decode_single_token_unaligned_sim PRIVATE
+      -Wall -Wextra -Werror)
+  set_target_properties(test_decode_single_token_unaligned_sim PROPERTIES
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+
+  # ------------------------------------------- mode-4 research probe, on CAModel
+  # The simulator twin of NpuTargets.cmake's test_cluster_sync_probe: the same
+  # tests/research/kernel_cluster_sync_probe.cpp, built against the model
+  # libraries, because the probe's verdict comes from its instruction trace and
+  # only this leg produces one. The probe moves no data, so a clean exit proves
+  # nothing by itself -- a sticky latch would retire every wait early and the
+  # run would still finish. What settles it is the tick order of
+  # SET_INTRA_BLOCK against WAIT_INTRA_BLOCK on a single recycled id, and that
+  # is read out of the core dumps.
+  #
+  # Pass an iteration count above the default 2 to give the recycled ids more
+  # than one reuse to go wrong on, as scripts/run_reshape_*_camodel.sh do for
+  # the operator.
+  ascendc_library(camodel_cluster_sync_probe_kernel SHARED
+      tests/research/kernel_cluster_sync_probe.cpp)
+  ascendc_compile_definitions(camodel_cluster_sync_probe_kernel PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(camodel_cluster_sync_probe_kernel PRIVATE
+      -std=c++17 -Wall -Werror -Wno-missing-braces ${splitk_system_options}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+  add_executable(test_cluster_sync_probe_sim
+      tests/research/test_cluster_sync_probe.cpp)
+  # Same convention as bench_decode_splitk_sim: the binary says at startup that
+  # it is the simulator leg, so a pasted log cannot be mistaken for silicon.
+  target_compile_definitions(test_cluster_sync_probe_sim PRIVATE
+      ASCEND_MICRO_PROBE_SIM)
+  target_include_directories(test_cluster_sync_probe_sim PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_cluster_sync_probe_sim PRIVATE
+      camodel_cluster_sync_probe_kernel ascendcl
+      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  target_link_options(test_cluster_sync_probe_sim PRIVATE
+      "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+  target_compile_options(test_cluster_sync_probe_sim PRIVATE
+      -Wall -Wextra -Werror)
+  set_target_properties(test_cluster_sync_probe_sim PROPERTIES
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+
   # The BF16 operand-layout micro-probe. Explicit rather than through
   # add_micro_camodel_probe because its runner is test_micro_layout_bf16.cpp,
   # not test_camodel_<name>.cpp: it is a data-movement probe over one tile, not
@@ -336,27 +431,4 @@ function(add_ascend_micro_sim_targets)
   set_target_properties(test_micro_layout_bf16 PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
       INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 
-  # ---------------------------------------------------- Cluster Sync Research Probe
-  ascendc_library(camodel_cluster_sync_probe_kernel SHARED
-      tests/research/kernel_cluster_sync_probe.cpp)
-  ascendc_compile_definitions(camodel_cluster_sync_probe_kernel PRIVATE
-      ASCEND_MICRO_CANN_LAUNCH)
-  ascendc_compile_options(camodel_cluster_sync_probe_kernel PRIVATE
-      -std=c++17 -Wall -Werror -Wno-missing-braces ${splitk_system_options}
-      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
-
-  add_executable(test_cluster_sync_probe_sim
-      tests/research/test_cluster_sync_probe.cpp)
-  target_include_directories(test_cluster_sync_probe_sim PRIVATE
-      "${ASCEND_HOME_PATH}/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/research")
-  target_compile_options(test_cluster_sync_probe_sim PRIVATE -Wall -Wextra -Werror)
-  target_link_libraries(test_cluster_sync_probe_sim PRIVATE
-      camodel_cluster_sync_probe_kernel ascendcl
-      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
-  target_link_options(test_cluster_sync_probe_sim PRIVATE
-      "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
-  set_target_properties(test_cluster_sync_probe_sim PROPERTIES
-      BUILD_WITH_INSTALL_RPATH TRUE
-      INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 endfunction()

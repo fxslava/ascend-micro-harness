@@ -129,33 +129,100 @@ function(add_ascend_micro_npu_targets)
   target_compile_options(bench_turboquant_decode_splitk PRIVATE
       -Wall -Wextra -Werror)
 
-  foreach(target test_turboquant_a8_validation test_turboquant_bf16_validation
-      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk)
-    set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-        INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
-  endforeach()
-  add_custom_target(turboquant_npu_all DEPENDS
-      test_turboquant_a8_validation test_turboquant_bf16_validation
-      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk)
+  # ------------------------------ split-K decode validation (directive 3)
+  # The correctness ladders for the two split-K decode kernels. HARDWARE ONLY,
+  # on the same footing as the benchmark above and for the same reason: each
+  # rung is a real launch whose every emitted value is compared against the
+  # FP64 oracles in tests/common, so a build on a host with no 950PR
+  # establishes that the harness compiles and nothing about the kernels.
+  # `add_ascend_micro_sim_targets` registers the simulator twins, which is
+  # where these can actually run without a device.
+  #
+  # Both link both kernel libraries: the rigs they share live in one header
+  # (tests/npu/turboquant_splitk_rigs.hpp), so either driver may reference
+  # either launcher as the ladders grow.
+  add_executable(test_npu_decode_splitk_aic
+      tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp)
+  target_include_directories(test_npu_decode_splitk_aic PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_npu_decode_splitk_aic PRIVATE
+      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
+  target_compile_options(test_npu_decode_splitk_aic PRIVATE
+      -Wall -Wextra -Werror)
 
-  # ---------------------------------------------------- Cluster Sync Research Probe (NPU)
-  ascendc_library(kernel_cluster_sync_probe SHARED
+  add_executable(test_npu_decode_splitk_aiv
+      tests/npu/validation/test_turboquant_decode_splitk_aiv_validation.cpp)
+  target_include_directories(test_npu_decode_splitk_aiv PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_npu_decode_splitk_aiv PRIVATE
+      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
+  target_compile_options(test_npu_decode_splitk_aiv PRIVATE
+      -Wall -Wextra -Werror)
+
+  # ------------------------- single-token decode at an unaligned context S
+  # tests/npu/test_npu_decode_single_token_unaligned.cpp walks the ladder
+  # S = 1, 7, 15, 17, 31, 33, 127, 129, 255, 257, 1023 -- not one of them a
+  # multiple of the 16-token strip, and most not a multiple of the page. It
+  # launches BOTH AIV decode kernels (the plain one through its new
+  # arbitrary-context entry point, and the split-K one at K = 1, 2, 4, 8), so
+  # it links both kernel libraries. Every cache slot past seq_len carries a
+  # quiet-NaN canary, so a tail that leaks arrives as a non-finite context
+  # rather than a near miss.
+  add_executable(test_npu_decode_single_token_unaligned
+      tests/npu/test_npu_decode_single_token_unaligned.cpp)
+  target_include_directories(test_npu_decode_single_token_unaligned PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_npu_decode_single_token_unaligned PRIVATE
+      turboquant_single_token_decode_npu
+      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu
+      ascendcl)
+  target_compile_options(test_npu_decode_single_token_unaligned PRIVATE
+      -Wall -Wextra -Werror)
+
+  # ------------------------------------------------- mode-4 research probe
+  # tests/research/kernel_cluster_sync_probe.cpp: one physical AI Core block,
+  # 1 Cube + 2 Vector cores, no data, and a cyclic bilateral handshake over
+  # RECYCLED mode-4 ids 0, 1, 16 and 17 with an x_S drain in front of every
+  # announcement. It is the experiment that settled whether a mode-4 flag
+  # consumes -- guidelines section 6.2c -- and the reason the production
+  # kernels now default to the recycled two-slot ring, so it is a target rather
+  # than a transcript: a toolkit regression that reintroduces the stale release
+  # has to be reproducible here.
+  #
+  # Run it with more than the default two iterations and read the trace, not
+  # the exit status. The probe moves no data, so a sticky latch would make
+  # every wait retire early and the run would still finish and still print
+  # nothing wrong; what distinguishes the two semantics is the tick order of
+  # SET_INTRA_BLOCK against WAIT_INTRA_BLOCK on one id, which only the trace
+  # shows. `add_ascend_micro_sim_targets` registers the CAModel twin that
+  # produces that trace.
+  ascendc_library(cluster_sync_probe_npu SHARED
       tests/research/kernel_cluster_sync_probe.cpp)
-  ascendc_compile_definitions(kernel_cluster_sync_probe PRIVATE
+  ascendc_compile_definitions(cluster_sync_probe_npu PRIVATE
       ASCEND_MICRO_CANN_LAUNCH)
-  ascendc_compile_options(kernel_cluster_sync_probe PRIVATE
+  ascendc_compile_options(cluster_sync_probe_npu PRIVATE
       -std=c++17 -Wall -Werror -Wno-missing-braces ${CANN_SYSTEM_OPTIONS}
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
 
   add_executable(test_cluster_sync_probe
       tests/research/test_cluster_sync_probe.cpp)
   target_include_directories(test_cluster_sync_probe PRIVATE
-      "${ASCEND_HOME_PATH}/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/research")
+      "${ASCEND_HOME_PATH}/include")
   target_link_libraries(test_cluster_sync_probe PRIVATE
-      kernel_cluster_sync_probe ascendcl stdc++)
+      cluster_sync_probe_npu ascendcl)
   target_compile_options(test_cluster_sync_probe PRIVATE -Wall -Wextra -Werror)
-  set_target_properties(test_cluster_sync_probe PROPERTIES
-      BUILD_WITH_INSTALL_RPATH TRUE
-      INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
+
+  foreach(target test_turboquant_a8_validation test_turboquant_bf16_validation
+      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
+      test_npu_decode_splitk_aic test_npu_decode_splitk_aiv
+      test_npu_decode_single_token_unaligned
+      test_cluster_sync_probe)
+    set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
+  endforeach()
+  add_custom_target(turboquant_npu_all DEPENDS
+      test_turboquant_a8_validation test_turboquant_bf16_validation
+      bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
+      test_npu_decode_splitk_aic test_npu_decode_splitk_aiv
+      test_npu_decode_single_token_unaligned)
 endfunction()

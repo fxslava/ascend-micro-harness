@@ -37,6 +37,9 @@
 #include "camodel_common.hpp"
 
 #include "../common/turboquant_oracle.hpp"
+// Pure C++17, no CCE dependency: the single source of truth for which
+// mode-4 channel policy ships.
+#include "../../kernels/ops/turboquant/turboquant_wave_protocol.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -53,7 +56,8 @@ extern "C" void launch_turboquant_reshape_and_cache_bf16(
     const std::int32_t* slot_mapping, const float* pi_signs,
     const std::int32_t* tables, std::uint32_t num_tokens,
     std::uint32_t num_kv_heads, std::uint32_t head_size, std::uint32_t block_size,
-    std::uint32_t num_blocks, std::uint32_t tokens_per_core, float inv_sqrt_len);
+    std::uint32_t num_blocks, std::uint32_t tokens_per_core,
+    float inv_sqrt_len, bool reuse_mode4_flags);
 
 namespace {
 
@@ -90,15 +94,25 @@ int chunk_head(int chunk) { return chunk % kHeads; }
 void usage(std::FILE* output, const char* argv0)
 {
     std::fprintf(output,
-                 "Usage: %s [--slices N] [--window W]\n"
-                 "  N aligned 16-token strips, one grid block each (default 1,"
-                 " 1..%d).\n"
-                 "  --window W splits the context into launches of at most W\n"
-                 "  strips, which is required above the AI Core count.\n",
+                 "Usage: %s [--slices N] [--mode4-single-shot]\n"
+                 "  N aligned 16-token strips in ONE monolithic grid of N\n"
+                 "  blocks (default 1, 1..%d). There is no launch window: a\n"
+                 "  grid wider than the AI Core count spans several physical\n"
+                 "  waves inside the single dispatch, which is the case the\n"
+                 "  inter-wave protocol exists for.\n"
+                 "  The default is the recycled two-slot mode-4 channel\n"
+                 "  entry point; --mode4-single-shot dispatches the fallback\n"
+                 "  that gives every event its own id. Audit the trace either\n"
+                 "  way, do not read the PASS line: two earlier runs of the\n"
+                 "  recycled policy produced bit-exact output while their\n"
+                 "  traces showed a second wait passing before its set. That\n"
+                 "  was an un-drained announcement overtaking its own pipeline\n"
+                 "  (guidelines 6.2a); the fences are in place now and\n"
+                 "  scripts/audit_cross_core_fences.py keeps them there.\n",
                  argv0, kMaxSlices);
 }
 
-int run(int slices, int window)
+int run(int slices, bool reuse_mode4)
 {
     Shape shape;
     shape.num_tokens = slices * kBlockSize;
@@ -168,32 +182,32 @@ int run(int slices, int window)
     pi_signs.upload();
     tables.upload();
 
-    // One launch per window of at most `window` strips: a grid wider than the
-    // AI Core count does not dispatch, and one strip per block per launch is
-    // what the mode-4 id budget allows.
-    const int strips_per_launch = window > 0 ? window : shape.strips();
-    int launches = 0;
-    for (int first = 0; first < shape.strips(); first += strips_per_launch) {
-        const int count = std::min(strips_per_launch, shape.strips() - first);
-        const std::size_t token_base = static_cast<std::size_t>(first) * shape.block_size;
-        launch_turboquant_reshape_and_cache_bf16(
-            session.stream,
-            static_cast<const std::uint16_t*>(key.payload()) + token_base * channels,
-            static_cast<const std::uint16_t*>(value.payload()) + token_base * channels,
-            static_cast<std::int8_t*>(key_cache.payload()),
-            static_cast<std::int8_t*>(value_cache.payload()),
-            static_cast<float*>(scale_cache.payload()),
-            static_cast<const std::int32_t*>(slot_mapping.payload()) + token_base,
-            static_cast<const float*>(pi_signs.payload()),
-            static_cast<const std::int32_t*>(tables.payload()),
-            static_cast<std::uint32_t>(count * shape.block_size),
-            static_cast<std::uint32_t>(shape.num_kv_heads),
-            static_cast<std::uint32_t>(shape.head_size),
-            static_cast<std::uint32_t>(shape.block_size),
-            static_cast<std::uint32_t>(shape.num_blocks),
-            static_cast<std::uint32_t>(shape.block_size), shape.inv_sqrt_len());
-        ++launches;
-    }
+    // ONE launch of shape.strips() grid blocks, however many physical waves
+    // that spans. This used to be a loop over capped windows, because the
+    // mode-4 intra-block flag registers are per physical AI Core block and the
+    // scheduler does not clear them between waves, so re-entering the kernel
+    // was the only way to re-arm them. The kernel now carries the inter-wave
+    // protocol itself -- the boundary guard before InitSocState, the bounded
+    // cross-core channels, and the epilogue drain of every queue of every
+    // role (turboquant_wave_protocol.hpp, guidelines section 6.5) -- so a
+    // multi-wave grid is a single dispatch and that is what has to be tested.
+    // A capped window would re-arm everything at each boundary and hide it.
+    launch_turboquant_reshape_and_cache_bf16(
+        session.stream,
+        static_cast<const std::uint16_t*>(key.payload()),
+        static_cast<const std::uint16_t*>(value.payload()),
+        static_cast<std::int8_t*>(key_cache.payload()),
+        static_cast<std::int8_t*>(value_cache.payload()),
+        static_cast<float*>(scale_cache.payload()),
+        static_cast<const std::int32_t*>(slot_mapping.payload()),
+        static_cast<const float*>(pi_signs.payload()),
+        static_cast<const std::int32_t*>(tables.payload()),
+        static_cast<std::uint32_t>(shape.num_tokens),
+        static_cast<std::uint32_t>(shape.num_kv_heads),
+        static_cast<std::uint32_t>(shape.head_size),
+        static_cast<std::uint32_t>(shape.block_size),
+        static_cast<std::uint32_t>(shape.num_blocks),
+        static_cast<std::uint32_t>(shape.block_size), shape.inv_sqrt_len(), reuse_mode4);
     camodel::check(aclrtSynchronizeStream(session.stream), "aclrtSynchronizeStream");
 
     key_cache.download();
@@ -293,8 +307,12 @@ int run(int slices, int window)
     std::printf("PASS turboquant_reshape_and_cache_bf16: %d strips x 16 tokens x %d "
                 "channels, %d chunks, BF16 activations\n",
                 shape.strips(), channels, chunks);
-    std::printf("  %d launch(es) of at most %d strips, strip s -> physical page 2s+1 "
-                "of %d\n", launches, strips_per_launch, shape.num_blocks);
+    std::printf("  1 launch of %d grid blocks spanning %d physical wave(s) of 32, "
+                "%s, strip s -> physical page 2s+1 of %d\n",
+                shape.strips(), (shape.strips() + 31) / 32,
+                reuse_mode4 ? "recycled two-slot mode-4 ring"
+                            : "single-shot mode-4 channels",
+                shape.num_blocks);
     std::printf("  keyCache   %zu/%d bytes bit-exact, key-major\n", key_bytes,
                 shape.strips() * kHeads * head_bytes);
     std::printf("  valueCache %zu/%d bytes bit-exact, channel-major\n", value_bytes,
@@ -319,31 +337,33 @@ int run(int slices, int window)
 int main(int argc, char** argv)
 {
     int slices = 1;
-    int window = 0;
+    // The shared header's constant, so this runner cannot disagree with the
+    // kernel or the NPU harnesses about which policy ships.
+    bool reuse_mode4 = turboquant_wave::kReshapeDefaultReuse;
     bool saw_slices = false;
-    bool saw_window = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             usage(argc == 2 ? stdout : stderr, argv[0]);
             return argc == 2 ? 0 : 2;
         }
-        const bool is_slices = (arg == "--slices" && !saw_slices);
-        const bool is_window = (arg == "--window" && !saw_window);
-        if ((is_slices || is_window) && i + 1 < argc) {
+        if (arg == "--mode4-reuse") {
+            reuse_mode4 = true;
+            continue;
+        }
+        if (arg == "--mode4-single-shot") {
+            reuse_mode4 = false;
+            continue;
+        }
+        if (arg == "--slices" && !saw_slices && i + 1 < argc) {
             const std::string_view value = argv[++i];
             int parsed_value = 0;
             const auto parsed =
                 std::from_chars(value.data(), value.data() + value.size(), parsed_value);
             if (parsed.ec == std::errc() && parsed.ptr == value.data() + value.size() &&
                 parsed_value >= 1 && parsed_value <= kMaxSlices) {
-                if (is_slices) {
-                    slices = parsed_value;
-                    saw_slices = true;
-                } else {
-                    window = parsed_value;
-                    saw_window = true;
-                }
+                slices = parsed_value;
+                saw_slices = true;
                 continue;
             }
         }
@@ -351,11 +371,13 @@ int main(int argc, char** argv)
         return 2;
     }
     try {
-        return run(slices, window);
+        return run(slices, reuse_mode4);
     } catch (const std::exception& error) {
         std::fprintf(stderr,
-                     "FAIL turboquant_reshape_and_cache_bf16 (%d slices, window %d): "
-                     "%s\n", slices, window, error.what());
+                     "FAIL %s (%d slices, %s): %s\n", "turboquant_reshape_and_cache_bf16", slices,
+                     reuse_mode4 ? "recycled mode-4 ring"
+                                 : "single-shot mode-4 channels",
+                     error.what());
         return 1;
     }
 }

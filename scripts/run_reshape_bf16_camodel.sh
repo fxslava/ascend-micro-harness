@@ -10,11 +10,23 @@
 # "executes on the cycle-accurate model over S = {0, 1, 2} and matches the
 # audited golden", not a hardware claim.
 #
-# Wider contexts need --window, because a grid wider than the AI Core count
-# does not dispatch and one strip per block per launch is what the mode-4 flag
-# id budget allows:
+# Wider contexts are ONE monolithic dispatch now. The kernel carries the
+# inter-wave protocol -- boundary guard, bounded single-shot mode-4 channels,
+# and an epilogue that drains every queue of every role into the scalar stream
+# before the block retires -- so a grid wider than the model's 32 AI Cores
+# spans several physical waves inside a single launch, which is the case that
+# needs testing. --window is gone; a capped launch re-armed everything at each
+# boundary and hid exactly this:
 #
-#   BF16_SLICES="1 2 3 32" BF16_WINDOW=32 scripts/run_reshape_bf16_camodel.sh
+#   BF16_SLICES="1 32 33 48 64" scripts/run_reshape_bf16_camodel.sh
+#
+# BF16_MODE4=single-shot dispatches the single-shot fallback entry point
+# instead of the recycled two-slot ring, which is the default.
+# Two earlier runs of that policy produced bit-exact output while their traces
+# showed a second wait on a reused id passing before its set, so audit the
+# trace with scripts/analyze_reshape_trace.py -- do not read the PASS line:
+#
+#   BF16_MODE4=reuse BF16_SLICES=64 scripts/run_reshape_bf16_camodel.sh
 #
 # Unlike the INT8 probe this kernel has no sparse boundary sampling: its grids
 # are small enough that every block runs.
@@ -24,7 +36,7 @@ toolkit="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.2.0-beta.2}"
 build="${BF16_BUILD_DIR:-$(mktemp -d /tmp/ascend-bf16-camodel-XXXXXX)}"
 sim="${toolkit}/tools/simulator/Ascend950PR_9599/lib"
 slices="${BF16_SLICES:-1 2 3}"
-window="${BF16_WINDOW:-0}"
+mode4="${BF16_MODE4:-reuse}"
 
 if [[ ! -f "${toolkit}/set_env.sh" ]]; then
     echo "CANN 9.2 toolkit not found: ${toolkit}" >&2
@@ -53,7 +65,7 @@ for n in ${slices}; do
     (
         cd "${dir}"
         args=(--slices "${n}")
-        if [[ "${window}" != "0" ]]; then args+=(--window "${window}"); fi
+        if [[ "${mode4}" == "single-shot" ]]; then args+=(--mode4-single-shot); fi
         if ! timeout "${BF16_TIMEOUT:-1800s}" \
                 "${build}/lib/test_camodel_turboquant_reshape_and_cache_bf16" \
                 "${args[@]}" > run.log 2>&1; then
