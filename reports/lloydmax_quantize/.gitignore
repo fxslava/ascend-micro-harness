@@ -1,0 +1,7 @@
+# Keep numeric logs, summaries and the active AIV instruction evidence.
+# Inactive-core placeholders and ancillary simulator dumps stay local.
+*.dump
+!core0.veccore0.instr_log.dump
+!core0.veccore0.instr_popped_log.dump
+profile*.toml
+!*.log

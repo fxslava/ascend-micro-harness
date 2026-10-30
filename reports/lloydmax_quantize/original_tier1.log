@@ -1,0 +1,9 @@
+PASS tier1 queue model: 4 tiles, deadlock-free, 5/5 routes balanced, 0 residual tokens
+PASS tier1 queue model: 8 tiles, deadlock-free, 5/5 routes balanced, 0 residual tokens
+PASS tier1 FP16 4 tiles: 2048/2048 packed bytes bit-identical, 453 subnormal and 1943 +-7-tail inputs covered
+PASS tier1 FP16 8 tiles: 4096/4096 packed bytes bit-identical, 889 subnormal and 3880 +-7-tail inputs covered
+PASS tier1 BF16 4 tiles: 2048/2048 packed bytes bit-identical, 299 subnormal and 1943 +-7-tail inputs covered
+PASS tier1 BF16 8 tiles: 4096/4096 packed bytes bit-identical, 598 subnormal and 3881 +-7-tail inputs covered
+PASS tier1 FP16 sensitivity: 16384 perturbed recomputes, 0 nibble flips (justifies a zero Tier 2 tolerance)
+PASS tier1 BF16 sensitivity: 16384 perturbed recomputes, 0 nibble flips (justifies a zero Tier 2 tolerance)
+tier1 total host time: 6679.367 us

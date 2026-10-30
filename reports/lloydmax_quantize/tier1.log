@@ -1,0 +1,3 @@
+PASS capacity-one one-shot queue model: 13 states, zero residual tokens
+PASS bits=2 Gaussian population NMSE LM=0.1174818479 CDF=0.1467506787 sigmoid=0.1467734219 fixed_point_residual=1.12e-05
+PASS bits=4 Gaussian population NMSE LM=0.0095010080 CDF=0.0236125580 sigmoid=0.0235953785 fixed_point_residual=6.05e-08
