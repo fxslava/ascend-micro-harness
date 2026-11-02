@@ -1,0 +1,15 @@
+2026-11-02T15:35:20Z
+Linux 60133706-BZ 6.18.33.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+toolkit=/usr/local/Ascend/cann-9.2.0-beta.2
+soc=Ascend950PR_9599
+work=/tmp/ascend-camodel-trace.kVltIU
+context=16
+page_tokens=16
+heads=1
+splits=1
+LD_LIBRARY_PATH=/tmp/ascend-camodel-trace.kVltIU/build/lib:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib:/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/devlib
+CAMODEL_CONFIG_PATH=/tmp/ascend-camodel-trace.kVltIU/config
+78077e64b44b579405257126da7378fbfd3ef9e5065b13fc957c3f384767b4db  /tmp/ascend-camodel-trace.kVltIU/build/lib/bench_decode_splitk_sim
+c31bad3d6d4057cb11f69fbbff119dff13b372a1c66c427f83ed954778febcda  /tmp/ascend-camodel-trace.kVltIU/config/config.json
+22989c415bcaaa77bc302b66a5cd36a4d2dd03e5594570a20f743b3288bfcc76  /tmp/ascend-camodel-trace.kVltIU/config/config_stars.json
+0b6ba8cab6c0a9b3e71fe467cfa8a53bd32cd5d710960926d2cd8012b220da98  /tmp/ascend-camodel-trace.kVltIU/src/tests/npu/bench/bench_turboquant_decode_splitk.cpp

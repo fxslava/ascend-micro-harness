@@ -1,0 +1,94 @@
+[WARN]  The option "--application" will be deprecated in future version. It is recommended to specify <app> [arguments] instead.
+=================================================================
+                   >>>>>   MindStudio   <<<<<
+    THE END-TO-END TOOLCHAIN TO UNLEASH HUAWEI ASCEND COMPUTE
+=================================================================
+
+[INFO]  Op profiling analysis start.
+[INFO]  Running simulation task: Binary Simulation Running, use simulator Ascend950PR 9599 by --soc-version
+CAModel functional run: event times/speedups are unavailable; completion deltas are model ticks.
+[PROFILING MODE] Single launch mode active for msprof op.
+AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.
+AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.
+Single samples replace p50; tail/export show maxima. No implicit K=1 launch.
+Each implementation uses its own K=1 baseline. Validation runs once after sampling; tail/export describe the final launch.
+impl=aic requests=1 heads=1 AIV_rows=6 AIC_rows=16 page_tokens=128 warmup=0 iters=1
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+
+| Context (N) | Splits (K) |   Grid |     AIV (us) | AIV Speedup | AIV KV GB/s | AIC Batch Raw(us) |      AIC Model(us/req) | AIC Model GB/s | Tail (ticks) |   Export (ticks) | AIC Speedup |
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+
+[INFO] Config file is found, path is /usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/simulator/dav_3510/lib/config_stars.json.
+[FuncCache]: size:0x20000, line_size:128, way_num:16, line_num:1024, idx_num:64
+             idx_lsb:7, idx_mask:0x3f, tag_lsb:13, tag_mask:0xffffffffffffffff, ofst_mask:0x7f
+
+[TmSim]: Run in serial mode.
+[INFO] Config file [config.json] from environment variable [CAMODEL_CONFIG_PATH]. Path: /tmp/ascend-camodel-trace.hIInsZ/profile/OPPROF_20261102182823_TCQKCJOZUBYHASWO/device0/tmp_dump/config/config.json
+[INFO] AicWrapper attach AIC 0, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 1, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 2, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 3, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 4, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 5, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 6, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 7, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 8, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 9, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 10, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 11, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 12, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 13, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 14, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 15, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 16, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 17, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 18, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 19, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 20, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 21, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 22, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 23, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 24, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 25, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 26, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 27, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 28, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 29, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 30, num_vec_core=2, num_subcore=3
+[INFO] AicWrapper attach AIC 31, num_vec_core=2, num_subcore=3
+[INFO] Chip 0 AIC / Scheduler / Soc periods: 200.0000 / 200.0000 / 105.0000
+[INFO] chip 0 die 0 device created
+================================================================================
+>>>>                                                                        
+>>>>                             " PEM MODEL "                                
+>>>>             Total no. of 1 chip(s) Model Init Success!                
+>>>>                                                                        
+================================================================================
+[INFO] Model Start Time: 2026-11-02 18:28:26
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:0 swapbuf_addr:10000000
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:1 swapbuf_addr:10000040
+[DRVSTUB_LOG] driver_api.c:521 sendSwapBuf:swapbuf_base_addr:10000000
+[DRVSTUB_LOG] driver_api.c:522 sendSwapBuf:sq:2 swapbuf_addr:10000080
+[2026-11-02 15:28:26] [891832] [ProfDataCollect.cpp:495] [INFO] Start profiling on kernel: turboquant_paged_decode_splitk_aic_1_mix_aic
+
+Model SignalHandler: SigIntHandler received signal: 2
+Model logs are being flushed...
+Model is terminating...
+Assertion failed: rvec_instantiator.cc:139 reg_type
+Invalid reg type, reg_name: VD, reg_type: V
+[INFO]  The timeout has reached and the application will be forcibly killed.
+[WARN]  Child process exited with status 11, The process is manually stopped. The existing data has been saved for subsequent analysis
+[INFO]  Profiling running finished. All task success.
+[INFO]  Start parse dump file
+[INFO]  Extract 1817 relations from kernel
+[WARN]  Failed to parse pc to code, maybe kernel missed debug_line information. If you need code call stack, please recompile kernel with -g option
+[WARN]  Code call stack is empty
+[WARN]  Lack of code info of files
+[INFO]  Core operator results run in simulator as follow:
+core_name           duration_time(us)   running_time(us)    
+core0.cubecore0     47.48               47.44               
+core0.veccore0      57.19               57.16               
+core0.veccore1      47.67               47.63               
+[INFO]  Profiling results saved in /tmp/ascend-camodel-trace.hIInsZ/profile/OPPROF_20261102182823_TCQKCJOZUBYHASWO
+[INFO]  Profiling data parse finished.
+[INFO]  Op profiling finish. Welcome to next use.
