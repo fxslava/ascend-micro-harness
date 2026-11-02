@@ -2,10 +2,10 @@
 # Reproduce the four-page cross-core defect in `turboquant_paged_decode_splitk_aic`
 # and the evidence that closes it. See reports/decode_splitk_aic_page_race.md.
 #
-#   bash scripts/run_decode_splitk_aic_page_race.sh models   # host only, no CANN
-#   bash scripts/run_decode_splitk_aic_page_race.sh sweep    # the page sweep on CAModel
-#   bash scripts/run_decode_splitk_aic_page_race.sh audit DIR # trace gates on one rung
-#   bash scripts/run_decode_splitk_aic_page_race.sh all      # models, sweep, audit
+#   bash scripts/run_decode_splitk_aic_page_race.sh models      # host only, no CANN
+#   bash scripts/run_decode_splitk_aic_page_race.sh sweep       # the page sweep on CAModel
+#   bash scripts/run_decode_splitk_aic_page_race.sh audit DIR N # trace gates on one rung
+#   bash scripts/run_decode_splitk_aic_page_race.sh all         # models, sweep, audit
 #
 # Why the sweep is the shape it is
 # -------------------------------
@@ -69,36 +69,59 @@ rung() {
         | grep -v DRVSTUB | sed 's/^/    /'
 }
 
+# Rungs are independent -- each has its own evidence directory, its own log and
+# its own working directory -- and one rung is about five minutes of model time,
+# so they run concurrently. `wait` collects them; a failing rung still prints
+# its own line, because `rung` reports its own exit status.
 sweep() {
     mkdir -p "${work}"
     build_sim || return 1
     local base="--page-tokens 16 --heads 1 --rows 1 --splitk 1 --single --impl aic"
-    # Three pages, slid across the window: all three must pass.
-    rung p3_from0 --context 48 ${base} --page-begin 0 --page-count 3
-    rung p3_from1 --context 64 ${base} --page-begin 1 --page-count 3
-    rung p3_from2 --context 80 ${base} --page-begin 2 --page-count 3
-    # Four and five carried pages: the rungs the defect lives in.
-    rung p4_from0 --context 64 ${base} --page-begin 0 --page-count 4
-    rung p4_from1 --context 80 ${base} --page-begin 1 --page-count 4
-    rung p5_from0 --context 80 ${base} --page-begin 0 --page-count 5
+    # Two, four and eight carried pages: the depths the acceptance ladder names.
+    rung p2_from0 --context 32  ${base} --page-begin 0 --page-count 2 &
+    rung p4_from0 --context 64  ${base} --page-begin 0 --page-count 4 &
+    rung p8_from0 --context 128 ${base} --page-begin 0 --page-count 8 &
+    # Three pages, slid across the window: these passed before the refactor and
+    # must still pass, which is what separates a fix from a reshuffle.
+    rung p3_from0 --context 48 ${base} --page-begin 0 --page-count 3 &
+    rung p3_from1 --context 64 ${base} --page-begin 1 --page-count 3 &
+    rung p3_from2 --context 80 ${base} --page-begin 2 --page-count 3 &
+    wait
+    # The sliding-window rungs: holding the carried count fixed and moving the
+    # start is what separates "page count" from "page data". Four and five
+    # pages failed from EVERY start before the refactor.
+    rung p4_from1 --context 80 ${base} --page-begin 1 --page-count 4 &
+    rung p5_from0 --context 80 ${base} --page-begin 0 --page-count 5 &
     # One page per worker at the same depth: isolates the carry from the data.
-    rung p4_k4 --context 64 --page-tokens 16 --heads 1 --rows 1 --splitk 4 --single --impl aic
+    rung p4_k4 --context 64 --page-tokens 16 --heads 1 --rows 1 --splitk 4 --single --impl aic &
+    wait
 }
 
 audit() {
     local evidence="${1:-${work}/ev_p4_from0}"
-    echo "=== section 5: HardEvent balance, mode-4 census, Mmad census ==="
+    local pages="${2:-4}"
+    echo "=== section 5: HardEvent balance, cross-core census, Mmad census ==="
     python3 "${repo_dir}/scripts/analyze_aic_splitk_trace.py" "${evidence}" \
-        --workers 1 --pages 4 --strips 1
+        --workers 1 --pages "${pages}" --strips 1
     echo
     echo "=== section 5: capacity-one ORDER and cross-core STALL ==="
-    # kFlagPageDrainedV1 (absolute id 26) must stall on EVERY page, not just
-    # the first. 1000 ticks is well under the ~20600-tick page cadence of this
-    # geometry and well over the 3-tick floor the collapsed channel showed.
-    # Scoped to that id: a stall floor is per channel, and the Cube's
-    # per-strip score-free wait legitimately reads ~1000 on one slot.
+    # Two properties, and the first is the one that matters. EARLY RETIREMENT
+    # is checked for every channel with no threshold at all: the j-th wait must
+    # not have been released before the j-th announcement, which is what mode
+    # 4's AIC -> AIV direction violated. The stall floor is the weaker, older
+    # check, scoped to the release broadcast (mode-2 id 9) -- the channel that
+    # bounds AIV1 and the one whose mode-4 predecessor read [23146, 3, 3, 3]
+    # against ~20600-tick announcements.
+    #
+    # 50 ticks and not 1000. The threshold only separated a collapsed latch
+    # from a real stall while the producer ran UNBOUNDED. With the two-slot
+    # credit the Cube is often already a strip or two ahead, so a wait
+    # legitimately finds its token banked and stalls only the cost of its own
+    # drain -- around a hundred ticks. 50 is comfortably above the 1-3 tick
+    # floor a channel that had stopped blocking showed, and claims nothing more
+    # than that no wait retired at the floor.
     python3 "${repo_dir}/scripts/audit_mode4_tick_order.py" "${evidence}" \
-        --block 0 --cross --expect-stall 1000 --expect-id 26
+        --block 0 --cross --expect-stall 50 --expect-id m2:9
     echo
     echo "=== nonempty exception dumps (must be none) ==="
     find "${evidence}" -name "*excp*.dump" -size +0 -print | sed 's/^/    /' || true
@@ -107,7 +130,7 @@ audit() {
 case "${mode}" in
 models) host_models ;;
 sweep)  sweep ;;
-audit)  audit "${2:-}" ;;
+audit)  audit "${2:-}" "${3:-}" ;;
 all)    host_models && sweep && audit ;;
 *)      echo "usage: $0 {models|sweep|audit [DIR]|all}" >&2; exit 2 ;;
 esac

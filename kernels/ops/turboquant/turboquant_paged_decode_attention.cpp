@@ -198,6 +198,24 @@ static_assert(kBcLanes * kF32 == 8u * kBlock, "a Brcb repeat writes eight DataBl
 static_assert(kPackedBytes % kBlock == 0 && kScalePairBytes % kBlock == 0 && (kTokens * kHeadSize * kB16) % kBlock == 0, "every MTE2/MTE3 length must be whole 32-byte bursts");
 static_assert(kPanel % ascend_micro::kDequant4MinElements == 0, "a dequant count must be a multiple of 64 nibbles");
 
+// Ring slot addresses, in two colours of the same `base + slot * stride`.
+//
+// The per-page schedule knows its slot at compile time, so it uses the variable
+// templates. The continuous strip pipeline resolves `slot = strip % kStageDepth`
+// at RUN time and needs functions -- and in the CCE dialect a plain `constexpr`
+// function is `__host__`, so one an `__aicore__` function may call has to carry
+// `__aicore__` itself. That colour is also why the templates below cannot be
+// written in terms of these functions: a namespace scope initialiser is not a
+// device context. The two forms name the same base and the same stride, so the
+// only way they can disagree is by editing one and not the other.
+__aicore__ inline constexpr std::uint32_t ScoreSlotOf(std::uint32_t slot)   { return kUbScoreRing    + slot * kRingScore; }
+__aicore__ inline constexpr std::uint32_t PackedKSlotOf(std::uint32_t slot) { return kUbPackedKRing  + slot * kRingPacked; }
+__aicore__ inline constexpr std::uint32_t PackedVSlotOf(std::uint32_t slot) { return kUbPackedVRing  + slot * kRingPacked; }
+__aicore__ inline constexpr std::uint32_t KeySlotOf(std::uint32_t slot)     { return kUbKeyRing      + slot * kRingKey; }
+__aicore__ inline constexpr std::uint32_t ValueSlotOf(std::uint32_t slot)   { return kUbValueRing    + slot * kRingValue; }
+__aicore__ inline constexpr std::uint32_t ScaleSlotOf(std::uint32_t slot)   { return kUbScaleRing    + slot * kRingScale; }
+__aicore__ inline constexpr std::uint32_t ArchiveSlotOf(std::uint32_t strip){ return kUbScoreArchive + strip * kRingScore; }
+
 template <std::uint32_t Slot>  constexpr std::uint32_t kScoreSlot   = kUbScoreRing    + Slot * kRingScore;
 template <std::uint32_t Slot>  constexpr std::uint32_t kPackedKSlot = kUbPackedKRing  + Slot * kRingPacked;
 template <std::uint32_t Slot>  constexpr std::uint32_t kPackedVSlot = kUbPackedVRing  + Slot * kRingPacked;
@@ -216,21 +234,142 @@ constexpr std::uint32_t kL1End        = kL1KeyRing + kStrips * kL1SlotStride;
 static_assert(kL1PiTable  % kBlock == 0 && kL1Q       % kBlock == 0 && kL1QRot   % kBlock == 0 && kL1KeyRing % kBlock == 0 && kL1SlotStride % kBlock == 0, "every L1 operand base must be 32-byte aligned");
 static_assert(kL1End <= 512u * 1024u, "the per-strip L1 key pages exceed the L1 buffer");
 
+__aicore__ inline constexpr std::uint32_t L1KeyPageOf(std::uint32_t page)
+{
+    return kL1KeyRing + page * kL1SlotStride;
+}
+
 template <std::uint32_t Strip>
 constexpr std::uint32_t kL1KeyPage = kL1KeyRing + Strip * kL1SlotStride;
+
+// The continuous strip pipeline reuses the first kStageDepth of those pages as
+// a RING addressed by slot, with an explicit cross-core WAR edge behind it. The
+// per-page schedule's one-page-per-strip arrangement carried no such edge --
+// its premise was that "every page is read once", which holds inside a page and
+// fails the moment a second sequence page reuses the address. That is the
+// defect reports/decode_splitk_aic_page_race.md section 5 measures.
+static_assert(kStageDepth <= kStrips,
+              "the streaming L1 key ring is carved out of the per-strip pages");
 
 template <std::uint32_t Slot> constexpr std::uint16_t kFlagValueReady   = 0u + Slot;
 template <std::uint32_t Slot> constexpr std::uint16_t kFlagScoreFree    = 4u + Slot;
 template <std::uint32_t Slot> constexpr std::uint16_t kFlagScoreReady   = 8u + Slot;
 template <std::uint32_t Slot> constexpr std::uint16_t kFlagKeyReady     = 16u + Slot;
 
-constexpr std::uint16_t kFlagPageDrainedV0 = 10u;
-constexpr std::uint16_t kFlagPageDrainedV1 = 26u;
-constexpr std::int32_t  kEvtPageDrain      = 5;
+// The event id the continuous strip pipeline's cross-core drains ride on. It
+// is distinct from the per-slot kEvtStatic and from the slot ids 0..1, so a
+// drain pair can sit inside a strip body without colliding with that body's own
+// HardEvent places.
+constexpr std::int32_t  kEvtStreamDrain    = 5;
 
-static_assert(kFlagPageDrainedV0 < 11u && kFlagPageDrainedV1 - 16u < 11u, "page-completion flags must remain in the application ID range");
+// The mode-4 page-completion flags kFlagPageDrainedV0 / V1 are GONE. They were
+// a per-page drain cascade standing where a per-strip L1 WAR back edge should
+// have been, and on this toolkit an AIC -> AIV mode-4 wait blocks only on its
+// FIRST use of an id: the four waits measured 23146, 3, 3 and 3 ticks against
+// announcements ~20600 ticks apart, so the edge did not bound its consumer at
+// all. reports/decode_splitk_aic_page_race.md sections 4, 5 and 7. The
+// replacement is the mode-2 pair above, and it is per strip, not per page.
 static_assert(kFlagValueReady<kStageDepth - 1u> < 11u && kFlagScoreFree<kStageDepth - 1u> < 11u && kFlagScoreReady<kStageDepth - 1u> < 11u, "sub block 0 flag ids must stay below the library-reserved 11..14");
 static_assert(kFlagKeyReady<kStageDepth - 1u> - 16u < 11u, "sub block 1 flag ids must stay below 11 in their own half");
+
+// ----------------------------------------------------- the mode-2 channels
+// The continuous strip pipeline's whole cross-core discipline: one readiness
+// quorum and one release broadcast. Mode 2 is the "AIC and ALL AIVs" fused
+// mode, so the AIC's counter advances only once BOTH Vector cores have
+// announced, and one AIC announcement releases both of them
+// (`key_feature_description.md`, "Full-Core Synchronization Between AIC and AIV
+// in a Single AI Core"). That quorum is the property this operator needs and
+// mode 4, which addresses one AIV at a time, cannot express.
+//
+// Both participants name the SAME id. There is no +16 rebase as in mode 4,
+// because mode 2 does not address an individual AIV.
+//
+// The budget, asserted rather than commented, because every claim here is a
+// silent-wrong-answer away from being wrong: an id outside 0..15 is truncated
+// to its low four bits, and an id another API also uses aliases two channels.
+struct Mode2IdBudget {
+    static constexpr std::uint16_t kIds = 16u;           // 0..15 per core
+    // SyncAll's hardware path claims 11..14 (SyncAll.md, "Constraints").
+    static constexpr std::uint16_t kSyncAllFirst = 11u;
+    static constexpr std::uint16_t kSyncAllLast  = 14u;
+    // The Matmul high-level API claims [0, 2N - 1] for N objects, N <= 4. This
+    // operator defines no Matmul object -- it issues Mmad directly -- but the
+    // budget is asserted against the worst case, so adding one later cannot
+    // silently alias a channel.
+    static constexpr std::uint16_t kMatmulLast = 7u;
+    // Each id is a counter in 0..15; overflowing it is a reported error, not a
+    // wrap. kMaxOutstanding below is this pipeline's worst case.
+    static constexpr std::uint16_t kCounterMax = 15u;
+
+    static constexpr bool Free(std::uint16_t id)
+    {
+        return id < kIds && id > kMatmulLast &&
+               (id < kSyncAllFirst || id > kSyncAllLast);
+    }
+};
+
+// Readiness, both AIVs -> AIC, consumed by ONE quorum wait per strip.
+constexpr std::uint16_t kSync2StageReady      = 8u;
+// The same channel, named so that section 6.6's fence audit can tell the
+// PRIMING sets -- "the score slots start empty" -- from announcements of
+// earlier pipe work, which are the only ones that need a drain (section 6.2a).
+constexpr std::uint16_t kSync2StageReadyPrime = kSync2StageReady;
+// Release, AIC -> both AIVs, one broadcast per retired strip.
+constexpr std::uint16_t kSync2StepRetired     = 9u;
+
+static_assert(Mode2IdBudget::Free(kSync2StageReady),
+              "the readiness channel must not alias SyncAll or Matmul");
+static_assert(Mode2IdBudget::Free(kSync2StepRetired),
+              "the release channel must not alias SyncAll or Matmul");
+static_assert(kSync2StageReady != kSync2StepRetired,
+              "readiness and release must never share an id: conflating data "
+              "readiness with buffer release is the fault this replaces");
+
+// Worst-case outstanding announcements on either channel. Each AIV's n-th
+// readiness announcement is itself behind the AIC's (n - kStageDepth)-th
+// release, and the AIC's n-th release is behind its n-th readiness wait, so
+// neither side can run more than kStageDepth strips ahead of the other, plus
+// the one announcement in flight.
+constexpr std::uint16_t kMaxOutstanding = static_cast<std::uint16_t>(kStageDepth + 1u);
+static_assert(kMaxOutstanding <= Mode2IdBudget::kCounterMax,
+              "a mode-2 flag counter overflow is a reported error, not a wrap");
+
+// Which pipe each participant may name. The library gates both calls on
+// IsSplitVectorPipe / IsSplitCubePipe (CANN 9.2
+// impl/basic_api/kernel_event.h:257, :263), and on __NPU_ARCH__ == 3510 the two
+// sets are nearly disjoint: a call naming the other side's pipe compiles to
+// NOTHING, silently and with no diagnostic. PIPE_S is excluded because mode 2
+// does not support it (CrossCoreSetFlag_ISASI.md, "Supported Pipeline Type").
+constexpr bool Mode2AivPipe(pipe_t pipe)
+{
+    return pipe == PIPE_V || pipe == PIPE_MTE2 || pipe == PIPE_MTE3;
+}
+
+constexpr bool Mode2AicPipe(pipe_t pipe)
+{
+    return pipe == PIPE_MTE1 || pipe == PIPE_MTE2 || pipe == PIPE_FIX || pipe == PIPE_M;
+}
+
+// The AIC waits on MTE1 because MTE1 is the pipe that READS the L1 key page.
+// One wait is enough for the Fixpipe too: the Fixpipe is chained to the Mmad
+// (M_FIX) and the Mmad to the L1 -> L0B load (MTE1_M), so blocking MTE1 orders
+// the whole triple. It announces on FIX, the last pipe it drains.
+constexpr pipe_t kSync2AicWait      = PIPE_MTE1;
+constexpr pipe_t kSync2AicAnnounce  = PIPE_FIX;
+// AIV0's recurrence is Vector work and reads the score panel, so it waits on V
+// and announces on V.
+constexpr pipe_t kSync2Aiv0Wait     = PIPE_V;
+constexpr pipe_t kSync2Aiv0Announce = PIPE_V;
+// AIV1 waits on MTE3, the pipe that WRITES the L1 key page, and announces on
+// MTE3, the work the announcement reports.
+constexpr pipe_t kSync2Aiv1Wait     = PIPE_MTE3;
+constexpr pipe_t kSync2Aiv1Announce = PIPE_MTE3;
+
+static_assert(Mode2AicPipe(kSync2AicWait) && Mode2AicPipe(kSync2AicAnnounce),
+              "an AIC mode-2 call naming a Vector-only pipe compiles to nothing");
+static_assert(Mode2AivPipe(kSync2Aiv0Wait) && Mode2AivPipe(kSync2Aiv0Announce) &&
+                  Mode2AivPipe(kSync2Aiv1Wait) && Mode2AivPipe(kSync2Aiv1Announce),
+              "an AIV mode-2 call naming a Cube-only pipe compiles to nothing");
 
 constexpr std::int32_t kEvtStatic = 3;
 
@@ -358,22 +497,22 @@ __aicore__ inline void DequantValueStrip(ValueEngine&)
     AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagValueReady<Slot>);
 }
 
-template <std::uint32_t Slot, std::uint32_t Strip>
-__aicore__ inline void RecurStrip(ValueEngine&, std::uint32_t active)
+// Every operand of the recurrence that depends only on the ring slot. Shared
+// by the per-page schedule and the continuous strip pipeline, so the two cannot
+// drift: the carried (m, l, Acc) sit at FIXED UB offsets in both, which is the
+// ordering property tests/cpu/test_decode_page_loop_model.py checks.
+__aicore__ inline void FillRecurEngine(ascend_micro::NativeDecodeRecurrenceEngine& recur_engine,
+                                       std::uint32_t slot)
 {
-    static_assert(Slot < kStageDepth && Strip < kStrips);
-    constexpr std::int32_t evt = static_cast<std::int32_t>(Slot);
-
-    ascend_micro::NativeDecodeRecurrenceEngine recur_engine;
     recur_engine.position     = kUb;
-    recur_engine.panel_base   = kScoreSlot<Slot>;
+    recur_engine.panel_base   = ScoreSlotOf(slot);
     recur_engine.m_base       = kUbMPrev;
     recur_engine.l_base       = kUbLPrev;
     recur_engine.acc_base     = kUbAcc;
-    recur_engine.panel        = {kUb, kScoreSlot<Slot>,                   kScores};
-    recur_engine.key_scale    = {kUb, kScaleSlot<Slot>,                   kTokens};
-    recur_engine.value_scale  = {kUb, kScaleSlot<Slot> + kTokens * kF32,  kTokens};
-    recur_engine.value_page   = {kUb, kValueSlot<Slot>,                   kPanel};
+    recur_engine.panel        = {kUb, ScoreSlotOf(slot),                  kScores};
+    recur_engine.key_scale    = {kUb, ScaleSlotOf(slot),                  kTokens};
+    recur_engine.value_scale  = {kUb, ScaleSlotOf(slot) + kTokens * kF32, kTokens};
+    recur_engine.value_page   = {kUb, ValueSlotOf(slot),                  kPanel};
     recur_engine.m_prev       = {kUb, kUbMPrev,                           kTokens * kStateLanes};
     recur_engine.l_prev       = {kUb, kUbLPrev,                           kTokens * kStateLanes};
     recur_engine.acc          = {kUb, kUbAcc,                             kTokens * kHeadSize};
@@ -400,6 +539,16 @@ __aicore__ inline void RecurStrip(ValueEngine&, std::uint32_t active)
     recur_engine.masked_fill  = {kUb, kUbMaskedFill,                      kTokens};
     recur_engine.zero_fill    = {kUb, kUbZeroFill,                        kTokens};
     recur_engine.tail_sel     = {kUb, kUbTailSel,                         kTokens};
+}
+
+template <std::uint32_t Slot, std::uint32_t Strip>
+__aicore__ inline void RecurStrip(ValueEngine&, std::uint32_t active)
+{
+    static_assert(Slot < kStageDepth && Strip < kStrips);
+    constexpr std::int32_t evt = static_cast<std::int32_t>(Slot);
+
+    ascend_micro::NativeDecodeRecurrenceEngine recur_engine;
+    FillRecurEngine(recur_engine, Slot);
 
     AscendC::LocalTensor<float> panel{kUb,    kScoreSlot<Slot>,    kScores};
     AscendC::LocalTensor<float> archived{kUb, kArchiveSlot<Strip>, kScores};
@@ -673,15 +822,48 @@ __aicore__ inline void StepColumnsCube(CubeEngine& engine, std::uint32_t strips,
     (StepColumnCube<Columns>(engine, strips), ...);
 }
 
+// The Cube's ingress rotation prologue: Q . Pi^T into L1, then into L0A. It
+// is identical for both schedules, so both call it.
+__aicore__ inline void CubeRotatePrologue(__gm__ bfloat16_t* gm_q,
+                                          __gm__ bfloat16_t* gm_pi_table,
+                                          __gm__ bfloat16_t* gm_out_qrot,
+                                          std::uint32_t      q_base,
+                                          CubeEngine&        engine)
+{
+    ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_q + q_base, kL1Q, kHeadSize);
+    ascend_micro::stage_blocks_nz<kTableBlocks, kGroup>(gm_pi_table, kL1PiTable);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+
+    ascend_micro::rotate_query_stage_l0(kL1PiTable, kL1Q, engine.l0_query, engine.l0_table);
+    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
+
+    ascend_micro::rotate_query_compute(engine.l0_query, engine.l0_table, engine.l0_scores);
+    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(kEvtStatic);
+
+    ascend_micro::rotate_query_to_gm(gm_out_qrot, engine.l0_scores);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtStatic);
+
+    ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_out_qrot, kL1QRot, kHeadSize);
+    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEvtStatic);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+
+    ascend_micro::load_query_rotated(kL1QRot, engine.l0_query);
+    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
+}
+
 __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
                                      __gm__ bfloat16_t* gm_pi_table,
                                      __gm__ bfloat16_t* gm_out_qrot,
                                      std::uint32_t      q_base,
-                                     std::uint32_t      strips,
-                                     std::uint32_t      pages    = 1u,
-                                     bool               temporal = false)
+                                     std::uint32_t      strips)
 {
-    if (pages == 0u) return;
     using namespace AscendC::Te;
 
     __ca__ bfloat16_t l0_query[kPanel]       __attribute__((aligned(512)));
@@ -693,59 +875,482 @@ __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
 
     CubeEngine engine{l0_query, l0_table, l0_scores};
 
-    ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_q + q_base, kL1Q, kHeadSize);
-    ascend_micro::stage_blocks_nz<kTableBlocks, kGroup>(gm_pi_table, kL1PiTable);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+    CubeRotatePrologue(gm_q, gm_pi_table, gm_out_qrot, q_base, engine);
 
-    ascend_micro::rotate_query_stage_l0(kL1PiTable, kL1Q, l0_query, l0_table);
-    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
+    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(0);
+    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(1);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
 
-    ascend_micro::rotate_query_compute(l0_query, l0_table, l0_scores);
-    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(kEvtStatic);
+    StepColumnsCube(engine, strips, ColumnSeq{});
 
-    ascend_micro::rotate_query_to_gm(gm_out_qrot, l0_scores);
-    AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(1);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagScoreFree<0>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagScoreFree<1>);
+}
 
-    ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_out_qrot, kL1QRot, kHeadSize);
-    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEvtStatic);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+// =========================================================================
+// The continuous strip pipeline, for the Split-K / temporal entry
+// =========================================================================
+//
+// ONE flat sequence over the window's strips, agnostic of page boundaries
+// inside the loop. Column c carries the same five stages at the same offsets as
+// the per-page schedule at the top of this file -- what changes is that the
+// strip index is GLOBAL, so the sequence runs straight through a page boundary
+// instead of priming and draining the whole ring at each one:
+//
+//   AIV1  MTE2 + V + MTE3   stage key strip c - 1  -> L1 key page (c - 1) % 2
+//   AIC   MTE1 + M + FIX    GEMM strip c - 2       -> UB score slot c % 2
+//   AIV0  MTE2              load value strip c - 2
+//   AIV0  V                 dequant value strip c - 3
+//   AIV0  V                 recurrence strip c - 4  <- UB score slot c % 2
+//
+// Three structural differences from the per-page schedule, and why each one is
+// there:
+//
+// 1. The L1 key ring is kStageDepth pages addressed by SLOT, not kStrips pages
+//    addressed by STRIP. The per-strip arrangement had no WAR back edge at all;
+//    its comment argued "every page is read once", which is true inside one
+//    sequence page and false across the page loop, where page p + 1's strip s
+//    restages page p's address.
+// 2. The intra-core feedback cycles are primed ONCE before the stream and
+//    drained ONCE after it. There is no inter-page drain cascade left.
+// 3. Cross-core ordering is the two mode-2 channels and nothing else, so ring
+//    reuse rests on the token structure rather than on a hardware property of a
+//    mode-4 latch.
+//
+// The rendezvous, per strip
+// -------------------------
+// Readiness, kSync2StageReady, both AIVs -> AIC, ONE quorum wait:
+//   AIV1's n-th announcement = "the L1 key page holds strip n".
+//   AIV0's n-th announcement = "the UB score slot strip n will land in is
+//     free", i.e. the recurrence of strip n - kStageDepth has retired. Its
+//     first kStageDepth announcements are PRIMING sets: the slots start empty.
+//   The AIC's n-th wait therefore blocks until BOTH hold, which is exactly the
+//   pair of preconditions its n-th GEMM has. Readiness and release never share
+//   an id, so neither meaning can stand in for the other.
+//
+// Release, kSync2StepRetired, AIC -> both AIVs, one broadcast:
+//   the AIC's n-th announcement = "strip n is retired": its L1 key page has
+//   been read into L0B and its scores have landed in UB.
+//   AIV1's wait before staging strip t is its (t - kStageDepth)-th, so it is
+//     released by "strip t - kStageDepth retired" -- the strip that owns the L1
+//     page strip t is about to overwrite.
+//   AIV0's wait before the recurrence of strip t is its t-th, so it is released
+//     by "strip t retired" -- the scores it is about to read.
+//
+// Token census per channel, which is what keeps each counter inside its 0..15
+// range and what tests/cpu/test_decode_page_loop_model.py explores
+// exhaustively, with `total` the window's strip count:
+//
+//   readiness  AIV0 min(kStageDepth, total) primes + max(0, total - kStageDepth)
+//              post-recurrence announcements = total; AIV1 total; AIC total
+//              waits.
+//   release    AIC total announcements; AIV0 total waits; AIV1
+//              max(0, total - kStageDepth) in the stream + min(kStageDepth,
+//              total) in its epilogue = total.
+//
+// Every wait carries its own x_S scalar drain immediately behind it, on the
+// pipe the wait names. A CrossCoreWaitFlag on Ascend 950PR blocks only the
+// issuance of that one pipe, so the drain is what converts the wait into a
+// stall on instruction ISSUE -- which bounds the whole core rather than one
+// queue, and is also the only thing scripts/audit_mode4_tick_order.py can
+// measure a stall from.
 
-    ascend_micro::load_query_rotated(kL1QRot, l0_query);
-    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
+// The window one Split-K worker owns, in units of strips, plus everything
+// needed to turn a global strip index into Global Memory addresses.
+struct StripWindow {
+    std::uint32_t strips_per_page = 0;  // block_size / kTokens
+    std::uint32_t page_begin      = 0;  // first LOGICAL page, range offset included
+    std::uint32_t heads           = 0;
+    std::uint32_t head            = 0;
+    std::uint32_t block_size      = 0;
+    std::uint32_t table_base      = 0;  // request * seq_pages
+    std::uint32_t scale_plane     = 0;  // cache_pages * heads * block_size
+    std::uint32_t live_seq        = 0;
+    std::uint32_t total           = 0;  // strips in the window, dead ones included
+};
 
-    for (std::uint32_t page = 0; page < pages; ++page) {
-        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(0);
-        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(1);
-        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
-        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
+// Global strip index -> addresses. The block table is read through the scalar
+// unit, and the physical page is memoised: the walk is monotone in the strip
+// index (turboquant_decode_tail::WalkIsMonotone), so a page is looked up once
+// rather than once per strip.
+struct StripResolver {
+    __gm__ std::uint32_t* table = nullptr;
+    StripWindow           window;
+    std::uint32_t         page_idx = 0xFFFFFFFFu;
+    std::uint32_t         physical = 0u;
 
-        StepColumnsCube(engine, strips, ColumnSeq{});
-
-        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
-        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(1);
-        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
-        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
-        AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagScoreFree<0>);
-        AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagScoreFree<1>);
-
-        if (temporal) {
-            AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtPageDrain);
-            AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtPageDrain);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtPageDrain);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtPageDrain);
-            AscendC::SetFlag<AscendC::HardEvent::M_S>(kEvtPageDrain);
-            AscendC::WaitFlag<AscendC::HardEvent::M_S>(kEvtPageDrain);
-            AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrainedV0);
-            AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrainedV1);
+    __aicore__ inline std::uint32_t PageBase(std::uint32_t strip)
+    {
+        const std::uint32_t index = strip / window.strips_per_page;
+        if (index != page_idx) {
+            page_idx = index;
+            physical = table[window.table_base + window.page_begin + index];
         }
+        return (physical * window.heads + window.head) * window.block_size;
     }
+
+    // Byte offset of this strip's packed int4 panel in the key or value pool.
+    // Both pools share the layout, so one function serves both -- as the
+    // per-page entry already relied on.
+    __aicore__ inline std::uint32_t PackedBytes(std::uint32_t strip)
+    {
+        return PageBase(strip) * kHeadSize / 2u +
+               (strip % window.strips_per_page) * kPackedBytes;
+    }
+
+    // Element offset of this strip's slice of the KEY scale plane; the value
+    // plane sits `scale_plane` elements further on.
+    __aicore__ inline std::uint32_t ScaleElems(std::uint32_t strip)
+    {
+        return PageBase(strip) + (strip % window.strips_per_page) * kTokens;
+    }
+
+    __aicore__ inline std::uint32_t Active(std::uint32_t strip) const
+    {
+        return turboquant_decode_tail::WalkActive(
+            strip, window.strips_per_page, window.page_begin, 0u,
+            window.block_size, window.live_seq);
+    }
+};
+
+// ------------------------------------------------------------------- AIV1
+__aicore__ inline void StreamKeyStrip(KeyEngine& engine, StripResolver& resolver,
+                                      std::uint32_t strip)
+{
+    const std::uint32_t  slot = strip % kStageDepth;
+    const std::int32_t   evt  = static_cast<std::int32_t>(slot);
+
+    ascend_micro::NativeDequant4Engine<bfloat16_t> dequant_engine;
+    dequant_engine.packed = {kUb, PackedKSlotOf(slot), kPackedBytes};
+    dequant_engine.output = {kUb, KeySlotOf(slot),     kPanel};
+
+    ascend_micro::NativeCvTransferEngine<bfloat16_t> transfer_engine;
+    transfer_engine.ub_position   = kUb;
+    transfer_engine.l1_position   = AscendC::TPosition::B1;
+    transfer_engine.ub_base_bytes = KeySlotOf(slot);
+    transfer_engine.l1_base_bytes = L1KeyPageOf(slot);
+
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evt);
+    AscendC::DataCopy(dequant_engine.packed,
+                      engine.key_cache[resolver.PackedBytes(strip)], kPackedBytes);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(evt);
+    ascend_micro::turboquant_dequant4_signed(dequant_engine, kPanel);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evt);
+
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evt);
+
+    // WAR on the L1 key page. This strip overwrites what strip
+    // `strip - kStageDepth` put there, so the AIC must already have read that
+    // page into L0B. The wait gates PIPE_MTE3 -- the pipe that writes L1 -- and
+    // the MTE3_S drain behind it stalls instruction issue until MTE3 has
+    // retired past the wait, which also holds the NEXT strip's MTE2 ingress
+    // behind the release. This is the edge that was missing.
+    if (strip >= kStageDepth) {
+        AscendC::CrossCoreWaitFlag<2, kSync2Aiv1Wait>(kSync2StepRetired);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtStreamDrain);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtStreamDrain);
+    }
+
+    ascend_micro::cv_transfer_nd2nz<kTokens, kHeadSize, kHeadSize, 16u, 1u>(transfer_engine);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(evt);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(evt);
+    AscendC::CrossCoreSetFlag<2, kSync2Aiv1Announce>(kSync2StageReady);
+}
+
+__aicore__ inline void stream_key_core(__gm__ std::int8_t*   gm_key_cache,
+                                       __gm__ std::uint32_t* gm_table,
+                                       const StripWindow&    window)
+{
+    if (window.total == 0u) return;
+
+    KeyEngine engine;
+    engine.key_cache.SetGlobalBuffer(gm_key_cache);
+    engine.strip_base_bytes = 0;
+
+    StripResolver resolver;
+    resolver.table  = gm_table;
+    resolver.window = window;
+
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(0);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(1);
+
+    for (std::uint32_t strip = 0; strip < window.total; ++strip) {
+        StreamKeyStrip(engine, resolver, strip);
+    }
+
+    // The AIC broadcasts one release per strip and this core consumed one per
+    // strip from kStageDepth on, so min(kStageDepth, total) releases are still
+    // standing. Consume them: a cross-core counter left non-empty at kernel
+    // exit leaks into the next launch.
+    const std::uint32_t standing =
+        window.total < kStageDepth ? window.total : kStageDepth;
+    for (std::uint32_t i = 0; i < standing; ++i) {
+        AscendC::CrossCoreWaitFlag<2, kSync2Aiv1Wait>(kSync2StepRetired);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtStreamDrain);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtStreamDrain);
+    }
+
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(1);
+}
+
+// ------------------------------------------------------------------- AIV0
+__aicore__ inline void StreamLoadValueStrip(ValueEngine& engine,
+                                            StripResolver& resolver,
+                                            std::uint32_t strip)
+{
+    const std::uint32_t slot = strip % kStageDepth;
+    const std::int32_t  evt  = static_cast<std::int32_t>(slot);
+
+    AscendC::LocalTensor<std::int8_t> packed{kUb,     PackedVSlotOf(slot),                  kPackedBytes};
+    AscendC::LocalTensor<float>       key_scale{kUb,  ScaleSlotOf(slot),                    kTokens};
+    AscendC::LocalTensor<float>       value_scale{kUb, ScaleSlotOf(slot) + kTokens * kF32,  kTokens};
+
+    const std::uint32_t packed_base = resolver.PackedBytes(strip);
+    const std::uint32_t scale_base  = resolver.ScaleElems(strip);
+
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evt);
+    AscendC::DataCopy(packed,      engine.value_cache[packed_base], kPackedBytes);
+    AscendC::DataCopy(key_scale,   engine.scale_cache[scale_base],  kTokens);
+    AscendC::DataCopy(value_scale,
+                      engine.scale_cache[resolver.window.scale_plane + scale_base], kTokens);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evt);
+}
+
+__aicore__ inline void StreamDequantValueStrip(std::uint32_t strip)
+{
+    const std::uint32_t slot = strip % kStageDepth;
+    const std::int32_t  evt  = static_cast<std::int32_t>(slot);
+
+    ascend_micro::NativeDequant4Engine<float> dequant_engine;
+    dequant_engine.packed         = {kUb, PackedVSlotOf(slot), kPackedBytes};
+    dequant_engine.signed_nibbles = {kUb, kUbDqSigned,         kPanel};
+    dequant_engine.output         = {kUb, ValueSlotOf(slot),   kPanel};
+
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evt);
+    ascend_micro::turboquant_dequant4_signed(dequant_engine, kPanel);
+}
+
+__aicore__ inline void StreamRecurStrip(StripResolver& resolver, std::uint32_t strip)
+{
+    const std::uint32_t slot   = strip % kStageDepth;
+    const std::int32_t  evt    = static_cast<std::int32_t>(slot);
+    const std::uint32_t active = resolver.Active(strip);
+
+    ascend_micro::NativeDecodeRecurrenceEngine recur_engine;
+    FillRecurEngine(recur_engine, slot);
+
+    AscendC::LocalTensor<float> panel{kUb,    ScoreSlotOf(slot), kScores};
+    AscendC::LocalTensor<float> archived{kUb, ArchiveSlotOf(strip % kStrips), kScores};
+
+    recur_engine.prime_tail_mask(turboquant_decode_tail::kMaskedScore);
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // RAW on the score panel: the AIC's release for THIS strip means its
+    // Fixpipe has landed in this slot. The V_S drain behind the wait makes the
+    // stall measurable and holds this core's next MTE2 ingress behind it.
+    AscendC::CrossCoreWaitFlag<2, kSync2Aiv0Wait>(kSync2StepRetired);
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtStreamDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtStreamDrain);
+
+    if (active == kTokens) {
+        ascend_micro::vector_decode_recur_strip(recur_engine);
+    } else if (active != 0u) {
+        ascend_micro::vector_decode_recur_strip_masked(recur_engine, active);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls(archived, panel, 1.0f, static_cast<std::int32_t>(kScores));
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evt);
+
+    // The score slot is free again. Folded into the readiness quorum rather
+    // than given its own channel: the AIC's (strip + kStageDepth)-th GEMM is
+    // the one that overwrites this panel, so this IS the announcement its wait
+    // needs. Past that point there is no further GEMM to release, and
+    // announcing anyway would leave a token on the channel.
+    if (strip + kStageDepth < resolver.window.total) {
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(evt);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(evt);
+        AscendC::CrossCoreSetFlag<2, kSync2Aiv0Announce>(kSync2StageReady);
+    }
+}
+
+__aicore__ inline void stream_value_core(__gm__ std::int8_t*   gm_value_cache,
+                                         __gm__ float*         gm_scale_cache,
+                                         __gm__ std::uint32_t* gm_table,
+                                         __gm__ float*         gm_partition,
+                                         const StripWindow&    window)
+{
+    ValueEngine engine;
+    engine.value_cache.SetGlobalBuffer(gm_value_cache);
+    engine.scale_cache.SetGlobalBuffer(gm_scale_cache);
+
+    StripResolver resolver;
+    resolver.table  = gm_table;
+    resolver.window = window;
+
+    AscendC::LocalTensor<float> m_prev{kUb, kUbMPrev, kTokens * kStateLanes};
+    AscendC::LocalTensor<float> l_prev{kUb, kUbLPrev, kTokens * kStateLanes};
+    AscendC::LocalTensor<float> acc{kUb,    kUbAcc,   kTokens * kHeadSize};
+
+    // Seeded ONCE for the whole window. The per-page entry re-entered
+    // run_value_core per page with `initialize` true only on the first; a flat
+    // stream has one entry, so the carried state is seeded once and every
+    // recurrence folds into the same fixed UB offsets in strip order.
+    AscendC::Duplicate(m_prev, -3.0e38f, static_cast<std::int32_t>(kTokens * kStateLanes));
+    AscendC::Duplicate(l_prev, 0.0f,     static_cast<std::int32_t>(kTokens * kStateLanes));
+    AscendC::Duplicate(acc,    0.0f,     static_cast<std::int32_t>(kTokens * kHeadSize));
+
+    if (window.total != 0u) {
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
+
+        // Priming announcements: the kStageDepth UB score slots start empty, so
+        // the AIC's first kStageDepth GEMMs have nothing to wait for on this
+        // side. A priming set reports no earlier pipe work and needs no drain
+        // (MICROROUTINE_DESIGN_GUIDELINES.md section 6.2a).
+        const std::uint32_t primes =
+            window.total < kStageDepth ? window.total : kStageDepth;
+        for (std::uint32_t i = 0; i < primes; ++i) {
+            AscendC::CrossCoreSetFlag<2, kSync2Aiv0Announce>(kSync2StageReadyPrime);
+        }
+
+        for (std::uint32_t column = 0; column < window.total + kPipelineLag; ++column) {
+            if (column >= kPipelineLag && column - kPipelineLag < window.total) {
+                StreamRecurStrip(resolver, column - kPipelineLag);
+            }
+            if (column >= 3u && column - 3u < window.total) {
+                StreamDequantValueStrip(column - 3u);
+            }
+            if (column >= 2u && column - 2u < window.total) {
+                StreamLoadValueStrip(engine, resolver, column - 2u);
+            }
+        }
+
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
+    }
+
+    AscendC::GlobalTensor<float> partition;
+    partition.SetGlobalBuffer(gm_partition);
+    constexpr std::uint32_t kRecord = turboquant_splitk::kRecordFloats;
+
+    AscendC::DataCopyParams lane;
+    lane.blockCount = static_cast<std::uint16_t>(kTokens);
+    lane.blockLen   = static_cast<std::uint16_t>(kStateLanes * kF32 / kBlock);
+    lane.srcStride  = 0;
+    lane.dstStride  = static_cast<std::uint16_t>((kRecord - kStateLanes) * kF32 / kBlock);
+
+    AscendC::DataCopyParams band;
+    band.blockCount = static_cast<std::uint16_t>(kTokens);
+    band.blockLen   = static_cast<std::uint16_t>(kHeadSize * kF32 / kBlock);
+    band.srcStride  = 0;
+    band.dstStride  = static_cast<std::uint16_t>((kRecord - kHeadSize) * kF32 / kBlock);
+
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kEvtStatic);
+    AscendC::DataCopy(partition,                   m_prev, lane);
+    AscendC::DataCopy(partition[kStateLanes],      l_prev, lane);
+    AscendC::DataCopy(partition[2u * kStateLanes], acc,    band);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtStatic);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtStatic);
+}
+
+// -------------------------------------------------------------------- AIC
+__aicore__ inline void StreamGemmStrip(CubeEngine& engine, std::uint32_t strip)
+{
+    const std::uint32_t slot = strip % kStageDepth;
+    const std::int32_t  evt  = static_cast<std::int32_t>(slot);
+
+    auto* l0b_slot   = engine.l0_table  + slot * kHeadSize * kTokens;
+    auto* l0c_window = engine.l0_scores + slot * kScores;
+    auto* ub_scores  = reinterpret_cast<__ubuf__ float*>(ScoreSlotOf(slot));
+
+    // ONE quorum wait, for both of this GEMM's cross-core preconditions: the L1
+    // key page holds THIS strip's keys (AIV1) and the UB score slot is free
+    // (AIV0). Gates PIPE_MTE1, the pipe that reads L1; the Fixpipe is ordered
+    // behind it transitively through MTE1_M and M_FIX. MTE1 has no MTE1_S
+    // route, so the drain rides M (section 6.2a).
+    AscendC::CrossCoreWaitFlag<2, kSync2AicWait>(kSync2StageReady);
+    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStreamDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStreamDrain);
+    AscendC::SetFlag<AscendC::HardEvent::M_S>(kEvtStreamDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::M_S>(kEvtStreamDrain);
+
+    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(evt);
+    ascend_micro::score_strip_stage_l0(L1KeyPageOf(slot), l0b_slot);
+    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(evt);
+
+    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(evt);
+    ascend_micro::score_strip_compute(engine.l0_query, l0b_slot, l0c_window);
+    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(evt);
+    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(evt);
+    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(evt);
+    ascend_micro::score_strip_fixpipe(l0c_window, ub_scores, false);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(evt);
+
+    // The release: this strip's L1 key page has been read into L0B and its
+    // scores have landed in UB. MTE1 drains through M, then FIX, so the pipe
+    // the announcement is ISSUED on is the last one drained -- which is both
+    // section 6.2a's requirement and what section 6.6's audit checks.
+    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStreamDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStreamDrain);
+    AscendC::SetFlag<AscendC::HardEvent::M_S>(kEvtStreamDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::M_S>(kEvtStreamDrain);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtStreamDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtStreamDrain);
+    AscendC::CrossCoreSetFlag<2, kSync2AicAnnounce>(kSync2StepRetired);
+}
+
+__aicore__ inline void stream_cube_core(__gm__ bfloat16_t* gm_q,
+                                        __gm__ bfloat16_t* gm_pi_table,
+                                        __gm__ bfloat16_t* gm_out_qrot,
+                                        std::uint32_t      q_base,
+                                        std::uint32_t      total)
+{
+    if (total == 0u) return;
+    using namespace AscendC::Te;
+
+    __ca__ bfloat16_t l0_query[kPanel]       __attribute__((aligned(512)));
+    __cb__ bfloat16_t l0_table[kTableElems]  __attribute__((aligned(512)));
+    __cc__ float      l0_scores[kPanel]      __attribute__((aligned(1024)));
+
+    static_assert(kStageDepth * kHeadSize * kTokens <= kTableElems, "the key slots must fit inside the L0B table allocation");
+    static_assert(kStageDepth * kScores             <= kPanel,      "the score windows must fit inside the L0C panel allocation");
+
+    CubeEngine engine{l0_query, l0_table, l0_scores};
+
+    CubeRotatePrologue(gm_q, gm_pi_table, gm_out_qrot, q_base, engine);
+
+    // Primed once for the whole stream, drained once after it: no per-page
+    // cascade, which is what used to have to be got right at every boundary.
+    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(0);
+    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(1);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
+
+    for (std::uint32_t strip = 0; strip < total; ++strip) {
+        StreamGemmStrip(engine, strip);
+    }
+
+    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(1);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
 }
 
 }  // namespace paged_decode
@@ -848,43 +1453,36 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
 
     if (!turboquant_decode_tail::SeqLenInCapacity(live_seq, cache_pages, block_size)) return;
 
+    // One flat strip stream for the whole window, page boundaries and all. The
+    // three cores derive the same `total` from the same geometry, which is what
+    // makes their per-strip rendezvous line up by ordinal: strip n's readiness
+    // quorum is AIV0's n-th announcement and AIV1's n-th, and strip n's release
+    // is the AIC's n-th.
+    StripWindow window;
+    window.strips_per_page = strips;
+    window.page_begin      = page_begin + range.begin;
+    window.heads           = heads;
+    window.head            = head;
+    window.block_size      = block_size;
+    window.table_base      = request * seq_pages;
+    window.scale_plane     = cache_pages * heads * block_size;
+    window.live_seq        = live_seq;
+    window.total           = range.count * strips;
+
     if ASCEND_IS_AIC {
-        run_cube_core(q, pi_table, qrot + item * kPanel, head_item * kPanel, strips, range.count, true);
+        stream_cube_core(q, pi_table, qrot + item * kPanel, head_item * kPanel,
+                         window.total);
     } else if (AscendC::GetSubBlockIdx() == 0) {
-        const uint32_t iterations = range.count == 0u ? 1u : range.count;
-        for (uint32_t p = 0; p < iterations; ++p) {
-            const uint32_t physical = range.count == 0u ? 0u : table[request * seq_pages + page_begin + range.begin + p];
-            const uint32_t base     = (physical * heads + head) * block_size;
-            const uint32_t live_tokens = range.count == 0u ? 0u :
-                turboquant_decode_tail::ActiveInPage(page_begin + range.begin + p, block_size, live_seq);
-
-            run_value_core(value, scales, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                workspace + static_cast<std::uint64_t>(item) * turboquant_splitk::kPartitionFloats,
-                nullptr, nullptr, base * kHeadSize / 2u, base, cache_pages * heads * block_size + base, 0u,
-                range.count == 0u ? 0u : strips, live_tokens, true, p == 0u, p + 1u == iterations);
-
-            if (range.count != 0u) {
-                AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagPageDrainedV0);
-                AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
-                AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
-            }
-        }
+        // A worker with no live page still runs, with total = 0: it writes the
+        // neutral element (m = -3e38, l = 0, Acc = 0) so the Split-K reduction
+        // has a record from every worker. It takes part in no rendezvous, and
+        // neither does the Cube, which returns before priming anything.
+        stream_value_core(value, scales, table,
+                          workspace + static_cast<std::uint64_t>(item) *
+                              turboquant_splitk::kPartitionFloats,
+                          window);
     } else {
-        for (uint32_t p = 0; p < range.count; ++p) {
-            const uint32_t physical = table[request * seq_pages + page_begin + range.begin + p];
-            const uint32_t base     = (physical * heads + head) * block_size * kHeadSize / 2u;
-            run_key_core(key, base, strips);
-
-            AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagPageDrainedV1);
-            AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
-            AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtPageDrain);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtPageDrain);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
-        }
+        stream_key_core(key, table, window);
     }
 }
 

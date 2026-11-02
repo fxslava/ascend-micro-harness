@@ -1,5 +1,17 @@
 # The four-page defect in `turboquant_paged_decode_splitk_aic`
 
+> **STATUS: diagnosed here, fixed elsewhere.** Sections 1-5 and 9 are the
+> diagnosis and stand as written. The defect they localise is closed by the
+> continuous strip pipeline and the mode-2 rendezvous recorded in
+> `reports/decode_splitk_aic_strip_pipeline.md`; sections 6, 7 and 8 below have
+> been rewritten to say what became of the construction they described. The
+> open question section 7 ended on -- whether mode 2's AIC -> AIV direction
+> blocks on more than the first use of an id -- was measured on CAModel and the
+> answer is yes. The four-page rung in section 3 was re-run after the fix and
+> now passes at 0.00063x / 0.00025x against the 2.12830x / 7.58482x recorded
+> below; the five-page rung was stopped before it finished and is recorded as
+> stopped, not as passing.
+
 Target: CANN 9.2.0-beta.2, `dav-3510`, `Ascend950PR_9599`. No NPU on this host
 (`npu-smi` and `/dev/davinci*` both absent), so every device result below is
 CAModel over a collapsed grid and **nothing here is a hardware claim**.
@@ -177,10 +189,12 @@ Why three pages pass: AIV1 blocks on its first page-drain wait and then runs
 free, so it gets about three pages ahead. With three pages it runs out of work
 before it can overtake the Cube's read of any page; with four it does not.
 
-## 6. The attempted fix, and why it does NOT work
+## 6. The attempted fix, and why it did NOT work
 
-**This section describes a change that was made, measured, and found not to fix
-the defect. It is in the tree. The defect is still open.**
+**This section describes a change that was made, measured, found not to fix the
+defect, and has since been REMOVED along with the whole per-page handshake it
+belonged to. It is kept because the measurement in section 7 is what ruled out
+every rearrangement of mode-4 flags, and that is why mode 2 was tried.**
 
 One line of behaviour, in the AIV1 page loop of
 `turboquant_paged_decode_splitk_aic`: the page-boundary wait moves from
@@ -207,8 +221,8 @@ on the same core type, in the same run. Draining V first also holds page
 `p + 1`'s **MTE2 ingress** behind the announcement, which gating MTE3 never did
 even when the wait did block.
 
-This is the same construction AIV0 already uses at the same boundary, so the
-two Vector cores now close the boundary the same way.
+This was the same construction AIV0 already used at the same boundary, so the
+two Vector cores closed the boundary the same way.
 
 ## 7. After the change: no effect, measured
 
@@ -234,7 +248,7 @@ blocks on its FIRST use of an id and then stops blocking, on `PIPE_MTE3` and on
 immediately behind the wait holds page `p + 1`'s MTE2 ingress too, which gating
 MTE3 never did -- but it fixes nothing and is not presented as a fix.
 
-### Why no arrangement of these flags fixes it
+### Why no arrangement of these flags fixed it
 
 AIV1's run-ahead is unbounded. Its L1 write bursts for five pages are at ticks
 2892, 27035, 28040, 29010 and 30011 -- it stages every page about 1000 ticks
@@ -267,19 +281,38 @@ iterations is the next step and was not run here.** Its two targets
 (`test_cluster_sync_probe` on silicon, `test_cluster_sync_probe_sim` on
 CAModel) already exist; `build/lib/test_cluster_sync_probe_sim` is built.
 
-Candidate remedies, none implemented or measured:
+Candidate remedies, as they stood when this was written:
 
-* a mode-2 rendezvous for the page boundary instead of mode 4 -- a separate
-  16-id space whose AIC -> AIV semantics may differ, and the construction the
-  task's "reciprocal acknowledgement" would actually need;
+* a mode-2 rendezvous instead of mode 4 -- a separate 16-id space whose
+  AIC -> AIV semantics may differ, and the construction the task's "reciprocal
+  acknowledgement" would actually need;
 * the Cube staging the key page itself, removing the AIV1 -> L1 -> Cube hop and
   the WAR edge with it;
 * single-shot ids per page boundary with a hard guard at 11 pages, which is
   §6.2c's documented fallback and does not generalise.
 
-## 8. Gate status
+**The first was taken, and it needed the page boundary to stop being the unit
+of synchronization at all.** Mode 2 lowers to `ffts_cross_core_sync` /
+`wait_flag_dev` rather than `set_intra_block` / `wait_intra_block`, so it is a
+different mechanism and not a variant of the one measured above. The probe
+above was re-run on its new mode-2 leg at four iterations and every wait
+blocked on every iteration, in both directions -- 14167, 11527, 12380 and 12979
+ticks on the AIC -> AIV direction that had read 23146, 3, 3, 3 under mode 4.
+`reports/decode_splitk_aic_strip_pipeline.md` §1 has the measurement, and §2
+has what replaced the page-boundary handshake: one readiness quorum and one
+release broadcast, per STRIP, with the L1 key ring reduced to two pages
+addressed by slot and an explicit WAR edge behind it.
 
-**The operator is not fixed. Do not tag it for physical hardware.**
+## 8. Gate status, as it stood at this diagnosis
+
+**Superseded.** The table below is the state at the time of this report, with
+the defect open. For the current state see
+`reports/decode_splitk_aic_strip_pipeline.md` §3, where §4 (depth and wrap),
+§6.2c (the flag-semantics probe) and §6.6 (the fence audit) have all passed and
+§3 (isolated logical-page canaries on the AIC path) is still pending.
+
+**At the time of writing: the operator was not fixed, and was not to be tagged
+for physical hardware.**
 
 | gate | state |
 | --- | --- |
@@ -315,6 +348,15 @@ findings; two are the audit's own blind spot and two are real but benign:
   three to `MTE1_M`, `M_S`, `FIX_S` would make the gate green and weaken
   nothing; it was **not** done here because it changes the instruction stream
   that `bbaaa3e` verified and would need its own CAModel run.
+
+**All four are resolved.** The two real findings went with the code -- the
+page-drain announcements no longer exist, and the Cube's per-strip release that
+replaced them drains `MTE1_M`, `M_S`, then `FIX_S`, announcing on the pipe it
+drained last. The audit's priming exemption is now structural rather than a
+name match, so the two false positives are exempt for the right reason; it also
+reads mode 2 (it matched `CrossCoreSetFlag<4, ...>` only, so a mode-2 kernel
+would have passed it vacuously) and resolves a `constexpr pipe_t` pipe name.
+`reports/decode_splitk_aic_strip_pipeline.md` §7.
 
 ## 9. Tooling defects found on the way
 
