@@ -375,6 +375,25 @@ constexpr std::int32_t kEvtStatic = 3;
 
 template <std::uint32_t Column>
 constexpr std::uint32_t kSlotOf = Column % kStageDepth;
+
+// The runtime forms, as masks. Exact because both are powers of two, and a
+// mask rather than a modulo because the scalar unit is the whole core's
+// instruction dispatcher: a cycle it spends on address arithmetic is a cycle
+// it is not issuing the next burst.
+static_assert((kStageDepth & (kStageDepth - 1u)) == 0u,
+              "the slot index is formed by masking, so the ring depth must be a power of two");
+static_assert((kStrips & (kStrips - 1u)) == 0u,
+              "the archive index is formed by masking, so the strip count must be a power of two");
+
+__aicore__ inline constexpr std::uint32_t SlotOfStrip(std::uint32_t strip)
+{
+    return strip & (kStageDepth - 1u);
+}
+
+__aicore__ inline constexpr std::uint32_t ArchiveOfStrip(std::uint32_t strip)
+{
+    return strip & (kStrips - 1u);
+}
 using ColumnSeq = std::make_integer_sequence<std::uint32_t, kColumns>;
 
 constexpr auto kUb = AscendC::TPosition::VECCALC;
@@ -974,55 +993,99 @@ struct StripWindow {
     std::uint32_t total           = 0;  // strips in the window, dead ones included
 };
 
-// Global strip index -> addresses. The block table is read through the scalar
-// unit, and the physical page is memoised: the walk is monotone in the strip
-// index (turboquant_decode_tail::WalkIsMonotone), so a page is looked up once
-// rather than once per strip.
-struct StripResolver {
+// A monotone cursor over the window's strips. No division and no modulo in the
+// loop, and ONE block-table read per page rather than one per strip.
+//
+// The walk is strictly increasing in the strip index
+// (turboquant_decode_tail::WalkIsMonotone, which every caller already
+// validates), so `strip / strips_per_page` and `strip % strips_per_page` are a
+// counter that rolls over -- an add and a compare instead of a divide. The
+// token base rises by exactly kTokens per strip across a page boundary as much
+// as inside a page, because strips_per_page * kTokens == block_size, which is
+// what lets the tail mask ride the same counter.
+//
+// Each core keeps its own cursor, and AIV0 keeps TWO: its ingress and its
+// recurrence walk the same sequence at different lags, so one cursor cannot
+// serve both.
+struct StripCursor {
     __gm__ std::uint32_t* table = nullptr;
-    StripWindow           window;
-    std::uint32_t         page_idx = 0xFFFFFFFFu;
-    std::uint32_t         physical = 0u;
+    std::uint32_t strips_per_page = 0, heads = 0, head = 0, block_size = 0;
+    std::uint32_t table_base = 0, page_begin = 0, total = 0;
+    std::uint32_t strip = 0, strip_in_page = 0, page_idx = 0, page_base = 0;
+    std::uint64_t token_base = 0;
 
-    __aicore__ inline std::uint32_t PageBase(std::uint32_t strip)
+    __aicore__ inline void Resolve()
     {
-        const std::uint32_t index = strip / window.strips_per_page;
-        if (index != page_idx) {
-            page_idx = index;
-            physical = table[window.table_base + window.page_begin + index];
+        const std::uint32_t physical = table[table_base + page_begin + page_idx];
+        page_base = (physical * heads + head) * block_size;
+    }
+
+    __aicore__ inline void Begin(const StripWindow& window, __gm__ std::uint32_t* gm_table)
+    {
+        table           = gm_table;
+        strips_per_page = window.strips_per_page;
+        heads           = window.heads;
+        head            = window.head;
+        block_size      = window.block_size;
+        table_base      = window.table_base;
+        page_begin      = window.page_begin;
+        total           = window.total;
+        strip = 0; strip_in_page = 0; page_idx = 0;
+        token_base = static_cast<std::uint64_t>(page_begin) * block_size;
+        if (total != 0u) Resolve();
+    }
+
+    // Guarded by `total`: past the last strip there is no further page, and
+    // resolving one would read the block table outside this worker's window.
+    __aicore__ inline void Advance()
+    {
+        ++strip;
+        if (strip >= total) return;
+        ++strip_in_page;
+        token_base += kTokens;
+        if (strip_in_page == strips_per_page) {
+            strip_in_page = 0;
+            ++page_idx;
+            Resolve();
         }
-        return (physical * window.heads + window.head) * window.block_size;
     }
 
     // Byte offset of this strip's packed int4 panel in the key or value pool.
-    // Both pools share the layout, so one function serves both -- as the
-    // per-page entry already relied on.
-    __aicore__ inline std::uint32_t PackedBytes(std::uint32_t strip)
+    // Both pools share the layout, so one accessor serves both -- as the
+    // per-page entry already relied on. `kHeadSize / 2` is folded first rather
+    // than multiplying by kHeadSize and halving, which keeps the product
+    // inside 32 bits for a cache that the other order would overflow.
+    __aicore__ inline std::uint32_t PackedBytes() const
     {
-        return PageBase(strip) * kHeadSize / 2u +
-               (strip % window.strips_per_page) * kPackedBytes;
+        return page_base * (kHeadSize / 2u) + strip_in_page * kPackedBytes;
     }
 
     // Element offset of this strip's slice of the KEY scale plane; the value
     // plane sits `scale_plane` elements further on.
-    __aicore__ inline std::uint32_t ScaleElems(std::uint32_t strip)
+    __aicore__ inline std::uint32_t ScaleElems() const
     {
-        return PageBase(strip) + (strip % window.strips_per_page) * kTokens;
+        return page_base + strip_in_page * kTokens;
     }
 
-    __aicore__ inline std::uint32_t Active(std::uint32_t strip) const
+    // Live tokens in this strip, from the running token base rather than from
+    // the strip index -- the same value WalkActive would return, without its
+    // division.
+    __aicore__ inline std::uint32_t Active(std::uint32_t live_seq) const
     {
-        return turboquant_decode_tail::WalkActive(
-            strip, window.strips_per_page, window.page_begin, 0u,
-            window.block_size, window.live_seq);
+        return turboquant_decode_tail::ActiveInStrip(token_base, live_seq);
     }
 };
 
 // ------------------------------------------------------------------- AIV1
-__aicore__ inline void StreamKeyStrip(KeyEngine& engine, StripResolver& resolver,
+// The engines are built HERE, in the strip body, and not hoisted. Hoisting
+// them into a per-slot array was measured 2.1x slower: inline, a LocalTensor's
+// base is a constant the compiler folds into an immediate; in an array that
+// outlives the body it is memory, and every operand access becomes a load.
+// reports/decode_splitk_aic_scalar_issue.md has the numbers.
+__aicore__ inline void StreamKeyStrip(KeyEngine& engine, StripCursor& cursor,
                                       std::uint32_t strip)
 {
-    const std::uint32_t  slot = strip % kStageDepth;
+    const std::uint32_t  slot = SlotOfStrip(strip);
     const std::int32_t   evt  = static_cast<std::int32_t>(slot);
 
     ascend_micro::NativeDequant4Engine<bfloat16_t> dequant_engine;
@@ -1037,7 +1100,7 @@ __aicore__ inline void StreamKeyStrip(KeyEngine& engine, StripResolver& resolver
 
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evt);
     AscendC::DataCopy(dequant_engine.packed,
-                      engine.key_cache[resolver.PackedBytes(strip)], kPackedBytes);
+                      engine.key_cache[cursor.PackedBytes()], kPackedBytes);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evt);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evt);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(evt);
@@ -1076,9 +1139,8 @@ __aicore__ inline void stream_key_core(__gm__ std::int8_t*   gm_key_cache,
     engine.key_cache.SetGlobalBuffer(gm_key_cache);
     engine.strip_base_bytes = 0;
 
-    StripResolver resolver;
-    resolver.table  = gm_table;
-    resolver.window = window;
+    StripCursor cursor;
+    cursor.Begin(window, gm_table);
 
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
@@ -1086,7 +1148,8 @@ __aicore__ inline void stream_key_core(__gm__ std::int8_t*   gm_key_cache,
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(1);
 
     for (std::uint32_t strip = 0; strip < window.total; ++strip) {
-        StreamKeyStrip(engine, resolver, strip);
+        StreamKeyStrip(engine, cursor, strip);
+        cursor.Advance();
     }
 
     // The AIC broadcasts one release per strip and this core consumed one per
@@ -1109,30 +1172,31 @@ __aicore__ inline void stream_key_core(__gm__ std::int8_t*   gm_key_cache,
 
 // ------------------------------------------------------------------- AIV0
 __aicore__ inline void StreamLoadValueStrip(ValueEngine& engine,
-                                            StripResolver& resolver,
+                                            StripCursor& cursor,
+                                            std::uint32_t scale_plane,
                                             std::uint32_t strip)
 {
-    const std::uint32_t slot = strip % kStageDepth;
+    const std::uint32_t slot = SlotOfStrip(strip);
     const std::int32_t  evt  = static_cast<std::int32_t>(slot);
 
     AscendC::LocalTensor<std::int8_t> packed{kUb,     PackedVSlotOf(slot),                  kPackedBytes};
     AscendC::LocalTensor<float>       key_scale{kUb,  ScaleSlotOf(slot),                    kTokens};
     AscendC::LocalTensor<float>       value_scale{kUb, ScaleSlotOf(slot) + kTokens * kF32,  kTokens};
 
-    const std::uint32_t packed_base = resolver.PackedBytes(strip);
-    const std::uint32_t scale_base  = resolver.ScaleElems(strip);
+    const std::uint32_t packed_base = cursor.PackedBytes();
+    const std::uint32_t scale_base  = cursor.ScaleElems();
 
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evt);
     AscendC::DataCopy(packed,      engine.value_cache[packed_base], kPackedBytes);
     AscendC::DataCopy(key_scale,   engine.scale_cache[scale_base],  kTokens);
     AscendC::DataCopy(value_scale,
-                      engine.scale_cache[resolver.window.scale_plane + scale_base], kTokens);
+                      engine.scale_cache[scale_plane + scale_base], kTokens);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evt);
 }
 
 __aicore__ inline void StreamDequantValueStrip(std::uint32_t strip)
 {
-    const std::uint32_t slot = strip % kStageDepth;
+    const std::uint32_t slot = SlotOfStrip(strip);
     const std::int32_t  evt  = static_cast<std::int32_t>(slot);
 
     ascend_micro::NativeDequant4Engine<float> dequant_engine;
@@ -1144,27 +1208,38 @@ __aicore__ inline void StreamDequantValueStrip(std::uint32_t strip)
     ascend_micro::turboquant_dequant4_signed(dequant_engine, kPanel);
 }
 
-__aicore__ inline void StreamRecurStrip(StripResolver& resolver, std::uint32_t strip)
+// The engine is built HERE, per strip, and deliberately NOT hoisted: holding
+// it across the loop was measured 2.1x slower, because its operands stop being
+// immediates the compiler can fold and become memory the body reloads sixteen
+// times. reports/decode_splitk_aic_scalar_issue.md has the measurement.
+//
+// `active` IS handed in, from the caller's running token base, so the body
+// does no division.
+__aicore__ inline void StreamRecurStrip(std::uint32_t strip, std::uint32_t active,
+                                        std::uint32_t total)
 {
-    const std::uint32_t slot   = strip % kStageDepth;
-    const std::int32_t  evt    = static_cast<std::int32_t>(slot);
-    const std::uint32_t active = resolver.Active(strip);
+    const std::uint32_t slot = SlotOfStrip(strip);
+    const std::int32_t  evt  = static_cast<std::int32_t>(slot);
 
     ascend_micro::NativeDecodeRecurrenceEngine recur_engine;
     FillRecurEngine(recur_engine, slot);
 
-    AscendC::LocalTensor<float> panel{kUb,    ScoreSlotOf(slot), kScores};
-    AscendC::LocalTensor<float> archived{kUb, ArchiveSlotOf(strip % kStrips), kScores};
-
-    recur_engine.prime_tail_mask(turboquant_decode_tail::kMaskedScore);
-    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::LocalTensor<float> archived{kUb, ArchiveSlotOf(ArchiveOfStrip(strip)), kScores};
 
     // RAW on the score panel: the AIC's release for THIS strip means its
-    // Fixpipe has landed in this slot. The V_S drain behind the wait makes the
-    // stall measurable and holds this core's next MTE2 ingress behind it.
+    // Fixpipe has landed in this slot.
+    //
+    // No scalar drain behind this wait, unlike AIV1's. The wait names PIPE_V
+    // and the recurrence is V work, so the V queue already orders the two; a
+    // drain here would only convert the wait into a stall on instruction
+    // ISSUE, which held this core's next MTE2 ingress behind a dependency it
+    // does not have. On AIV1 that conversion is load-bearing -- it bounds the
+    // core whose run-ahead was the defect, and it is the only thing
+    // scripts/audit_mode4_tick_order.py can read a stall from -- so AIV1 keeps
+    // its drain and this one is gone. Proved safe in the token model first:
+    // tests/cpu/test_decode_page_loop_model.py's `aiv0_issue_fence` control is
+    // this edge put back, and it must still be ACCEPTED.
     AscendC::CrossCoreWaitFlag<2, kSync2Aiv0Wait>(kSync2StepRetired);
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtStreamDrain);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtStreamDrain);
 
     if (active == kTokens) {
         ascend_micro::vector_decode_recur_strip(recur_engine);
@@ -1172,7 +1247,7 @@ __aicore__ inline void StreamRecurStrip(StripResolver& resolver, std::uint32_t s
         ascend_micro::vector_decode_recur_strip_masked(recur_engine, active);
     }
     AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Muls(archived, panel, 1.0f, static_cast<std::int32_t>(kScores));
+    AscendC::Muls(archived, recur_engine.panel, 1.0f, static_cast<std::int32_t>(kScores));
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evt);
 
@@ -1181,9 +1256,24 @@ __aicore__ inline void StreamRecurStrip(StripResolver& resolver, std::uint32_t s
     // the one that overwrites this panel, so this IS the announcement its wait
     // needs. Past that point there is no further GEMM to release, and
     // announcing anyway would leave a token on the channel.
-    if (strip + kStageDepth < resolver.window.total) {
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(evt);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(evt);
+    //
+    // UNFENCED, ON INSTRUCTION, AND UNDER TEST. Section 6.2a requires a V_S
+    // drain here, because a cross-core set issues on the scalar unit and the
+    // `pipe` template argument does not order it -- in this operator's own
+    // trace the mode-2 set appears on FLOWCTRL, exactly where the mode-4 set
+    // appears. The drain was removed on the claim that the mode-2 quorum
+    // guarantees visibility at the CCU and makes it redundant.
+    //
+    // That claim is not settled here. What is at risk if it is wrong: this
+    // announcement means "the score panel of strip t is free, I have read
+    // it", so an announcement that overtakes the recurrence lets the Cube's
+    // Fixpipe for strip t + kStageDepth overwrite a panel still being read.
+    // The evidence that decides it is the accumulator against the FP64 oracle
+    // on every rung, plus scripts/analyze_announce_overtake.py over the tick
+    // order. scripts/audit_cross_core_fences.py reports this as unfenced,
+    // which is true and deliberate; see
+    // reports/decode_splitk_aic_scalar_issue.md.
+    if (strip + kStageDepth < total) {
         AscendC::CrossCoreSetFlag<2, kSync2Aiv0Announce>(kSync2StageReady);
     }
 }
@@ -1198,9 +1288,11 @@ __aicore__ inline void stream_value_core(__gm__ std::int8_t*   gm_value_cache,
     engine.value_cache.SetGlobalBuffer(gm_value_cache);
     engine.scale_cache.SetGlobalBuffer(gm_scale_cache);
 
-    StripResolver resolver;
-    resolver.table  = gm_table;
-    resolver.window = window;
+    // One cursor for the ingress walk; the recurrence walks the same sequence
+    // kPipelineLag columns later, so it carries its own running token base
+    // below rather than sharing this one.
+    StripCursor ingress;
+    ingress.Begin(window, gm_table);
 
     AscendC::LocalTensor<float> m_prev{kUb, kUbMPrev, kTokens * kStateLanes};
     AscendC::LocalTensor<float> l_prev{kUb, kUbLPrev, kTokens * kStateLanes};
@@ -1215,6 +1307,22 @@ __aicore__ inline void stream_value_core(__gm__ std::int8_t*   gm_value_cache,
     AscendC::Duplicate(acc,    0.0f,     static_cast<std::int32_t>(kTokens * kHeadSize));
 
     if (window.total != 0u) {
+        // The tail mask, primed once per core rather than once per strip.
+        // routine_vector_decode_recurrence.hpp says so of `prime_tail_mask`:
+        // "primed once per kernel, before the first strip. Reads nothing that
+        // changes, so it is hoisted out of the strip loop entirely" -- and
+        // calling it per strip was against that contract. The engine built
+        // here exists only to prime through: the four mask operands are at
+        // fixed UB addresses that every engine shares, so priming through any
+        // one of them primes all of them. The engines the strip bodies use are
+        // built inline, per strip, for the reason StreamRecurStrip records.
+        {
+            ascend_micro::NativeDecodeRecurrenceEngine priming_engine;
+            FillRecurEngine(priming_engine, 0u);
+            priming_engine.prime_tail_mask(turboquant_decode_tail::kMaskedScore);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
 
@@ -1228,15 +1336,28 @@ __aicore__ inline void stream_value_core(__gm__ std::int8_t*   gm_value_cache,
             AscendC::CrossCoreSetFlag<2, kSync2Aiv0Announce>(kSync2StageReadyPrime);
         }
 
+        // The recurrence's own token base, advanced once per recurrence. The
+        // tail mask rides this counter instead of a division, for the reason
+        // StripCursor records: strips_per_page * kTokens == block_size, so the
+        // base rises by kTokens per strip across a page boundary too.
+        std::uint64_t recur_token_base =
+            static_cast<std::uint64_t>(window.page_begin) * window.block_size;
+
         for (std::uint32_t column = 0; column < window.total + kPipelineLag; ++column) {
             if (column >= kPipelineLag && column - kPipelineLag < window.total) {
-                StreamRecurStrip(resolver, column - kPipelineLag);
+                const std::uint32_t strip = column - kPipelineLag;
+                const std::uint32_t active = turboquant_decode_tail::ActiveInStrip(
+                    recur_token_base, window.live_seq);
+                StreamRecurStrip(strip, active, window.total);
+                recur_token_base += kTokens;
             }
             if (column >= 3u && column - 3u < window.total) {
                 StreamDequantValueStrip(column - 3u);
             }
             if (column >= 2u && column - 2u < window.total) {
-                StreamLoadValueStrip(engine, resolver, column - 2u);
+                StreamLoadValueStrip(engine, ingress, window.scale_plane,
+                                     column - 2u);
+                ingress.Advance();
             }
         }
 
@@ -1272,7 +1393,7 @@ __aicore__ inline void stream_value_core(__gm__ std::int8_t*   gm_value_cache,
 // -------------------------------------------------------------------- AIC
 __aicore__ inline void StreamGemmStrip(CubeEngine& engine, std::uint32_t strip)
 {
-    const std::uint32_t slot = strip % kStageDepth;
+    const std::uint32_t slot = SlotOfStrip(strip);
     const std::int32_t  evt  = static_cast<std::int32_t>(slot);
 
     auto* l0b_slot   = engine.l0_table  + slot * kHeadSize * kTokens;

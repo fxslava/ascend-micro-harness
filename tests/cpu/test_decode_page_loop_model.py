@@ -104,7 +104,8 @@ def slot_of(strip):
 def schedule(pages, strips, *, no_l1_war=False, no_panel_war=False,
              single_sender_quorum=False, no_prime=False, carry_credit=False,
              release_before_fixpipe=False, release_before_l0b=False,
-             no_epilogue_drain=False, no_scalar_fence=False):
+             no_epilogue_drain=False, no_scalar_fence=False,
+             aiv0_issue_fence=False):
     """Emit the three cores' pipe queues for a window of `pages * strips` strips.
 
     Keyword flags are the negative controls, each removing one of the
@@ -207,8 +208,21 @@ def schedule(pages, strips, *, no_l1_war=False, no_panel_war=False,
             if 0 <= recur < total:
                 slot = slot_of(recur)
                 # RAW on the score panel: the Cube's release for THIS strip.
+                #
+                # No scalar drain behind this one, unlike AIV1's. The wait
+                # names PIPE_V and the recurrence is V work, so the V queue
+                # already orders them; the drain would only convert the wait
+                # into a stall on instruction ISSUE. On AIV1 that conversion is
+                # load-bearing -- it is what bounds the core whose run-ahead
+                # was the defect, and the only thing the trace census can read
+                # a stall from -- but on AIV0 it buys nothing the credit ring
+                # does not already give, and it sits in the hot loop. The
+                # `aiv0_issue_fence` control below is this edge put back, and
+                # it must still be ACCEPTED: removing a fence cannot be proved
+                # safe by a control that fails.
                 emit("V0.V", "m2wait", RETIRED, "V0")
-                scalar_drain("V0", ("V",))
+                if aiv0_issue_fence:
+                    scalar_drain("V0", ("V",))
                 emit("V0.V", "recurrence", slot, recur)
                 emit("V0.V", "archive", slot, recur)
                 if no_panel_war:

@@ -40,6 +40,10 @@ struct Options {
     bool single = false;
     std::string impl = "aiv", csv_out;
     int page_begin = 0, page_count = -1;
+    // Live tokens, as distinct from the allocated capacity `contexts` gives.
+    // -1 means "every allocated token is live", which is what every rung meant
+    // before this flag existed, so omitting it changes nothing.
+    int seq_len = -1;
 };
 
 int number(std::string_view s)
@@ -74,6 +78,7 @@ Options parse(int argc, char** argv)
             std::puts("--context N[,N...] --splitk K[,K...] --warmup N --iters N "
                       "--requests N --heads N --rows N --page-tokens N\n"
                       "--impl aiv|aic|both --single --csv-out PATH --page-begin P --page-count P\n"
+                      "--seq-len S   live tokens, <= the context; default: the whole context\n"
                       "Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8,12,16.\n"
                       "Use --page-tokens 16 --heads 1 --context 48 for a short CAModel run.");
             std::exit(0);
@@ -93,12 +98,23 @@ Options parse(int argc, char** argv)
         else if (arg == "--csv-out") o.csv_out = value;
         else if (arg == "--page-begin") o.page_begin = number(value);
         else if (arg == "--page-count") o.page_count = number(value);
+        else if (arg == "--seq-len") o.seq_len = number(value);
         else throw std::runtime_error("unknown option: " + std::string(arg));
     }
     if (o.single) { o.warmup = 0; o.iters = 1; }
     require(o.impl == "aiv" || o.impl == "aic" || o.impl == "both", "impl must be aiv, aic or both");
     require(o.page_begin >= 0 && o.page_count >= -1, "invalid AIC page window");
     require(o.page_tokens == 16 || o.page_tokens == 128, "page-tokens must be 16 or 128");
+    require(o.seq_len == -1 || o.seq_len > 0, "seq-len must be positive");
+    if (o.seq_len > 0) {
+        // One context only: the live count is relative to it, and silently
+        // applying the same S to a sweep of capacities would mean something
+        // different at each rung.
+        require(o.contexts.size() == 1,
+                "--seq-len applies to a single --context, not a sweep");
+        require(o.seq_len <= o.contexts.front(),
+                "seq-len must not exceed the context it is live within");
+    }
     require(o.heads > 0 && o.heads <= 4 && o.rows > 0 && o.rows <= 8, "heads must be 1..4 and rows 1..8");
     for (int n : o.contexts) {
         require(n > 0 && n <= 16384 && n % o.page_tokens == 0,
@@ -309,8 +325,8 @@ int main(int argc, char** argv)
         std::uint64_t aiv_launches = 0, aic_launches = 0;
         for (int n : o.contexts) {
             std::unique_ptr<Fixture> av, ac;
-            if (o.impl != "aic") av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
-            if (o.impl != "aiv") ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens));
+            if (o.impl != "aic") av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens, o.seq_len));
+            if (o.impl != "aiv") ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens, o.seq_len));
             std::vector<int> sweep;
             if (!o.single && av) sweep.push_back(1);
             for (int k : o.splits)

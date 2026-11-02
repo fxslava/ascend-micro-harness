@@ -114,18 +114,35 @@ def issues_work(code):
     return not NON_WORK_RE.match(code)
 
 
-def block_start(lines, index):
-    """Index of the first code line of the innermost block containing lines[index].
+# A brace that opens a CONDITIONAL is transparent to the priming test; one
+# that opens a loop or a function body is where an iteration begins.
+GUARD_RE = re.compile(r"^(?:\}\s*)?(?:else\b|if\s*\(|else\s+if\s*\()")
 
-    Brace counting backwards: the priming test asks whether anything in THIS
-    block ran on the announced pipe before the set, and a set at the top of a
-    loop body or a function body is the shape a priming set actually takes.
+
+def block_start(lines, index):
+    """Index of the first code line of the enclosing ITERATION.
+
+    The priming test asks "has anything run on the announced pipe since this
+    strip's body began", so the scope is the enclosing loop or function body,
+    not the innermost brace pair. Counting braces to the first `{` and
+    stopping made any announcement inside a one-line guard --
+
+        if (strip + kStageDepth < total) {
+            AscendC::CrossCoreSetFlag<2, kAnnounce>(kFlag);
+        }
+
+    -- look like a priming set, because nothing stands between the brace and
+    the set. So `if` and `else` braces are skipped over and the scan carries
+    on outward.
     """
     depth = 0
     for back in range(index - 1, -1, -1):
         code = lines[back][1]
         depth += code.count("}") - code.count("{")
         if depth < 0:
+            if GUARD_RE.match(code):
+                depth = 0      # a conditional: keep looking outward
+                continue
             return back + 1
     return 0
 
@@ -356,6 +373,31 @@ __aicore__ void named_wrong() {
 }
 """
 
+# The guard that made the structural test vacuous: an announcement alone
+# inside a conditional is NOT a priming set when the loop around it has
+# already run work on the announced pipe.
+SELF_TEST_GUARDED_ANNOUNCE = """
+__aicore__ void guarded() {
+    for (std::uint32_t strip = 0; strip < total; ++strip) {
+        RecurStrip(engine, strip);
+        if (strip + kStageDepth < total) {
+            AscendC::CrossCoreSetFlag<2, PIPE_V>(kSync2StageReady);
+        }
+    }
+}
+"""
+
+# ... and the same shape with nothing in front of it IS still priming.
+SELF_TEST_GUARDED_PRIME = """
+__aicore__ void guarded_prime() {
+    for (std::uint32_t i = 0; i < primes; ++i) {
+        if (i < kStageDepth) {
+            AscendC::CrossCoreSetFlag<2, PIPE_V>(kSync2StageReady);
+        }
+    }
+}
+"""
+
 SELF_TEST_UNKNOWN_PIPE = """
 __aicore__ void unknown() {
     FixpipeStrip(l0c, ub);
@@ -391,6 +433,8 @@ def self_test():
         ("named pipe, fenced", SELF_TEST_NAMED_PIPE_GOOD, False),
         ("named pipe, wrong route", SELF_TEST_NAMED_PIPE_WRONG, True),
         ("pipe name declared elsewhere", SELF_TEST_UNKNOWN_PIPE, True),
+        ("announcement alone inside a guard", SELF_TEST_GUARDED_ANNOUNCE, True),
+        ("priming set alone inside a guard", SELF_TEST_GUARDED_PRIME, False),
     )
     for label, source, want_fail in controls:
         verdicts = [row[3] for row in audit_text(source, label)]
