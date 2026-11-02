@@ -304,6 +304,8 @@ function(add_ascend_micro_sim_targets)
   target_compile_options(test_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
   add_executable(test_aic_splitk_decode_probe tests/cpu/test_aic_splitk_decode_probe.cpp)
   target_compile_options(test_aic_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
+  add_executable(test_aic_splitk_acc_error_model tests/cpu/test_aic_splitk_acc_error_model.cpp)
+  target_compile_options(test_aic_splitk_acc_error_model PRIVATE -Wall -Wextra -Werror)
   target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM)
   target_include_directories(bench_decode_splitk_sim PRIVATE
       "${ASCEND_HOME_PATH}/include")

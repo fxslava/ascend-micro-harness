@@ -1,0 +1,21 @@
+PASS pages=1 strips=1: 17505 reachable states, empty final marking, 1 ordered recurrences
+PASS pages=1 strips=2: 95194 reachable states, empty final marking, 2 ordered recurrences
+PASS pages=1 strips=4: 382773 reachable states, empty final marking, 4 ordered recurrences
+PASS pages=1 strips=8: 1507551 reachable states, empty final marking, 8 ordered recurrences
+PASS pages=2 strips=1: 115425 reachable states, empty final marking, 2 ordered recurrences
+PASS pages=2 strips=2: 429824 reachable states, empty final marking, 4 ordered recurrences
+PASS pages=2 strips=4: 1364217 reachable states, empty final marking, 8 ordered recurrences
+PASS pages=3 strips=1: 213345 reachable states, empty final marking, 3 ordered recurrences
+PASS pages=3 strips=2: 764454 reachable states, empty final marking, 6 ordered recurrences
+PASS pages=4 strips=1: 311265 reachable states, empty final marking, 4 ordered recurrences
+PASS pages=4 strips=2: 1099084 reachable states, empty final marking, 8 ordered recurrences
+NOT COVERED pages=2 strips=8: beyond exhaustive interleaving exploration in this model; covered on CAModel only
+NOT COVERED pages=4 strips=8: beyond exhaustive interleaving exploration in this model; covered on CAModel only
+PASS rejected negative control: aic_fix_only (the AIC draining only FIX at the page boundary) -- pages=2 strips=1: SET into a full place ('hard', 'AIC.M_MTE1', 0) (bound 1) -- hardware loses this token
+PASS rejected negative control: no_scalar_fence (the per-page X_S scalar drains removed) -- pages=2 strips=1: SET into a full place ('hard', 'V1.V_MTE2', 0) (bound 1) -- hardware loses this token
+PASS rejected negative control: no_page_fence (the full-page completion flags removed) -- pages=2 strips=1: SET into a full place ('hard', 'V1.MTE3_V', 0) (bound 1) -- hardware loses this token
+PASS rejected negative control: carry_credit (a V_MTE2 credit carried across the page boundary) -- pages=2 strips=1: unbalanced token census: ('hard', 'V0.V_MTE2', 1): 2 set / 0 wait
+PASS rejected negative control: l1_before_drain (L1 reuse announced before the scores were consumed) -- pages=2 strips=1: SET into a full place ('hard', 'AIC.M_MTE1', 0) (bound 1) -- hardware loses this token
+PASS rejected negative control: prime_once (the feedback cycles primed once instead of per page) -- pages=2 strips=1: unbalanced token census: ('cross', 'ScoreFree', 0): 3 set / 4 wait, ('cross', 'ScoreFree', 1): 1 set / 2 wait
+
+PASS AIC page loop: 11 geometries 1-safe across page boundaries, ordered carried state, finite drain; 6 negative controls; 2 geometries not covered here

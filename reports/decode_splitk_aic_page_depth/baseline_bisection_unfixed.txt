@@ -1,0 +1,11 @@
+### context=48 pages=3 splitk=1  (build=/tmp/ascend-splitk-build)
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=1.
+[INFO] Total tick: 69005
+### context=64 pages=4 splitk=4  (build=/tmp/ascend-splitk-build)
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=1.
+[INFO] Total tick: 27931
+### context=64 pages=4 splitk=2  (build=/tmp/ascend-splitk-build)
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=1.
+[INFO] Total tick: 48556
+### context=64 pages=4 splitk=1  (build=/tmp/ascend-splitk-build)
+[INFO] Total tick: 61786

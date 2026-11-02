@@ -1319,6 +1319,38 @@ __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
             // this page's mode-4 announcements can be reused.
             AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtPageDrain);
             AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtPageDrain);
+            // ... and drain MTE1 and M as well, which FIX_S does not.
+            //
+            // A scalar drain stalls instruction ISSUE, so the two above hold
+            // back everything that follows -- but they only prove the FIXPIPE
+            // retired. The next iteration's priming is what needs more than
+            // that. Both feedback cycles are primed on one queue and drained
+            // on another:
+            //
+            //   M_MTE1   SetFlag on M,   WaitFlag on MTE1
+            //   FIX_M    SetFlag on FIX, WaitFlag on M
+            //
+            // so page p + 1's `SetFlag<M_MTE1>` can execute on M while MTE1
+            // is still short of page p's `WaitFlag<M_MTE1>`, and page p + 1's
+            // `SetFlag<FIX_M>` can execute on FIX while M is still short of
+            // page p's `WaitFlag<FIX_M>`. Either one is a SET into a place
+            // that already holds its token, and a HardEvent is one bit: the
+            // second set is dropped, the matching wait later finds nothing,
+            // and the Cube stops. Nothing bounds the gap -- the drains carry
+            // no dependency that the primes have to respect -- so this is
+            // ordering, not a race one can lose only rarely.
+            //
+            // AIV0 and AIV1 already close the same hole at this boundary, and
+            // this is the same construction: AIV0 drains V and MTE2, AIV1
+            // drains MTE3, V and MTE2, each covering every queue it primes on.
+            // `HardEventAic` has no MTE1_S, so MTE1 cannot reach the scalar
+            // stream directly; MTE1_M carries it into M, which then drains.
+            // The wait sits on M behind page p's own `WaitFlag<FIX_M>` pair,
+            // so passing it proves MTE1 retired too.
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtPageDrain);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtPageDrain);
+            AscendC::SetFlag<AscendC::HardEvent::M_S>(kEvtPageDrain);
+            AscendC::WaitFlag<AscendC::HardEvent::M_S>(kEvtPageDrain);
             AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrainedV0);  // AIV0 page drained
             AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrainedV1);  // AIV1 page drained
         }

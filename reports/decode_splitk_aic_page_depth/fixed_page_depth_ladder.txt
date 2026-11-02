@@ -1,0 +1,20 @@
+### context=16 pages=1 splitk=1  (build=/tmp/ascend-aic-depth-build)
+AIC partial margins (fraction of each tolerance): m=0.00000x l=0.00064x acc=0.00032x at item=0 row=10 c=12 got=1.00920749 ref=1.00920761
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=1.
+[INFO] Total tick: 27853
+### context=32 pages=2 splitk=1  (build=/tmp/ascend-aic-depth-build)
+AIC partial margins (fraction of each tolerance): m=0.00000x l=0.00064x acc=0.00032x at item=0 row=14 c=0 got=-1.32090008 ref=-1.32090027
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=1.
+[INFO] Total tick: 48496
+### context=48 pages=3 splitk=1  (build=/tmp/ascend-aic-depth-build)
+AIC partial margins (fraction of each tolerance): m=0.00000x l=0.00096x acc=0.00033x at item=0 row=14 c=0 got=-1.21322167 ref=-1.21322191
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=1.
+[INFO] Total tick: 68997
+### context=64 pages=4 splitk=1  (build=/tmp/ascend-aic-depth-build)
+AIC partial mismatch item=0 row=0 c=0 got=-1.15049517 ref=-1.14959846 deviation=8.967165e-04 tolerance=8.580223e-04 (1.045x)
+[INFO] Total tick: 89568
+FAIL: AIC accumulator reference failed
+### context=64 pages=4 splitk=4  (build=/tmp/ascend-aic-depth-build)
+AIC partial margins (fraction of each tolerance): m=0.00000x l=0.00064x acc=0.00032x at item=0 row=10 c=12 got=1.00920749 ref=1.00920761
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=1.
+[INFO] Total tick: 27915

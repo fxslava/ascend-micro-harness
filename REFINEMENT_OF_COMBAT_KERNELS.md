@@ -68,6 +68,33 @@ for both kernels at N=0,1,2,3,4,5,8,16,64, rejects double SETs, unprimed cycles
 and early scale release, and requires ordered recurrence and an empty final
 marking. Keep model transitions consistent with the actual loop when editing it.
 
+### 1a. An operator with an outer loop needs the outer loop modelled too
+
+The ring model above covers ONE pass of the ring on one core. An operator that
+primes and drains that ring once per iteration of an outer loop -- a page loop,
+a wave loop, a tile-row loop -- has places that only exist at an iteration
+boundary, and they are invisible to a model that stops at one pass. Run
+`python3 tests/cpu/test_decode_page_loop_model.py` for
+`turboquant_paged_decode_splitk_aic`'s page loop, and write the equivalent for
+any other outer loop a refactor adds.
+
+Two rules that only bite at such a boundary, both learned from this operator:
+
+* **Route every SET and WAIT to the queue that actually issues it.** A SET is
+  issued into the PRODUCER's pipe and a WAIT into the CONSUMER's, so
+  `SetFlag<V_MTE2>` sits on V while `WaitFlag<V_MTE2>` sits on MTE2. A model
+  that puts both on one queue will report boundary deadlocks that the hardware
+  does not have, and will miss the ones it does.
+* **A feedback cycle primed on one queue and drained on another needs every
+  one of those queues drained before the next iteration primes it again.** The
+  next iteration's SET carries no dependency on this iteration's WAIT, so
+  without a fence it can execute first, and a HardEvent is one bit: the second
+  SET is dropped and the matching WAIT later finds nothing. A scalar drain
+  (`SetFlag<X_S>` / `WaitFlag<X_S>`) stalls instruction ISSUE until pipe X
+  retires, so one per primed queue closes it. `HardEventAic` has no `MTE1_S`;
+  route MTE1 through `MTE1_M` into M and drain M. Counting the SETs and WAITs
+  does not find this -- they balance -- which is why it belongs in the model.
+
 ## 2. Compile-time memory checks
 
 Compile the actual kernels with `-Wall -Werror`. Enforce 32-byte bases and DMA

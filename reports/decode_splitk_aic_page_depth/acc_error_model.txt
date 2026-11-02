@@ -1,0 +1,41 @@
+AIC Split-K partial: FP32 arithmetic error model
+
+context=16    page_tokens=16   pages=1   | FP32 recurrence vs FP64 oracle
+  margins (fraction of the rig's own bound): m=0.000000x l=0.001196x acc=0.000468x
+  worst acc: row=5   c=0    deviation=1.8656e-07 tolerance=3.9881e-04 condition=1.7x
+  worst cancellation anywhere: 18.8x ; worst |deviation|/sum|terms|: 9.386e-08
+
+context=32    page_tokens=16   pages=2   | FP32 recurrence vs FP64 oracle
+  margins (fraction of the rig's own bound): m=0.000000x l=0.001020x acc=0.000327x
+  worst acc: row=0   c=0    deviation=1.9207e-07 tolerance=5.8759e-04 condition=2.1x
+  worst cancellation anywhere: 49.3x ; worst |deviation|/sum|terms|: 6.845e-08
+
+context=48    page_tokens=16   pages=3   | FP32 recurrence vs FP64 oracle
+  margins (fraction of the rig's own bound): m=0.000000x l=0.000960x acc=0.000334x
+  worst acc: row=14  c=14   deviation=2.3702e-07 tolerance=7.0886e-04 condition=13.7x
+  worst cancellation anywhere: 594.2x ; worst |deviation|/sum|terms|: 5.509e-08
+
+context=64    page_tokens=16   pages=4   | FP32 recurrence vs FP64 oracle
+  margins (fraction of the rig's own bound): m=0.000000x l=0.000801x acc=0.000329x
+  worst acc: row=14  c=10   deviation=2.6229e-07 tolerance=7.9697e-04 condition=5.9x
+  worst cancellation anywhere: 105.2x ; worst |deviation|/sum|terms|: 5.567e-08
+
+context=128   page_tokens=128  pages=1   | FP32 recurrence vs FP64 oracle
+  margins (fraction of the rig's own bound): m=0.000000x l=0.001695x acc=0.000270x
+  worst acc: row=2   c=14   deviation=1.0989e-07 tolerance=4.0664e-04 condition=23.2x
+  worst cancellation anywhere: 440.5x ; worst |deviation|/sum|terms|: 4.125e-08
+
+context=256   page_tokens=128  pages=2   | FP32 recurrence vs FP64 oracle
+  margins (fraction of the rig's own bound): m=0.000000x l=0.001297x acc=0.000220x
+  worst acc: row=8   c=6    deviation=1.6660e-07 tolerance=7.5690e-04 condition=12.9x
+  worst cancellation anywhere: 2686.8x ; worst |deviation|/sum|terms|: 2.945e-08
+
+Oracle addressing, against the fixture's independent generator:
+oracle cross-check  context=16    pages=1   | worst |oracle - fixture generator| = 0.000e+00
+oracle cross-check  context=32    pages=2   | worst |oracle - fixture generator| = 0.000e+00
+oracle cross-check  context=48    pages=3   | worst |oracle - fixture generator| = 0.000e+00
+oracle cross-check  context=64    pages=4   | worst |oracle - fixture generator| = 0.000e+00
+oracle cross-check  context=128   pages=1   | worst |oracle - fixture generator| = 0.000e+00
+oracle cross-check  context=256   pages=2   | worst |oracle - fixture generator| = 0.000e+00
+
+PASS: the FP32 recurrence stays below 1% of every rig bound, and the oracle agrees with the fixture's own generator, at every geometry above.

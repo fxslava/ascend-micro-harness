@@ -273,11 +273,26 @@ struct AicRig {
     // so this reads the record rather than two separate tensors. That the
     // interleave arrives correctly is exactly what makes the two paths
     // interchangeable to a reducer, so it is checked lane by lane.
+    // The worst deviation each checked quantity reached, as a FRACTION of its
+    // own tolerance. Reported on success as well as failure: a check that
+    // passes at 0.001x of its bound is not measuring anything, and a check
+    // that passes at 0.98x is one fixture away from a false alarm. Without
+    // these numbers the page-depth ladder cannot say whether a deeper rung
+    // got worse or merely crossed a line that was always nearly crossed.
+    struct Margins {
+        double m = 0, l = 0, acc = 0;
+        std::size_t acc_item = 0;
+        int acc_row = 0, acc_channel = 0;
+        double acc_got = 0, acc_ref = 0;
+    };
+    Margins margins;
+
     AivRig::Census Validate(int)
     {
         std::vector<float> w(workspace.bytes / 4);
         std::vector<std::uint16_t> qr(qrot.bytes / 2);
         workspace.download(w); qrot.download(qr);
+        margins = Margins{};
         for (std::size_t item = 0; item < reference.size(); ++item) {
             const auto& ref = reference[item];
             const auto range = contract::Partition(pages, splits, item % splits);
@@ -288,9 +303,13 @@ struct AicRig {
                 const auto acc_base = item * splitk_decode_test::kAicAccFloats + row * kChannels;
                 const float m = w[record], l = w[record + contract::kStateLanes];
                 require(std::isfinite(m) && std::isfinite(l), "nonfinite AIC partial state");
-                require(std::abs(m - ref.m[row]) <= 2e-6 * std::max(1.0, std::abs(ref.m[row])),
+                const double m_tol = 2e-6 * std::max(1.0, std::abs(ref.m[row]));
+                const double l_tol = 1e-4 * std::max(1.0, ref.l[row]);
+                margins.m = std::max(margins.m, std::abs(m - ref.m[row]) / m_tol);
+                margins.l = std::max(margins.l, std::abs(l - ref.l[row]) / l_tol);
+                require(std::abs(m - ref.m[row]) <= m_tol,
                         "AIC partial maximum differs from CPU reference");
-                require(std::abs(l - ref.l[row]) <= 1e-4 * std::max(1.0, ref.l[row]),
+                require(std::abs(l - ref.l[row]) <= l_tol,
                         "AIC partial denominator differs from CPU reference");
                 if (!range.count)
                     require(m == -3e38f && l == 0.0f, "empty AIC split did not write exact neutral state");
@@ -301,15 +320,28 @@ struct AicRig {
                 double scale = 0;
                 for (int c = 0; c < kChannels; ++c)
                     scale = std::max(scale, std::abs(ref.acc[row * kChannels + c]));
+                const double acc_tol = 2e-4 * scale + 1e-5 * ref.l[row] + 1e-6;
                 for (int c = 0; c < kChannels; ++c) {
                     const float got = w[acc_at + c];
                     if (!range.count)
                         require(got == 0.0f && qr[acc_base + c] == 0xAAAAu,
                                 "empty AIC split must zero its accumulator and leave query rotation untouched");
-                    if (!std::isfinite(got) || std::abs(got - ref.acc[row * kChannels + c]) >
-                        2e-4 * scale + 1e-5 * ref.l[row] + 1e-6) {
-                        std::fprintf(stderr, "AIC partial mismatch item=%zu row=%d c=%d got=%.9g ref=%.9g\n",
-                                     item, row, c, got, ref.acc[row * kChannels + c]);
+                    const double deviation = std::abs(got - ref.acc[row * kChannels + c]);
+                    if (std::isfinite(got) && deviation / acc_tol > margins.acc) {
+                        margins.acc = deviation / acc_tol;
+                        margins.acc_item = item;
+                        margins.acc_row = row;
+                        margins.acc_channel = c;
+                        margins.acc_got = got;
+                        margins.acc_ref = ref.acc[row * kChannels + c];
+                    }
+                    if (!std::isfinite(got) || deviation > acc_tol) {
+                        std::fprintf(stderr, "AIC partial mismatch item=%zu row=%d c=%d got=%.9g ref=%.9g "
+                                     "deviation=%.6e tolerance=%.6e (%.3fx)\n",
+                                     item, row, c, got, ref.acc[row * kChannels + c],
+                                     deviation, acc_tol, deviation / acc_tol);
+                        std::fprintf(stderr, "AIC worst margins so far: m=%.4fx l=%.4fx acc=%.4fx\n",
+                                     margins.m, margins.l, margins.acc);
                         throw std::runtime_error("AIC accumulator reference failed");
                     }
                     if (range.count)
@@ -318,6 +350,10 @@ struct AicRig {
                 }
             }
         }
+        std::printf("AIC partial margins (fraction of each tolerance): m=%.5fx l=%.5fx "
+                    "acc=%.5fx at item=%zu row=%d c=%d got=%.9g ref=%.9g\n",
+                    margins.m, margins.l, margins.acc, margins.acc_item,
+                    margins.acc_row, margins.acc_channel, margins.acc_got, margins.acc_ref);
         return {};
     }
 };
