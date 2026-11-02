@@ -11,6 +11,29 @@ set(ASCEND_HOME_PATH "/usr/local/Ascend/cann-9.2.0-beta.2"
     CACHE PATH "CANN toolkit root")
 set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_HOME_PATH}")
 
+# CANN 9.2 adds its own headers with -I and emits hundreds of warnings under
+# -Wall. Reclassifying those same directories as system headers for BiSheng is
+# what lets -Werror stay strict for our kernels and the baseline source.
+#
+# Defined once, here, because both target modules need the identical list and
+# a divergence between them is silent: the simulator leg and the physical leg
+# compile the same kernel sources, so a path added to one list and not the
+# other turns -Werror on in one leg only, and the leg that starts failing is
+# whichever one a given host can actually build. SimTargets.cmake's copy
+# carried the comment "matching the physical-device target", which is the
+# property this makes structural instead of aspirational.
+set(ASCEND_MICRO_CANN_SYSTEM_OPTIONS "")
+foreach(path IN ITEMS
+    asc/impl/adv_api asc/impl/basic_api asc/impl/c_api
+    asc/impl/basic_api/reg_compute asc/impl/simt_api asc/impl/utils
+    asc asc/include asc/include/adv_api asc/include/basic_api
+    asc/include/aicpu_api asc/include/c_api
+    asc/include/basic_api/reg_compute asc/include/simt_api asc/include/utils
+    tikcpp/tikcfw tikcpp/tikcfw/interface tikcpp/tikcfw/impl)
+  list(APPEND ASCEND_MICRO_CANN_SYSTEM_OPTIONS
+      "-isystem${ASCEND_HOME_PATH}/x86_64-linux/${path}")
+endforeach()
+
 set(ASCENDC_CMAKE_DIR
     "${ASCEND_HOME_PATH}/tools/tikcpp/ascendc_kernel_cmake")
 if(NOT EXISTS "${ASCENDC_CMAKE_DIR}/ascendc.cmake")

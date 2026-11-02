@@ -1,20 +1,9 @@
 # CANN selects the physical-device host stubs and runtime for these targets.
 function(add_ascend_micro_npu_targets)
   set(RUN_MODE npu)
-  # CANN 9.2 adds its own headers with -I and emits hundreds of warnings under
-  # -Wall. Reclassify those same directories as system headers for BiSheng so
-  # -Werror remains strict for our kernel and the baseline source.
-  set(CANN_SYSTEM_OPTIONS "")
-  foreach(path IN ITEMS
-      asc/impl/adv_api asc/impl/basic_api asc/impl/c_api
-      asc/impl/basic_api/reg_compute asc/impl/simt_api asc/impl/utils
-      asc asc/include asc/include/adv_api asc/include/basic_api
-      asc/include/aicpu_api asc/include/c_api
-      asc/include/basic_api/reg_compute asc/include/simt_api asc/include/utils
-      tikcpp/tikcfw tikcpp/tikcfw/interface tikcpp/tikcfw/impl)
-    list(APPEND CANN_SYSTEM_OPTIONS
-        "-isystem${ASCEND_HOME_PATH}/x86_64-linux/${path}")
-  endforeach()
+  # The BiSheng system-header reclassification, defined once in the top-level
+  # CMakeLists.txt so this leg and the simulator leg cannot drift apart.
+  set(CANN_SYSTEM_OPTIONS ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS})
   set(BASELINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/baseline")
   set(BASELINE_SOURCE "${BASELINE_DIR}/turboquant_paged_attention.cpp")
   ascendc_library(turboquant_a8_npu SHARED
@@ -164,15 +153,31 @@ function(add_ascend_micro_npu_targets)
   # `add_ascend_micro_sim_targets` registers the simulator twins, which is
   # where these can actually run without a device.
   #
-  # Both link both kernel libraries: the rigs they share live in one header
-  # (tests/npu/turboquant_splitk_rigs.hpp), so either driver may reference
-  # either launcher as the ladders grow.
+  # Each links the ONE kernel library its driver calls into.
+  #
+  # This used to link both, on the reasoning that the rigs they share live in
+  # one header (tests/npu/turboquant_splitk_rigs.hpp) so either driver may
+  # reference either launcher as the ladders grow. The header declares both
+  # launchers, but a declaration is not a reference: each rig's `Launch` is an
+  # implicitly inline member emitted only where that rig is used, and each
+  # driver uses exactly one. `nm -u` on the two objects shows
+  # test_npu_decode_splitk_aic needing only
+  # launch_turboquant_paged_decode_splitk_aic and test_npu_decode_splitk_aiv
+  # only launch_turboquant_single_token_decode_splitk_aiv -- with and without
+  # ASCEND_MICRO_DECODE_SPLITK_SIM, so the simulator twins are the same.
+  #
+  # The cost of the spare link was a whole extra ascendc_library per driver,
+  # on every build rather than on clean ones, because CannRebuild.cmake keeps
+  # CANN's BUILD_ALWAYS: a no-op rebuild of the paged-decode library alone
+  # measures 54 s and 17 compile invocations. Future-proofing that expensive
+  # is not worth it when the failure mode is a link error that names the
+  # missing symbol and is repaired by putting the library back.
   add_executable(test_npu_decode_splitk_aic
       tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp)
   target_include_directories(test_npu_decode_splitk_aic PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(test_npu_decode_splitk_aic PRIVATE
-      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
+      turboquant_paged_decode_npu ascendcl)
   target_compile_options(test_npu_decode_splitk_aic PRIVATE
       -Wall -Wextra -Werror)
 
@@ -181,7 +186,7 @@ function(add_ascend_micro_npu_targets)
   target_include_directories(test_npu_decode_splitk_aiv PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(test_npu_decode_splitk_aiv PRIVATE
-      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
+      turboquant_single_token_decode_splitk_npu ascendcl)
   target_compile_options(test_npu_decode_splitk_aiv PRIVATE
       -Wall -Wextra -Werror)
 
@@ -191,16 +196,20 @@ function(add_ascend_micro_npu_targets)
   # multiple of the 16-token strip, and most not a multiple of the page. It
   # launches BOTH AIV decode kernels (the plain one through its new
   # arbitrary-context entry point, and the split-K one at K = 1, 2, 4, 8), so
-  # it links both kernel libraries. Every cache slot past seq_len carries a
-  # quiet-NaN canary, so a tail that leaks arrives as a non-finite context
-  # rather than a near miss.
+  # it links both kernel libraries -- those two and no more. It also used to
+  # link the AIC paged-decode library, which this comment never claimed and
+  # which `nm -u` on the driver's object refutes: it needs
+  # launch_turboquant_single_token_decode_tail_aiv and
+  # launch_turboquant_single_token_decode_splitk_aiv, and nothing else. Every
+  # cache slot past seq_len carries a quiet-NaN canary, so a tail that leaks
+  # arrives as a non-finite context rather than a near miss.
   add_executable(test_npu_decode_single_token_unaligned
       tests/npu/test_npu_decode_single_token_unaligned.cpp)
   target_include_directories(test_npu_decode_single_token_unaligned PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(test_npu_decode_single_token_unaligned PRIVATE
       turboquant_single_token_decode_npu
-      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu
+      turboquant_single_token_decode_splitk_npu
       ascendcl)
   target_compile_options(test_npu_decode_single_token_unaligned PRIVATE
       -Wall -Wextra -Werror)

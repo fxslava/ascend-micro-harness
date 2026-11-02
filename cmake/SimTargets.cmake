@@ -49,6 +49,37 @@ function(add_ascend_micro_sim_targets)
   # kernel library does not get them, so anything they gate must live in the
   # device leg only -- which is the case for sparse sampling: the launcher and
   # the kernel signature are identical either way.
+  # add_micro_camodel_runner(<name> <kernel_target> [<extra definitions>...])
+  # The RUNNER half of add_micro_camodel_probe, on its own, so that a second
+  # runner over an operator can link the kernel library that already exists
+  # instead of provoking a duplicate build of it.
+  #
+  # That duplicate is not a stray object file. `ascendc_library` expands into a
+  # nested ExternalProject per leg -- aic_device, aiv_device, host, plus
+  # precompile, preprocess and a merge step -- so a second library over the
+  # same source compiles the whole translation unit three more times through
+  # BiSheng and runs CANN's preprocessing again. On this operator that is the
+  # single most expensive thing in the build, and the second copy was linked by
+  # exactly one runner that calls the same `launch_camodel_*` symbol as the
+  # first. It also silently escaped the strict warning set: the per-target
+  # `-std=c++17 -Wall -Werror ${splitk_system_options}` below names
+  # camodel_paged_decode_attention_kernel, so the duplicate was the one
+  # translation unit of this operator compiled without it.
+  function(add_micro_camodel_runner name kernel_target)
+    add_executable(test_camodel_${name} tests/camodel/test_camodel_${name}.cpp)
+    if(ARGN)
+      target_compile_definitions(test_camodel_${name} PRIVATE ${ARGN})
+    endif()
+    target_include_directories(test_camodel_${name} PRIVATE "${ASCEND_HOME_PATH}/include")
+    target_link_libraries(test_camodel_${name} PRIVATE ${kernel_target} ascendcl
+        "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+    target_link_options(test_camodel_${name} PRIVATE
+        "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
+    target_compile_options(test_camodel_${name} PRIVATE -Wall -Wextra -Werror)
+    set_target_properties(test_camodel_${name} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+  endfunction()
+
   function(add_micro_camodel_probe name)
     set(kernel_src "kernels/camodel/${name}.cpp")
     if(ARGC GREATER 1)
@@ -67,18 +98,7 @@ function(add_ascend_micro_sim_targets)
         ASCEND_MICRO_CANN_LAUNCH ${extra_defs})
     ascendc_compile_options(camodel_${name}_kernel PRIVATE
         -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
-    add_executable(test_camodel_${name} tests/camodel/test_camodel_${name}.cpp)
-    if(extra_defs)
-      target_compile_definitions(test_camodel_${name} PRIVATE ${extra_defs})
-    endif()
-    target_include_directories(test_camodel_${name} PRIVATE "${ASCEND_HOME_PATH}/include")
-    target_link_libraries(test_camodel_${name} PRIVATE camodel_${name}_kernel ascendcl
-        "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
-    target_link_options(test_camodel_${name} PRIVATE
-        "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
-    target_compile_options(test_camodel_${name} PRIVATE -Wall -Wextra -Werror)
-    set_target_properties(test_camodel_${name} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-        INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+    add_micro_camodel_runner(${name} camodel_${name}_kernel ${extra_defs})
   endfunction()
 
   add_micro_camodel_probe(dequant4)
@@ -234,8 +254,16 @@ function(add_ascend_micro_sim_targets)
   # rotation and that strip's score panel checked bit-exactly, and the tick
   # spans read out of the Cube dump by
   # scripts/analyze_cube_tile_baseline.py.
-  add_micro_camodel_probe(cube_single_tile_baseline
-      kernels/ops/turboquant/turboquant_paged_decode_attention.cpp)
+  #
+  # "The same translation unit" is now literally true. This used to go through
+  # add_micro_camodel_probe, which builds a kernel library per call, so the
+  # operator was compiled twice on the simulator side and this runner linked
+  # the second copy. Both runners declare and call the same
+  # `launch_camodel_paged_decode_attention`, so the second library only ever
+  # duplicated the first -- and being a separate target it missed the strict
+  # warning set applied below. It links the first library now.
+  add_micro_camodel_runner(cube_single_tile_baseline
+      camodel_paged_decode_attention_kernel)
 
   # ------------------------------------------- the Split-K bench's sim twin
   # `tests/npu/bench/bench_turboquant_decode_splitk.cpp` is a hardware
@@ -262,19 +290,10 @@ function(add_ascend_micro_sim_targets)
 
   ascendc_library(camodel_single_token_decode_splitk_kernel SHARED
       kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp)
-  # Keep warnings strict in our source while classifying CANN's own headers
-  # as system headers, matching the physical-device target.
-  set(splitk_system_options "")
-  foreach(path IN ITEMS
-      asc/impl/adv_api asc/impl/basic_api asc/impl/c_api
-      asc/impl/basic_api/reg_compute asc/impl/simt_api asc/impl/utils
-      asc asc/include asc/include/adv_api asc/include/basic_api
-      asc/include/aicpu_api asc/include/c_api
-      asc/include/basic_api/reg_compute asc/include/simt_api asc/include/utils
-      tikcpp/tikcfw tikcpp/tikcfw/interface tikcpp/tikcfw/impl)
-    list(APPEND splitk_system_options
-        "-isystem${ASCEND_HOME_PATH}/x86_64-linux/${path}")
-  endforeach()
+  # Keep warnings strict in our source while classifying CANN's own headers as
+  # system headers, matching the physical-device target -- the same list, from
+  # the top-level CMakeLists.txt, so "matching" is now by construction.
+  set(splitk_system_options ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS})
   ascendc_compile_definitions(camodel_single_token_decode_splitk_kernel PRIVATE
       ASCEND_MICRO_CANN_LAUNCH)
   ascendc_compile_options(camodel_single_token_decode_splitk_kernel PRIVATE
@@ -328,6 +347,24 @@ function(add_ascend_micro_sim_targets)
   # real launch on the model -- so run them with a narrowed matrix when
   # iterating, and read reports/decode_splitk_validation.md for which rungs
   # have been executed on which leg.
+  # One kernel library per leg, not both to both. The two drivers share their
+  # rigs through tests/npu/turboquant_splitk_rigs.hpp, which DECLARES both
+  # launchers, but a declaration is not a reference: each rig's `Launch` is an
+  # implicitly inline member that is only emitted when that rig is used, and
+  # each driver uses exactly one. `nm -u` on their objects says so --
+  # test_decode_splitk_aic_sim needs only launch_turboquant_paged_decode_splitk_aic
+  # and test_decode_splitk_aiv_sim only
+  # launch_turboquant_single_token_decode_splitk_aiv.
+  #
+  # Linking both cost a whole extra ascendc_library build per driver, and
+  # because CannRebuild.cmake keeps CANN's BUILD_ALWAYS it cost it on EVERY
+  # build: a no-op rebuild of the paged-decode library alone is 54 s and 17
+  # compile invocations here. So building the AIV ladder pulled the AIC
+  # operator through BiSheng for a symbol it never calls. If a ladder later
+  # does reach across, the link error names the missing symbol immediately and
+  # the library goes back in one line.
+  set(camodel_splitk_leg_aic camodel_paged_decode_attention_kernel)
+  set(camodel_splitk_leg_aiv camodel_single_token_decode_splitk_kernel)
   foreach(leg aic aiv)
     add_executable(test_decode_splitk_${leg}_sim
         tests/npu/validation/test_turboquant_decode_splitk_${leg}_validation.cpp)
@@ -336,8 +373,7 @@ function(add_ascend_micro_sim_targets)
     target_include_directories(test_decode_splitk_${leg}_sim PRIVATE
         "${ASCEND_HOME_PATH}/include")
     target_link_libraries(test_decode_splitk_${leg}_sim PRIVATE
-        camodel_single_token_decode_splitk_kernel
-        camodel_paged_decode_attention_kernel ascendcl
+        ${camodel_splitk_leg_${leg}} ascendcl
         "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
     target_link_options(test_decode_splitk_${leg}_sim PRIVATE
         "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
@@ -356,6 +392,12 @@ function(add_ascend_micro_sim_targets)
   # entry point, and the split-K operator at four split counts, where the
   # partial strip lands in whichever split owns the last live page and the
   # splits beyond it must contribute the neutral element.
+  #
+  # Both AIV kernels, and no more. This used to link the AIC paged-decode
+  # library too, which the comment above never claimed and which `nm -u` on
+  # the driver's object refutes: it needs
+  # launch_turboquant_single_token_decode_tail_aiv and
+  # launch_turboquant_single_token_decode_splitk_aiv, and nothing else.
   add_executable(test_decode_single_token_unaligned_sim
       tests/npu/test_npu_decode_single_token_unaligned.cpp)
   target_compile_definitions(test_decode_single_token_unaligned_sim PRIVATE
@@ -364,8 +406,7 @@ function(add_ascend_micro_sim_targets)
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(test_decode_single_token_unaligned_sim PRIVATE
       camodel_single_token_decode_aiv_kernel
-      camodel_single_token_decode_splitk_kernel
-      camodel_paged_decode_attention_kernel ascendcl
+      camodel_single_token_decode_splitk_kernel ascendcl
       "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
   target_link_options(test_decode_single_token_unaligned_sim PRIVATE
       "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
