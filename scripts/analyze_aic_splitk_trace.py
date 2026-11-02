@@ -12,7 +12,7 @@ import re
 from collections import Counter
 
 LINE = re.compile(r"\[\d+\].*?\(ID: \d+\)\s+(\w+)(.*)")
-FLAG = re.compile(r"PIPE:(\w+), TRIGGER PIPE:(\w+), FLAG ID:0x([0-9a-f]+)")
+FLAG = re.compile(r"PIPE:(\w+), TRIGGER PIPE:(\w+), FLAG ID:(?:0x)?([0-9a-f]+)")
 MODE4 = re.compile(r"sync_id:(\d+)")
 
 

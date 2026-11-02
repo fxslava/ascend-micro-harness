@@ -1500,11 +1500,42 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
             const uint32_t physical = table[request * seq_pages + page_begin + range.begin + p];
             const uint32_t base = (physical * heads + head) * block_size * kHeadSize / 2u;
             run_key_core(key, base, strips);
-            AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(kFlagPageDrainedV1);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtPageDrain);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtPageDrain);
+            // This is the WAR edge for the WHOLE L1 key ring, and nothing else
+            // orders it. The kL1End comment gives every strip its own L1 page
+            // so that "every page is read once" and the per-strip L1-free back
+            // edge can go. That argument holds inside one sequence page and
+            // stops at a page boundary: page p + 1's strip s restages
+            // kL1KeyPage<s> over page p's, so the reuse is back and this is
+            // the only thing standing where that back edge used to be.
+            //
+            // It waits on PIPE_V and not on PIPE_MTE3, and the pipe is the
+            // whole fix. Measured on the four-page K=1 rung against the
+            // ccu_log common clock, AIV1's four waits on this id stalled
+            // 23145, 2, 5 and 10 ticks while the Cube's four announcements
+            // are ~20600 ticks apart -- a CrossCoreWaitFlag<4, PIPE_MTE3> on
+            // AIV1 blocks the first time and then stops blocking, so AIV1 ran
+            // all four pages' staging by tick 29611 and the Cube read L1 for
+            // sequence page 2 at 47018, by which time the page held page 3's
+            // keys. The same construction on PIPE_V does block every page:
+            // on that same run AIV0's CrossCoreWaitFlag<4, PIPE_V> on
+            // kFlagScoreReady was released at the Cube's set on all four
+            // pages, giving recurrence spans of 19386, 19386, 19385 and 19385
+            // ticks. The kL1End comment records this same MTE3 symptom on the
+            // edge this one replaces: "AIV1's third and fourth waits did not
+            // block."
+            //
+            // V_S goes immediately behind it, because a mode-4 wait blocks
+            // only the issuance of its own pipe. Draining V into the scalar
+            // stream stalls instruction ISSUE until the Vector queue has
+            // retired past the wait, so page p + 1's MTE2 ingress, its
+            // dequant AND its MTE3 staging burst are all held behind the
+            // Cube's announcement. Gating MTE3 alone never covered the
+            // ingress even when the wait did block.
+            AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagPageDrainedV1);
             AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtPageDrain);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtPageDrain);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtPageDrain);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kEvtPageDrain);
         }

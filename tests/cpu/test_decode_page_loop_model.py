@@ -91,7 +91,7 @@ def slot_of(column):
 
 def schedule(pages, strips, *, no_page_fence=False, carry_credit=False,
              l1_before_drain=False, prime_once=False, no_scalar_fence=False,
-             aic_fix_only=False):
+             aic_fix_only=False, page_fence_on_mte3=False):
     """Emit the three cores' pipe queues for `pages` pages of `strips` strips.
 
     Keyword flags are the negative controls, each removing one of the
@@ -168,10 +168,18 @@ def schedule(pages, strips, *, no_page_fence=False, carry_credit=False,
         for page in range(pages):
             key_page(page)
             if not no_page_fence:
-                # Waited on PIPE_MTE3, the pipe that writes L1.
-                cross("V1.MTE3", "wait", "PageDrainedV1")
+                # Waited on PIPE_V, with the V drain first. A mode-4 wait
+                # blocks only its own pipe's issuance, so the pipe it sits on
+                # decides nothing by itself -- what holds page p + 1 back is
+                # the scalar drain behind it, and that drain has to be on the
+                # same pipe as the wait to mean anything. `page_fence_on_mte3`
+                # is the construction this replaces.
+                lane = "V1.MTE3" if page_fence_on_mte3 else "V1.V"
+                cross(lane, "wait", "PageDrainedV1")
                 if not no_scalar_fence:
-                    scalar_drain("V1", ("MTE3", "V", "MTE2"))
+                    order = ("MTE3", "V", "MTE2") if page_fence_on_mte3 else \
+                            ("V", "MTE3", "MTE2")
+                    scalar_drain("V1", order)
 
     # ---------------------------------------------------------------- AIV0
     def value_page(page):
@@ -287,7 +295,7 @@ class Violation(Exception):
     pass
 
 
-def explore(queues, pages, strips, cap=4_000_000):
+def explore(queues, pages, strips, cap=4_000_000, sticky_aiv_wait=False):
     names = sorted(queues)
     lanes = [queues[name] for name in names]
     places = sorted({cmd[1] for lane in lanes for cmd in lane
@@ -317,15 +325,17 @@ def explore(queues, pages, strips, cap=4_000_000):
     caps = [capacity(place) for place in places]
     # Owner of each L1 key page, and the page whose (m, l, Acc) the recurrence
     # has most recently folded in. -1 is "no page has written it yet".
+    # `sticky` is the set of cross-core places whose AIV-side wait has already
+    # been released once, for the sticky_aiv_wait semantics knob below.
     start = (tuple([0] * len(lanes)), tuple([0] * len(places)),
-             tuple([-1] * strips), -1, 0)
+             tuple([-1] * strips), -1, 0, 0)
     pending = deque([start])
     seen = {start}
     terminals = 0
     while pending:
         if len(seen) > cap:
             raise Violation(f"state space exceeded {cap} states")
-        pcs, marking, l1, folded, recurs = pending.popleft()
+        pcs, marking, l1, folded, recurs, sticky = pending.popleft()
         progress = False
         for lane_id, lane in enumerate(lanes):
             pc = pcs[lane_id]
@@ -334,7 +344,7 @@ def explore(queues, pages, strips, cap=4_000_000):
             op, *rest = lane[pc]
             tokens = list(marking)
             pages_l1 = list(l1)
-            next_folded, next_recurs = folded, recurs
+            next_folded, next_recurs, next_sticky = folded, recurs, sticky
             if op == "set":
                 place = rest[0]
                 i = index[place]
@@ -346,9 +356,24 @@ def explore(queues, pages, strips, cap=4_000_000):
             elif op == "wait":
                 place = rest[0]
                 i = index[place]
-                if tokens[i] == 0:
+                # SS6.3's knob, and this operator is where it bit. Under
+                # `sticky_aiv_wait` an AIV-side mode-4 wait behaves as a level
+                # that the first wait observes and no later wait blocks on --
+                # which is what the four-page Split-K trace measured for
+                # AIV1's `kFlagPageDrainedV1`: stalls of 23146, 3, 3 and 3
+                # ticks against announcements ~20600 ticks apart. A model that
+                # assumes the consuming semantics has assumed the answer, so
+                # both settings are explored and both verdicts reported.
+                if (sticky_aiv_wait and place[0] == "cross"
+                        and names[lane_id].startswith("V") and (sticky >> i) & 1):
+                    pass
+                elif tokens[i] == 0:
                     continue  # the engine blocks here
-                tokens[i] -= 1
+                else:
+                    tokens[i] -= 1
+                    if (sticky_aiv_wait and place[0] == "cross"
+                            and names[lane_id].startswith("V")):
+                        next_sticky = sticky | (1 << i)
             elif op == "barrier":
                 core, tag, drained = rest[0]
                 # Instruction issue is stalled until every NAMED pipe has
@@ -385,7 +410,8 @@ def explore(queues, pages, strips, cap=4_000_000):
                 next_recurs = expect + 1
                 next_folded = page
             state = (tuple(pcs[:lane_id] + (pc + 1,) + pcs[lane_id + 1:]),
-                     tuple(tokens), tuple(pages_l1), next_folded, next_recurs)
+                     tuple(tokens), tuple(pages_l1), next_folded, next_recurs,
+                     next_sticky)
             progress = True
             if state not in seen:
                 seen.add(state)
@@ -413,7 +439,7 @@ def explore(queues, pages, strips, cap=4_000_000):
 # four strips.
 GRID = [(1, 1), (1, 2), (1, 4), (1, 8),
         (2, 1), (2, 2), (2, 4),
-        (3, 1), (3, 2), (4, 1), (4, 2)]
+        (3, 1), (3, 2), (4, 1), (4, 2), (5, 1), (6, 1)]
 
 # Beyond exhaustive interleaving exploration here: eight strips on three
 # asynchronous cores over more than one page is tens of millions of states with
@@ -469,13 +495,46 @@ def main():
             print(f"FAIL negative control {control} ({description}) was accepted")
             failures += 1
 
+    # ---- the flag-semantics knob, reported and not gated -----------------
+    # REFINEMENT_OF_COMBAT_KERNELS.md SS6.3: two hardware properties decide
+    # whether channel recycling is usable, and a model that assumes either has
+    # assumed the answer. Everything above assumes an AIV-side mode-4 wait
+    # CONSUMES the flag it tested. The four-page Split-K trace measured the
+    # other half for `kFlagPageDrainedV1` on PIPE_MTE3 -- stalls of 23146, 3,
+    # 3 and 3 ticks against announcements ~20600 ticks apart -- so the verdict
+    # under the sticky reading belongs here too.
+    #
+    # It is REPORTED rather than gated because the token structure cannot fix
+    # it: under a sticky AIV wait no arrangement of these flags orders AIV1's
+    # L1 reuse, including the arrangement the kernel now ships. What settles
+    # it for a given toolkit is the stall census in
+    # `scripts/audit_mode4_tick_order.py` over that revision's own trace, and
+    # that is the gate. This section exists so the dependence is on the
+    # record instead of implicit.
+    print()
+    for label, flags in (("as shipped (page fence on PIPE_V)", {}),
+                         ("pre-fix (page fence on PIPE_MTE3)",
+                          {"page_fence_on_mte3": True})):
+        verdicts = []
+        for pages, strips in ((2, 1), (4, 1)):
+            try:
+                explore(schedule(pages, strips, **flags), pages, strips,
+                        sticky_aiv_wait=True)
+                verdicts.append(f"pages={pages}: safe even so")
+            except Violation as e:
+                verdicts.append(f"pages={pages}: {e}")
+        print(f"SEMANTICS sticky AIV mode-4 wait, {label}: " + "; ".join(verdicts))
+    print("SEMANTICS the consuming reading is the one measured for this "
+          "revision; see reports/decode_splitk_aic_page_race.md")
+
     if failures:
         print(f"\n{failures} check(s) failed")
         return 1
     print(f"\nPASS AIC page loop: {len(GRID)} geometries 1-safe across page "
           f"boundaries, ordered carried state, finite drain; "
           f"{len(CONTROLS)} negative controls; "
-          f"{len(BEYOND_EXHAUSTIVE)} geometries not covered here")
+          f"{len(BEYOND_EXHAUSTIVE)} geometries not covered here; "
+          f"flag-semantics knob reported for both readings")
     return 0
 
 

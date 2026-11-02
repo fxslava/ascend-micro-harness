@@ -284,6 +284,17 @@ struct AicRig {
         std::size_t acc_item = 0;
         int acc_row = 0, acc_channel = 0;
         double acc_got = 0, acc_ref = 0;
+        // Where a failure actually lives. Throwing at the first channel past
+        // its bound answers none of the questions that matter next: whether
+        // the query rotation is intact, whether m and l hold for the fifteen
+        // rows after the first, whether one channel is wrong or all of them,
+        // and whether the deviations share a sign. One channel of one row is
+        // a different defect from a whole accumulator, so the survey runs to
+        // completion and the diagnosis is printed before anything is raised.
+        int acc_over = 0, rows_touched = 0, qrot_wrong = 0, state_torn = 0;
+        int m_over = 0, l_over = 0;
+        double acc_signed_sum = 0, acc_abs_sum = 0;
+        int acc_checked = 0;
     };
     Margins margins;
 
@@ -307,20 +318,18 @@ struct AicRig {
                 const double l_tol = 1e-4 * std::max(1.0, ref.l[row]);
                 margins.m = std::max(margins.m, std::abs(m - ref.m[row]) / m_tol);
                 margins.l = std::max(margins.l, std::abs(l - ref.l[row]) / l_tol);
-                require(std::abs(m - ref.m[row]) <= m_tol,
-                        "AIC partial maximum differs from CPU reference");
-                require(std::abs(l - ref.l[row]) <= l_tol,
-                        "AIC partial denominator differs from CPU reference");
+                margins.m_over += std::abs(m - ref.m[row]) > m_tol;
+                margins.l_over += std::abs(l - ref.l[row]) > l_tol;
                 if (!range.count)
                     require(m == -3e38f && l == 0.0f, "empty AIC split did not write exact neutral state");
                 for (unsigned lane = 1; lane < contract::kStateLanes; ++lane)
-                    require(w[record + lane] == m &&
-                            w[record + contract::kStateLanes + lane] == l,
-                            "AIC replicated state torn");
+                    margins.state_torn += w[record + lane] != m ||
+                                          w[record + contract::kStateLanes + lane] != l;
                 double scale = 0;
                 for (int c = 0; c < kChannels; ++c)
                     scale = std::max(scale, std::abs(ref.acc[row * kChannels + c]));
                 const double acc_tol = 2e-4 * scale + 1e-5 * ref.l[row] + 1e-6;
+                int over_in_row = 0;
                 for (int c = 0; c < kChannels; ++c) {
                     const float got = w[acc_at + c];
                     if (!range.count)
@@ -335,25 +344,48 @@ struct AicRig {
                         margins.acc_got = got;
                         margins.acc_ref = ref.acc[row * kChannels + c];
                     }
+                    margins.acc_checked++;
+                    margins.acc_signed_sum += got - ref.acc[row * kChannels + c];
+                    margins.acc_abs_sum += deviation;
                     if (!std::isfinite(got) || deviation > acc_tol) {
-                        std::fprintf(stderr, "AIC partial mismatch item=%zu row=%d c=%d got=%.9g ref=%.9g "
-                                     "deviation=%.6e tolerance=%.6e (%.3fx)\n",
-                                     item, row, c, got, ref.acc[row * kChannels + c],
-                                     deviation, acc_tol, deviation / acc_tol);
-                        std::fprintf(stderr, "AIC worst margins so far: m=%.4fx l=%.4fx acc=%.4fx\n",
-                                     margins.m, margins.l, margins.acc);
-                        throw std::runtime_error("AIC accumulator reference failed");
+                        if (margins.acc_over < 8)
+                            std::fprintf(stderr, "AIC partial mismatch item=%zu row=%d c=%d "
+                                         "got=%.9g ref=%.9g deviation=%.6e tolerance=%.6e (%.3fx)\n",
+                                         item, row, c, got, ref.acc[row * kChannels + c],
+                                         deviation, acc_tol, deviation / acc_tol);
+                        margins.acc_over++;
+                        over_in_row++;
                     }
                     if (range.count)
-                        require(qr[acc_base + c] == f.q[(item / splits) * 16 * kChannels + row * kChannels + c],
-                                "AIC query rotation differs from BF16 reference");
+                        margins.qrot_wrong +=
+                            qr[acc_base + c] !=
+                            f.q[(item / splits) * 16 * kChannels + row * kChannels + c];
                 }
+                margins.rows_touched += over_in_row != 0;
             }
         }
         std::printf("AIC partial margins (fraction of each tolerance): m=%.5fx l=%.5fx "
                     "acc=%.5fx at item=%zu row=%d c=%d got=%.9g ref=%.9g\n",
                     margins.m, margins.l, margins.acc, margins.acc_item,
                     margins.acc_row, margins.acc_channel, margins.acc_got, margins.acc_ref);
+        // The localisation. `rows_touched` and `acc_over` say whether this is
+        // one channel or a whole accumulator; the mean SIGNED deviation
+        // against the mean absolute one says whether the error has a
+        // direction -- a biased error points at a scale or a rescale factor,
+        // a symmetric one at noise in the data path.
+        std::printf("AIC partial profile: acc over tolerance %d of %d channels in %d of "
+                    "%d rows; m over %d, l over %d; replicas torn %d; qrot wrong %d; "
+                    "mean signed deviation %.6e, mean |deviation| %.6e\n",
+                    margins.acc_over, margins.acc_checked, margins.rows_touched,
+                    static_cast<int>(reference.size()) * 16, margins.m_over,
+                    margins.l_over, margins.state_torn, margins.qrot_wrong,
+                    margins.acc_checked ? margins.acc_signed_sum / margins.acc_checked : 0.0,
+                    margins.acc_checked ? margins.acc_abs_sum / margins.acc_checked : 0.0);
+        require(margins.qrot_wrong == 0, "AIC query rotation differs from BF16 reference");
+        require(margins.state_torn == 0, "AIC replicated state torn");
+        require(margins.m_over == 0, "AIC partial maximum differs from CPU reference");
+        require(margins.l_over == 0, "AIC partial denominator differs from CPU reference");
+        require(margins.acc_over == 0, "AIC accumulator reference failed");
         return {};
     }
 };

@@ -15,3 +15,4 @@ __pycache__/
 /profile_*.toml
 .claude/
 probe/prof_output/
+/sim_log

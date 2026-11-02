@@ -1,0 +1,19 @@
+test_all_codes_are_packed_at_exact_bit_budget (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_all_codes_are_packed_at_exact_bit_budget) ... ok
+test_chunk_stable_gaussian_generator (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_chunk_stable_gaussian_generator) ... ok
+test_fp16_scales_zero_vectors_and_payload (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_fp16_scales_zero_vectors_and_payload) ... ok
+test_gaussian_grid_and_logistic_inverse (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_gaussian_grid_and_logistic_inverse) ... ok
+test_lloyd_codebook_stationarity_and_gaussian_mse (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_lloyd_codebook_stationarity_and_gaussian_mse) ... ok
+test_reference_suite_compatibility_when_available (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_reference_suite_compatibility_when_available) ... ok
+test_rotation_is_orthogonal_and_self_inverse (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_rotation_is_orthogonal_and_self_inverse) ... ok
+test_uniform_fp16_group_step_uses_absmax_not_rms (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_uniform_fp16_group_step_uses_absmax_not_rms) ... ok
+test_uniform_signed_codes_zero_and_grid_boundaries (test_tq_cdf_vs_lloydmax_ablation.CodecTests.test_uniform_signed_codes_zero_and_grid_boundaries) ... ok
+test_cross_bit_pairing_uses_corrected_5_vs_4_and_4_vs_3 (test_tq_cdf_vs_lloydmax_ablation.CrossBitParityTests.test_cross_bit_pairing_uses_corrected_5_vs_4_and_4_vs_3) ... ok
+test_tost_matches_90_percent_ci_and_handles_degenerate_pairs (test_tq_cdf_vs_lloydmax_ablation.CrossBitParityTests.test_tost_matches_90_percent_ci_and_handles_degenerate_pairs) ... ok
+test_chunk_size_preserves_metrics (test_tq_cdf_vs_lloydmax_ablation.StreamingTests.test_chunk_size_preserves_metrics) ... ok
+test_spearman_ties_and_paired_t (test_tq_cdf_vs_lloydmax_ablation.StreamingTests.test_spearman_ties_and_paired_t) ... ok
+test_streamed_ranks_against_dense_sort_oracle (test_tq_cdf_vs_lloydmax_ablation.StreamingTests.test_streamed_ranks_against_dense_sort_oracle) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.865s
+
+OK
