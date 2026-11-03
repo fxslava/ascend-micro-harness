@@ -156,10 +156,31 @@ S = 127: acc=0.00019x  mean |deviation| 4.480050e-08
 `l` bit-exact, `qrot wrong 0`, replicas intact. So at these geometries the
 reassociation changed no FP32 result -- either the two orders coincide for
 this data, or `ReduceRepeat` was already reducing by DataBlock pairs
-internally. That is a stronger outcome than the ULP budget required, and it is
-reported as an observation at these rungs rather than as a guarantee: a
-different fixture could separate the two orderings by a few ULP, which is
-exactly what the 256-ULP budget is sized for.
+internally.
+
+### 3e. The 192 ULP predates the tree
+
+The legacy gate reports `acc <= 192 ULP` of its 256 budget, which is 75% of
+it, and a figure that close to a limit is worth attributing rather than
+accepting. So the same rung was run against commit `a86197b` -- the revision
+immediately before the tree, with only the four files the tree touched
+restored, and a guard that fails the run if `ReduceDataBlock` is still in the
+restored source, because a silent no-op restore would have produced an
+"identical" answer that proved nothing:
+
+| revision | scores | m, l | acc | context err |
+| --- | --- | --- | --- | --- |
+| `a86197b`, pre-tree | 0/2048 wrong | <= 2 ULP | **<= 192 ULP** | 5.960e-08 |
+| with the tree | 0/2048 wrong | <= 2 ULP | **<= 192 ULP** | 5.960e-08 |
+
+Identical. Those 192 ULP are **pre-existing FP32-versus-FP64 drift** over an
+eight-strip accumulation of 256-channel dot products, not anything the
+reassociation introduced, and the margin to the budget is as wide as it ever
+was. The authorisation to spend numerical accuracy here went unused.
+
+One thing worth recording about getting that measurement: `git -C` run inside
+WSL cannot read this worktree, because its `.git` file holds a Windows path.
+The pre-tree files had to be extracted Windows-side and copied in.
 
 ## 4. Proposal: offload the contraction to the Cube as a GEMM
 
@@ -247,7 +268,89 @@ values are -7..7. The lesson is that bf16 is free wherever the value being
 carried has eight or fewer significant bits, and ruinous wherever it carries
 FP32 significance. `V` qualifies; `p` does not.
 
-## 6. Gate status
+## 6. The pipeline overlap audit
+
+`scripts/analyze_strip_pipeline_overlap.py --overlap` reconstructs each
+engine's busy INTERVALS from its retirement ticks -- two consecutive
+retirements join when the gap is at most `--gap` ticks -- and intersects them
+exactly. That replaces the binned occupancy picture, whose answer moved with
+the bin width, with a number. It does depend on `--gap`, so the threshold is
+printed with every figure and `--gap-sweep` runs several.
+
+`VECTOR` on an AIV means the union of the RISC-V vector units and the classic
+`VEC` column, because the recurrence runs on the SIMT path: in these traces
+`VEC` holds 15 instructions against `RVECEX`'s 12,780. Reading `VEC` alone
+would have said the Vector pipe was idle.
+
+### 6a. Pairwise overlap, four strips, gap 64
+
+| pair | overlap | share of A | share of B |
+| --- | ---: | ---: | ---: |
+| AIV0 MTE2 vs AIV0 VECTOR | 31 ticks | **52.5%** | 0.0% |
+| AIV0 VECTOR vs AIV0 MTE3 | 0 | 0.0% | 0.0% |
+| Cube CUBE vs AIV0 VECTOR | 380 | **28.6%** | 0.6% |
+| Cube FIXP vs AIV0 VECTOR | 7 | 33.3% | 0.0% |
+| Cube MTE1 vs AIV1 MTE3 | 18 | 5.9% | 1.8% |
+
+Given as a share of each side's own busy time, because the two sides differ by
+three orders of magnitude and one percentage would hide that.
+
+`VECTOR` against `MTE3` is 0.0% at every threshold, and it is correct: AIV0's
+MTE3 is six instructions, the partition write-out, which by construction runs
+after all vector work.
+
+### 6b. Bubbles: one, and it is the prologue
+
+AIV0's VECTOR busy intervals at four strips are
+
+```text
+[1809,1810] [2332,2487] [2574,2574] [3113,3279] [6854,72159]
+```
+
+-- after tick 6854 it is **one unbroken interval to the end of the stream**.
+93.3% occupancy over its own span, and every gap sits before the first score
+panel exists, which no schedule can remove. **There is no scalar-issue
+starvation and no lingering barrier in steady state.**
+
+The gap sweep is what makes that a finding rather than an artifact:
+
+| gap | busy | idle | bubbles |
+| ---: | ---: | ---: | ---: |
+| 16 | 51,160 | 19,190 | 842 |
+| 64 | 65,627 | 4,723 | 4 |
+| 256 | 65,714 | 4,636 | 3 |
+| 1024 | 66,775 | 3,575 | 1 |
+
+The 842 bubbles at gap 16 are sub-16-tick spacings between individual
+instructions, not structural stalls; from 64 up the count is 1 to 4 and
+occupancy is stable at 93-95%.
+
+### 6c. The Deferred Wait is measurable, and it amortises
+
+The steady-state MTE2 ingress bursts at ticks 20337, 23023, 36713 and 39405
+all fall inside that unbroken VECTOR interval, which is the intent of deferring
+the wait. The stronger evidence is the trend with strip count, since a fixed
+prologue cost should amortise:
+
+| | 4 strips | 8 strips |
+| --- | ---: | ---: |
+| AIV0 MTE2 hidden behind VECTOR | 52.5% | **76.5%** |
+| Cube CUBE hidden behind VECTOR | 28.6% | **50.5%** |
+
+### 6d. And there is nothing left to overlap
+
+AIV0's VECTOR holds 48,386 of the block's roughly 50,000 pipe instructions at
+four strips. The Cube holds 136 and AIV0's MTE2 holds 23 -- 59 ticks of busy
+time out of 72,617. The overlap percentages are capped by that distribution,
+not by scheduling, and 59 ticks cannot be hidden into significance however
+well they are scheduled.
+
+That is the end of this line of optimisation. The remaining work on AIV0 is
+the recurrence itself: `select_query`'s per-row issue, `Exp`, the reductions
+in `update_denominator`, and the ~150 `RV_VLDI` per row that survive the tree.
+None of it is a scheduling problem.
+
+## 7. Gate status
 
 | gate | state |
 | --- | --- |
