@@ -560,6 +560,11 @@ from phase 4, reused.
 | --- | ---: | ---: | ---: |
 | pages 4, K 1, 16-token pages | 73,728 | **62,887** | **-14.70%** |
 | pages 8, K 1, 16-token pages | 139,110 | **117,428** | **-15.59%** |
+| S = 127 of 128, 128-token page | 140,621 | **120,745** | **-14.14%** |
+
+The ragged rung gains too, which is the expected shape rather than a surprise:
+seven of its eight strips are full and take the widened aligned path, and only
+the last one is masked.
 
 Both read from the run logs, not transcribed from §3a. One widened phase out of
 five is worth about as much as the whole DataBlock tree was.
@@ -612,13 +617,21 @@ to 5, which are still per row.
 | bit-identity against the pre-change run | **PASS**, margin lines character-identical |
 | §1a strip-stream token model | **PASS**, unchanged -- the schedule was not touched |
 | §6.6 cross-core fence audit | **PASS**, 16 self-test controls |
-| `tails` (ragged, masked path) | **NOT RUN** |
-| `wide` (128-token pages, 32 strips) | **NOT RUN** |
+| CAModel `tails`: S = 1, S = 113, S = 127 at 128-token pages | **PASS**, 0 channels over tolerance on every rung |
+| `wide` (128-token pages over more than one page, 32 strips) | **NOT RUN** |
 | physical NPU | **UNAVAILABLE** on this host |
 
 The masked path was not modified and its operands still start at the base of
-each widened slot, so it is unaffected by construction -- but `tails` is the
-rung that would show it, and it has not been run.
+each widened slot, so it is unaffected by construction -- and `tails` is the
+rung that shows it: all three pass, S = 1 exactly (one live token, every margin
+0.00000x).
+
+`wide` remains the standing gap, as it was before this change: no rung anywhere
+in this report has run 128-token pages over more than ONE page. What that
+geometry adds over `tails` is the multi-page block-table walk at 32 strips.
+This change is per-strip arithmetic and does not vary with strip count or page
+geometry, so the risk it carries there is low -- but low is not measured, and
+it is recorded here as not run rather than as covered.
 
 ### 8e. What this says about the rest
 
