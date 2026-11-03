@@ -51,5 +51,34 @@ class AuditTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'reserved'):
             places([row('SET_FLAG', 1, route.replace('SCALAR', 'MTE2'))], lambda r: r['tick'])
 
+    # BiSheng schedules either direction of its reserved VEC/SCALAR pair
+    # depending on the body length, so both are permitted -- and only those
+    # two. The widening must not become "any route may carry a reserved id",
+    # and must not exempt an id-7 route from the capacity-one lifetime audit.
+    def test_compiler_reserved_reverse_route(self):
+        route = 'PIPE:SCALAR, TRIGGER PIPE:VEC, FLAG ID:0x7,'
+        places([row('SET_FLAG', 1, route), row('WAIT_FLAG', 2, route)], lambda r: r['tick'])
+
+    def test_compiler_reserved_reverse_route_other_pipe_rejected(self):
+        route = 'PIPE:SCALAR, TRIGGER PIPE:MTE2, FLAG ID:0x7,'
+        with self.assertRaisesRegex(ValueError, 'reserved'):
+            places([row('SET_FLAG', 1, route), row('WAIT_FLAG', 2, route)], lambda r: r['tick'])
+
+    def test_other_reserved_id_still_rejected(self):
+        route = 'PIPE:VEC, TRIGGER PIPE:SCALAR, FLAG ID:0xb,'
+        with self.assertRaisesRegex(ValueError, 'reserved'):
+            places([row('SET_FLAG', 1, route), row('WAIT_FLAG', 2, route)], lambda r: r['tick'])
+
+    def test_compiler_reserved_route_leak_rejected(self):
+        for route in ('PIPE:VEC, TRIGGER PIPE:SCALAR, FLAG ID:0x7,',
+                      'PIPE:SCALAR, TRIGGER PIPE:VEC, FLAG ID:0x7,'):
+            with self.assertRaisesRegex(ValueError, 'nonempty final marking'):
+                places([row('SET_FLAG', 1, route)], lambda r: r['tick'])
+            with self.assertRaisesRegex(ValueError, 'double SET'):
+                places([row('SET_FLAG', 1, route), row('SET_FLAG', 2, route)],
+                       lambda r: r['tick'])
+            with self.assertRaisesRegex(ValueError, 'WAIT without token'):
+                places([row('WAIT_FLAG', 1, route)], lambda r: r['tick'])
+
 
 if __name__ == '__main__': unittest.main()

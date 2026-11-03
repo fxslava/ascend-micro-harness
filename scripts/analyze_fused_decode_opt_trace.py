@@ -19,9 +19,13 @@ def places(rows, order):
         if op not in ('SET_FLAG', 'WAIT_FLAG'): continue
         key = flag_key(row)
         # CANN ArithProgression has __in_pipe__(S) __out_pipe__(V,S).
-        # BiSheng emits reserved V->Scalar id 7 around those VF calls.
-        # No user event allocator owns this id. Still audit its full lifetime.
-        compiler_event = key == ('VEC', 'SCALAR', 7)
+        # BiSheng emits reserved id 7 around those VF calls on either
+        # direction of that one VEC/SCALAR pair; which directions appear
+        # depends on how it schedules the body, so a long enough loop shows
+        # both (N=12 emits V->S only, N=16 emits both). No user event
+        # allocator owns this id, and no other pipe pair may carry it.
+        # Still audit each route's full lifetime below.
+        compiler_event = key in (('VEC', 'SCALAR', 7), ('SCALAR', 'VEC', 7))
         if '?' in key or not (0 <= key[2] <= 5 or compiler_event):
             raise ValueError(f'invalid/reserved user flag route {key}')
         if op == 'SET_FLAG':
