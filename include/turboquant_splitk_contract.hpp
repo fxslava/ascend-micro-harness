@@ -43,17 +43,42 @@ struct RowState {
 constexpr std::uint32_t kMaxStateRows = 16;
 constexpr std::uint32_t kPartitionFloats = kMaxStateRows * kRecordFloats;
 
-// The grid bound an in-launch reduction imposes. `AscendC::SyncAll<false>()`
-// is a barrier across the LAUNCHED blocks, and on dav-3510 it only completes
-// if every one of them is resident at the same time: a grid that runs in two
+// The grid bound an in-launch reduction imposes. `AscendC::SyncAll` is a
+// barrier across the LAUNCHED blocks, and on dav-3510 it only completes if
+// every one of them is resident at the same time: a grid that runs in two
 // hardware waves parks wave 0 on the barrier while wave 1 has not been
 // scheduled yet, and the launch hangs rather than returning a wrong answer.
 // So a split launch, which is the only configuration that reaches the barrier,
-// is capped at the physical AI Core block count.
+// is capped at the number of blocks one hardware wave holds.
+//
+// WHAT A BLOCK IS, AND WHY THE BOUND IS 64 RATHER THAN 32
+//
+// The only operator that reaches this barrier is the Vector Split-K decode,
+// and it is `KERNEL_TYPE_AIV_ONLY`. On an AIV-only launch a block IS a vector
+// subcore, not an AI Core cluster: dav-3510 has 32 Cube cores and each of them
+// fronts TWO vector subcores, so a single wave spans 64 independent blocks.
+// The CAModel for `Ascend950PR_9599` enumerates exactly that -- 32 clusters of
+// `cubecore0`, `veccore0`, `veccore1`, 96 cores in all, 64 of them AIV -- and
+// `reports/decode_ring_pipeline/summary.json` records 95 idle cores beside the
+// one this harness's single-block probes drive.
+//
+// 32 was the bound this header shipped with, and it came from the AI Core
+// block count, which is the right number for a `KERNEL_TYPE_MIX_AIC_1_2`
+// operator and the wrong one here. It cost half the machine and it put
+// K = 16 at H = 4, B = 1 and K = 8 at B = 2 out of reach for no hardware
+// reason. The barrier the Vector kernel raises is `SYNC_AIV_ONLY_ALL`
+// (`SyncAll<true>`, the `isAIVOnly` specialization), which is the AIV-only
+// participant set and has no Cube core in it to wait for.
+//
+// A MIX operator that ever wants an in-launch barrier needs the cluster count
+// instead, so it does not get to borrow this constant: it is named for the
+// engine whose wave it describes.
 //
 // A single-split launch never reaches the barrier -- it emits its context
 // directly from the decode pass -- and so is not bounded here.
-constexpr std::uint32_t kMaxCoResidentBlocks = 32;
+constexpr std::uint32_t kAivSubcoresPerCluster = 2;
+constexpr std::uint32_t kAiCoreClusters = 32;
+constexpr std::uint32_t kMaxAivBlocks = kAiCoreClusters * kAivSubcoresPerCluster;
 
 #if defined(__CCE_AICORE__)
 __aicore__
@@ -62,7 +87,7 @@ constexpr bool GridFitsOneWave(std::uint32_t requests, std::uint32_t heads,
                                std::uint32_t splits)
 {
     return splits <= 1u ||
-           static_cast<std::uint64_t>(requests) * heads * splits <= kMaxCoResidentBlocks;
+           static_cast<std::uint64_t>(requests) * heads * splits <= kMaxAivBlocks;
 }
 
 // Floats the host must allocate, and the task's own offset inside them. The
@@ -128,6 +153,21 @@ constexpr PageRange Partition(std::uint32_t pages, std::uint32_t splits,
     const std::uint32_t remaining = begin < pages ? pages - begin : 0u;
     return {begin, remaining < width ? remaining : width};
 }
+
+// The grid bound as a compile-time object rather than a comment, so a later
+// edit that renumbers it has to break a build. The three rungs below are the
+// shapes the 64-block wave is for: K = 16 at H = 4 B = 1, K = 8 at B = 2, and
+// the largest grid any legal operand triple can reach, which must still fit.
+static_assert(kMaxAivBlocks == 64u, "dav-3510: 32 clusters x 2 AIV subcores");
+static_assert(GridFitsOneWave(1, 4, 16), "K=16 at H=4, B=1 is a 64-block grid");
+static_assert(GridFitsOneWave(2, 4, 8), "K=8 at H=4, B=2 is a 64-block grid");
+static_assert(!GridFitsOneWave(2, 4, 16), "a 128-block split grid spans two waves");
+static_assert(GridFitsOneWave(1, 4, 1) && GridFitsOneWave(64, 4, 1),
+              "a single-split launch never reaches the barrier");
+// The split axis alone can never overflow the wave, so a one-head, one-request
+// launch is admissible at every K the ABI accepts.
+static_assert(kMaxSplits <= kMaxAivBlocks && GridFitsOneWave(1, 1, kMaxSplits),
+              "the maximum split count must fit one wave on its own");
 
 static_assert(sizeof(RowState) == kRecordFloats * sizeof(float), "row ABI");
 static_assert(kRecordFloats * sizeof(float) % 32 == 0,

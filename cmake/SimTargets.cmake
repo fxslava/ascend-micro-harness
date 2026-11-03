@@ -302,6 +302,12 @@ function(add_ascend_micro_sim_targets)
       tests/npu/bench/bench_turboquant_decode_splitk.cpp)
   add_executable(test_splitk_decode_probe tests/cpu/test_splitk_decode_probe.cpp)
   target_compile_options(test_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
+  # Host-only, and it needs no simulator: the AIV single-wave grid bound (the
+  # one declaration the device guard and the host launcher share) and the two
+  # egress oracles checked against each other through the dense rotation.
+  # scripts/run_reshape_wave_host_gate.sh runs it where there is no toolkit.
+  add_executable(test_splitk_grid_bound tests/cpu/test_splitk_grid_bound.cpp)
+  target_compile_options(test_splitk_grid_bound PRIVATE -Wall -Wextra -Werror)
   add_executable(test_aic_splitk_decode_probe tests/cpu/test_aic_splitk_decode_probe.cpp)
   target_compile_options(test_aic_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
   target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM)

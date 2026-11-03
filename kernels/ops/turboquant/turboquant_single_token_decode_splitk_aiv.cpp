@@ -502,6 +502,33 @@ __simd_vf__ inline void BroadcastDenominators(__ubuf__ float* dst,
 // issue four register loads and four stores per row and not one more.
 // RegShuffle is ingress-only by construction, so Egress has one measured
 // winner and the kernel takes it.
+//
+// EGRESS_UNROTATE: whether Pi^T is applied here or absorbed downstream
+// ---------------------------------------------------------------------
+// `true` is the operator's standing contract and the default: the context
+// leaves in the model's own channel basis, which is what every existing
+// caller and every existing oracle expects.
+//
+// `false` publishes the context in the CACHE's rotated basis instead, with the
+// butterfly gather gone from the instruction stream entirely. It is for a
+// caller that has folded Pi^T into whatever reads the context next -- an
+// absorbed output projection, W_o' = Pi^T W_o, or a SwiGLU gate fused on the
+// rotated vector. Pi is orthogonal, so that is exact rather than approximate,
+// but it is also NOT the same tensor: a caller that takes this leg and then
+// multiplies by an unabsorbed W_o gets a plausible, silently wrong answer, for
+// the same reason this routine's own ingress/egress stride order does. Hence a
+// separate `__global__` symbol rather than a runtime flag -- a caller has to
+// name the basis it wants at the call site.
+//
+// The arena is deliberately NOT re-laid-out for the bypass. Every offset above
+// is a compile-time constant shared by both instantiations, so the 32-byte
+// bases, the ring bank skew (AKA3003), the per-slot scale landings and the
+// 256-byte register read pad are the ones already asserted, verbatim, on both
+// legs; `kUbRotated` and `kUbSign` simply go unread when the rotation does.
+// Shrinking the arena to reclaim those 8 KiB of a 192 KiB window would make
+// the two legs' addresses differ, which is exactly the thing that would make a
+// difference between them uninterpretable.
+template <bool EGRESS_UNROTATE = true>
 __aicore__ inline void Egress(const Geometry& geom)
 {
     const std::uint32_t lanes = geom.rows * kHeadSize;
@@ -519,14 +546,22 @@ __aicore__ inline void Egress(const Geometry& geom)
 
     // All `rows` rows in one VF entry: the sign registers and the index
     // tables are built once per call rather than once per row.
-    ascend_micro::rotate_butterfly_gather_vf<ascend_micro::RotateDirection::Egress>(
-        reinterpret_cast<__ubuf__ float*>(
-            View<float>(kUbRotated, kMaxRows * kHeadSize).GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(
-            View<float>(kUbNorm, kMaxRows * kHeadSize).GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbSign, kHeadSize).GetPhyAddr()),
-        kRotOrthoScale, static_cast<std::uint16_t>(geom.rows));
-    AscendC::PipeBarrier<PIPE_V>();
+    //
+    // `kUbNorm` is the normalized accumulator in the cache's rotated basis and
+    // `kUbRotated` is it after Pi^T. The gate below reads whichever of the two
+    // this leg produced, so the bypass is one `if constexpr` and not a second
+    // copy of the gate chain.
+    if constexpr (EGRESS_UNROTATE) {
+        ascend_micro::rotate_butterfly_gather_vf<ascend_micro::RotateDirection::Egress>(
+            reinterpret_cast<__ubuf__ float*>(
+                View<float>(kUbRotated, kMaxRows * kHeadSize).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(
+                View<float>(kUbNorm, kMaxRows * kHeadSize).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(View<float>(kUbSign, kHeadSize).GetPhyAddr()),
+            kRotOrthoScale, static_cast<std::uint16_t>(geom.rows));
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    constexpr std::uint32_t kEgressSource = EGRESS_UNROTATE ? kUbRotated : kUbNorm;
 
     // out = y . sigmoid(gate) = y / (1 + exp(-gate)), over all rows at once --
     // the level-2 continuous form takes a plain element count, so the whole
@@ -546,7 +581,7 @@ __aicore__ inline void Egress(const Geometry& geom)
                   static_cast<std::int32_t>(lanes));
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Div<float, kDecodePreciseDiv>(
-        View<float>(kUbGateB, lanes), View<float>(kUbRotated, lanes),
+        View<float>(kUbGateB, lanes), View<float>(kEgressSource, lanes),
         View<float>(kUbGateA, lanes), static_cast<std::int32_t>(lanes));
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Cast(View<bfloat16_t>(kUbContext, lanes), View<float>(kUbGateB, lanes),
@@ -615,6 +650,7 @@ __aicore__ inline void StoreContext(const AscendC::GlobalTensor<bfloat16_t>& out
 // that goes on to reduce must publish its census once, at the end, with every
 // field final: two `FinishMetric` calls would leave the second overwriting the
 // export measurement this one exists to take.
+template <bool EGRESS_UNROTATE = true>
 __aicore__ inline std::uint64_t ExportPartial(
     const AscendC::GlobalTensor<float>& workspace,
     const AscendC::GlobalTensor<bfloat16_t>& out_context, std::uint32_t item,
@@ -622,7 +658,7 @@ __aicore__ inline std::uint64_t ExportPartial(
 {
     const auto export_begin = static_cast<std::uint64_t>(AscendC::GetSystemCycle());
     if (splits == 1u) {
-        Egress(geom);
+        Egress<EGRESS_UNROTATE>(geom);
         StoreContext(out_context, head_item, geom);
         return static_cast<std::uint64_t>(AscendC::GetSystemCycle()) - export_begin;
     }
@@ -666,6 +702,7 @@ __aicore__ inline std::uint64_t ExportPartial(
 // overlapping with the merge of record i. The two retired key pages are the
 // slots; the ring is primed, drained and capacity-one on both routes,
 // including the slot a K below the ring depth never fills.
+template <bool EGRESS_UNROTATE = true>
 __aicore__ inline void ReduceHead(const AscendC::GlobalTensor<float>& workspace,
                                   const AscendC::GlobalTensor<float>& gate,
                                   const AscendC::GlobalTensor<bfloat16_t>& out_context,
@@ -732,9 +769,10 @@ __aicore__ inline void ReduceHead(const AscendC::GlobalTensor<float>& workspace,
     for (std::uint32_t slot = 0; slot < kStageDepth; ++slot)
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtRecordFree + slot);
 
-    Egress(geom);
+    Egress<EGRESS_UNROTATE>(geom);
     StoreContext(out_context, head_item, geom);
 }
+template <bool EGRESS_UNROTATE = true>
 __aicore__ inline std::uint64_t ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_rot,
                                    const AscendC::GlobalTensor<std::int8_t>& key_cache,
                                    const AscendC::GlobalTensor<std::int8_t>& value_cache,
@@ -910,14 +948,19 @@ __aicore__ inline std::uint64_t ProcessItem(const AscendC::GlobalTensor<bfloat16
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtScaleFree + slot);
     }
 
-    return ExportPartial(workspace, out_context, item,
+    return ExportPartial<EGRESS_UNROTATE>(workspace, out_context, item,
                          request * geom.num_kv_heads + head, splits, geom);
 }
 
 
-}  // namespace turboquant_splitk_device
-
-extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
+// ----------------------------------------------------- the launch body
+// One body, two `__global__` symbols, differing in NOTHING but the egress
+// basis: same guards, same grid bound, same ring, same drain. That is the
+// §6.6 discipline of REFINEMENT_OF_COMBAT_KERNELS.md applied to a numerical
+// policy rather than to a flag policy -- if the two legs ever disagree about
+// anything but the rotation, the schedule is not what isolates it.
+template <bool EGRESS_UNROTATE>
+__aicore__ inline void SplitkDecodeBody(
     __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
     __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
     __gm__ float* signs, __gm__ float* workspace,
@@ -926,9 +969,6 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
     uint32_t block_size, uint32_t cache_pages, uint32_t pages,
     uint32_t splits, uint32_t seq_len)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    AscendC::InitSocState();
-    using namespace turboquant_splitk_device;
     // Every guard below is a function of the launch operands alone, so all
     // blocks evaluate it identically and either all of them return or none
     // does. That is what makes the barrier further down safe to place after
@@ -965,12 +1005,18 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
     gate_tensor.SetGlobalBuffer(gate);
     pi_signs.SetGlobalBuffer(signs);
     partials.SetGlobalBuffer(workspace);
-    AscendC::DataCopy(View<float>(kUbSign, kHeadSize), pi_signs, kHeadSize);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+    // Pi's sign diagonal is an egress operand and nothing else reads it, so the
+    // leg that absorbs Pi^T downstream does not fetch it. The `signs` operand
+    // stays in the ABI: one signature serves both symbols, and a caller that
+    // switches legs changes the entry point rather than its argument list.
+    if constexpr (EGRESS_UNROTATE) {
+        AscendC::DataCopy(View<float>(kUbSign, kHeadSize), pi_signs, kHeadSize);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+    }
     const auto export_region =
-        ProcessItem(q, key_cache, value_cache, scale_cache, table, gate_tensor,
-                    partials, context, splits, item,
+        ProcessItem<EGRESS_UNROTATE>(q, key_cache, value_cache, scale_cache, table,
+                    gate_tensor, partials, context, splits, item,
                     head_item / heads, head_item % heads, geom);
 
     bool reduced = false;
@@ -999,7 +1045,9 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
         // different head -- and has to re-establish every buffer the egress
         // reads.
         reduced = item < requests * heads;
-        if (reduced) ReduceHead(partials, gate_tensor, context, item, splits, geom);
+        if (reduced)
+            ReduceHead<EGRESS_UNROTATE>(partials, gate_tensor, context, item, splits,
+                                        geom);
     }
     // Once per block, with every field final: the fused worker and the
     // reducer are the two that wrote this head's context.
@@ -1008,13 +1056,61 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
                  splits == 1u || reduced, geom.seq_pages, export_region);
 }
 
+}  // namespace turboquant_splitk_device
+
+// The standing contract: the context arrives in the model's channel basis.
+extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
+    __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
+    __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
+    __gm__ float* signs, __gm__ float* workspace,
+    __gm__ turboquant_splitk::WorkerMetrics* metrics, __gm__ bfloat16_t* out,
+    uint32_t requests, uint32_t heads, uint32_t rows,
+    uint32_t block_size, uint32_t cache_pages, uint32_t pages,
+    uint32_t splits, uint32_t seq_len)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::InitSocState();
+    turboquant_splitk_device::SplitkDecodeBody<true>(
+        q_rot, key, value, scales, table, gate, signs, workspace, metrics, out,
+        requests, heads, rows, block_size, cache_pages, pages, splits, seq_len);
+}
+
+// EGRESS_UNROTATE = false: the context arrives in the CACHE's rotated basis,
+// Pi . ctx, with the butterfly gather absent from the instruction stream. For
+// a caller that has absorbed Pi^T into what reads the context next -- an
+// output projection W_o' = Pi^T W_o, or a SwiGLU gate fused on the rotated
+// vector. Feeding it to an UNabsorbed consumer is a silent wrong answer, not a
+// fault, which is why it is a symbol of its own.
+extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_rotated_aiv(
+    __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
+    __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
+    __gm__ float* signs, __gm__ float* workspace,
+    __gm__ turboquant_splitk::WorkerMetrics* metrics, __gm__ bfloat16_t* out,
+    uint32_t requests, uint32_t heads, uint32_t rows,
+    uint32_t block_size, uint32_t cache_pages, uint32_t pages,
+    uint32_t splits, uint32_t seq_len)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::InitSocState();
+    turboquant_splitk_device::SplitkDecodeBody<false>(
+        q_rot, key, value, scales, table, gate, signs, workspace, metrics, out,
+        requests, heads, rows, block_size, cache_pages, pages, splits, seq_len);
+}
+
 // Diagnostic entry uses the production ProcessItem and export path unchanged.
 // Selects one logical-page/strip window without rebasing the block table.
 //
 // It launches one block at splits = 1, so it takes the fused path: no
 // partition is written, no barrier is entered, and the workspace operand is
 // present only to keep one signature between this entry and production.
-extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
+//
+// Templated on the egress basis for the same reason production is: the
+// isolated head/middle/tail canaries of REFINEMENT_OF_COMBAT_KERNELS.md §3 are
+// the gate the rotation bypass has to pass, and a probe that can only run the
+// rotating leg cannot be that gate.
+namespace turboquant_splitk_device {
+template <bool EGRESS_UNROTATE>
+__aicore__ inline void SplitkBoundaryBody(
     __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
     __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
     __gm__ float* signs, __gm__ float* workspace,
@@ -1022,9 +1118,6 @@ extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
     uint32_t head, uint32_t rows, uint32_t page_begin, uint32_t page_count,
     uint32_t strips, uint32_t strip_begin)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    AscendC::InitSocState();
-    using namespace turboquant_splitk_device;
     if (head >= 4u || rows == 0u || rows > kMaxRows || page_begin >= 8u ||
         page_count == 0u || page_count > 8u - page_begin || strips == 0u ||
         strips > 8u || strip_begin > 8u - strips) return;
@@ -1045,14 +1138,47 @@ extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
     gates.SetGlobalBuffer(gate);
     sign_tensor.SetGlobalBuffer(signs);
     partials.SetGlobalBuffer(workspace);
-    AscendC::DataCopy(View<float>(kUbSign, kHeadSize), sign_tensor, kHeadSize);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+    if constexpr (EGRESS_UNROTATE) {
+        AscendC::DataCopy(View<float>(kUbSign, kHeadSize), sign_tensor, kHeadSize);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtIngressReady);
+    }
     const auto export_region =
-        ProcessItem(q, keys, values, scale_tensor, table, gates, partials,
-                    context, 1u, head, 0u, head, geom);
+        ProcessItem<EGRESS_UNROTATE>(q, keys, values, scale_tensor, table, gates,
+                    partials, context, 1u, head, 0u, head, geom);
     FinishMetric(metrics + head, turboquant_splitk::kNoPartition, false, true,
                  page_count, export_region);
+}
+}  // namespace turboquant_splitk_device
+
+extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
+    __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
+    __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
+    __gm__ float* signs, __gm__ float* workspace,
+    __gm__ turboquant_splitk::WorkerMetrics* metrics, __gm__ bfloat16_t* out,
+    uint32_t head, uint32_t rows, uint32_t page_begin, uint32_t page_count,
+    uint32_t strips, uint32_t strip_begin)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::InitSocState();
+    turboquant_splitk_device::SplitkBoundaryBody<true>(
+        q_rot, key, value, scales, table, gate, signs, workspace, metrics, out,
+        head, rows, page_begin, page_count, strips, strip_begin);
+}
+
+extern "C" __global__ __aicore__ void turboquant_splitk_boundary_rotated_aiv(
+    __gm__ bfloat16_t* q_rot, __gm__ std::int8_t* key, __gm__ std::int8_t* value,
+    __gm__ float* scales, __gm__ uint32_t* table, __gm__ float* gate,
+    __gm__ float* signs, __gm__ float* workspace,
+    __gm__ turboquant_splitk::WorkerMetrics* metrics, __gm__ bfloat16_t* out,
+    uint32_t head, uint32_t rows, uint32_t page_begin, uint32_t page_count,
+    uint32_t strips, uint32_t strip_begin)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::InitSocState();
+    turboquant_splitk_device::SplitkBoundaryBody<false>(
+        q_rot, key, value, scales, table, gate, signs, workspace, metrics, out,
+        head, rows, page_begin, page_count, strips, strip_begin);
 }
 
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
@@ -1068,13 +1194,21 @@ extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_aiv(
     uint32_t, uint32_t, uint32_t, uint32_t,
     uint32_t, uint32_t, uint32_t, uint32_t);
 
-extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
-    void* stream, std::uint16_t* q_rot, std::int8_t* key, std::int8_t* value,
-    float* scales, std::uint32_t* table, float* gate, float* signs,
-    float* workspace, turboquant_splitk::WorkerMetrics* metrics,
-    std::uint16_t* out, std::uint32_t requests, std::uint32_t heads,
-    std::uint32_t rows, std::uint32_t block_size, std::uint32_t cache_pages,
-    std::uint32_t pages, std::uint32_t splits, std::uint32_t seq_len)
+extern "C" __global__ __aicore__ void turboquant_single_token_decode_splitk_rotated_aiv(
+    __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
+    __gm__ uint32_t*, __gm__ float*, __gm__ float*, __gm__ float*,
+    __gm__ turboquant_splitk::WorkerMetrics*, __gm__ bfloat16_t*,
+    uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t);
+
+// Both legs refuse the same launches, in the same order, with the same
+// messages, because this is one function rather than two copies: a bound that
+// held on one symbol and not on the other would be a hang on whichever leg was
+// forgotten.
+namespace {
+void splitk_launch_gates(std::uint32_t requests, std::uint32_t heads,
+                         std::uint32_t pages, std::uint32_t block_size,
+                         std::uint32_t splits, std::uint32_t seq_len)
 {
     // 0 means "the whole allocation is live", the pre-tail contract. Anything
     // else must fit the pages the caller says it allocated; the device returns
@@ -1090,14 +1224,50 @@ extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
     if (!turboquant_splitk::GridFitsOneWave(requests, heads, splits))
         throw std::invalid_argument(
             "single_token_decode_splitk: a split launch must fit one hardware "
-            "wave (requests * heads * splits <= kMaxCoResidentBlocks)");
+            "wave (requests * heads * splits <= kMaxAivBlocks)");
+}
+}  // namespace
+
+extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
+    void* stream, std::uint16_t* q_rot, std::int8_t* key, std::int8_t* value,
+    float* scales, std::uint32_t* table, float* gate, float* signs,
+    float* workspace, turboquant_splitk::WorkerMetrics* metrics,
+    std::uint16_t* out, std::uint32_t requests, std::uint32_t heads,
+    std::uint32_t rows, std::uint32_t block_size, std::uint32_t cache_pages,
+    std::uint32_t pages, std::uint32_t splits, std::uint32_t seq_len)
+{
+    splitk_launch_gates(requests, heads, pages, block_size, splits, seq_len);
     turboquant_single_token_decode_splitk_aiv<<<requests * heads * splits,
                                              nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(q_rot), key, value, scales, table, gate, signs,
         workspace, metrics, reinterpret_cast<bfloat16_t*>(out), requests, heads, rows,
         block_size, cache_pages, pages, splits, seq_len);
 }
+
+// EGRESS_UNROTATE = false. Same grid, same gates, same operand list; the
+// emitted context is Pi . ctx rather than ctx. See the device symbol.
+extern "C" void launch_turboquant_single_token_decode_splitk_rotated_aiv(
+    void* stream, std::uint16_t* q_rot, std::int8_t* key, std::int8_t* value,
+    float* scales, std::uint32_t* table, float* gate, float* signs,
+    float* workspace, turboquant_splitk::WorkerMetrics* metrics,
+    std::uint16_t* out, std::uint32_t requests, std::uint32_t heads,
+    std::uint32_t rows, std::uint32_t block_size, std::uint32_t cache_pages,
+    std::uint32_t pages, std::uint32_t splits, std::uint32_t seq_len)
+{
+    splitk_launch_gates(requests, heads, pages, block_size, splits, seq_len);
+    turboquant_single_token_decode_splitk_rotated_aiv<<<requests * heads * splits,
+                                             nullptr, stream>>>(
+        reinterpret_cast<bfloat16_t*>(q_rot), key, value, scales, table, gate, signs,
+        workspace, metrics, reinterpret_cast<bfloat16_t*>(out), requests, heads, rows,
+        block_size, cache_pages, pages, splits, seq_len);
+}
 extern "C" __global__ __aicore__ void turboquant_splitk_boundary_aiv(
+    __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
+    __gm__ uint32_t*, __gm__ float*, __gm__ float*, __gm__ float*,
+    __gm__ turboquant_splitk::WorkerMetrics*, __gm__ bfloat16_t*,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+
+extern "C" __global__ __aicore__ void turboquant_splitk_boundary_rotated_aiv(
     __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*, __gm__ float*,
     __gm__ uint32_t*, __gm__ float*, __gm__ float*, __gm__ float*,
     __gm__ turboquant_splitk::WorkerMetrics*, __gm__ bfloat16_t*,
@@ -1112,6 +1282,23 @@ extern "C" void launch_turboquant_splitk_boundary_aiv(
     std::uint32_t strip_begin)
 {
     turboquant_splitk_boundary_aiv<<<1, nullptr, stream>>>(
+        reinterpret_cast<bfloat16_t*>(q), key, value, scales, table, gate, signs,
+        workspace, metrics, reinterpret_cast<bfloat16_t*>(out), head, rows, begin,
+        count, strips, strip_begin);
+}
+
+// The section 3 canary probe on the bypass leg. One block, splits = 1, the
+// same window operands: everything the rotating probe isolates, isolated again
+// against a rotated-basis oracle.
+extern "C" void launch_turboquant_splitk_boundary_rotated_aiv(
+    void* stream, std::uint16_t* q, std::int8_t* key, std::int8_t* value,
+    float* scales, std::uint32_t* table, float* gate, float* signs,
+    float* workspace, turboquant_splitk::WorkerMetrics* metrics,
+    std::uint16_t* out, std::uint32_t head, std::uint32_t rows,
+    std::uint32_t begin, std::uint32_t count, std::uint32_t strips,
+    std::uint32_t strip_begin)
+{
+    turboquant_splitk_boundary_rotated_aiv<<<1, nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(q), key, value, scales, table, gate, signs,
         workspace, metrics, reinterpret_cast<bfloat16_t*>(out), head, rows, begin,
         count, strips, strip_begin);

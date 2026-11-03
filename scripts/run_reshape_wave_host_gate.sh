@@ -137,7 +137,24 @@ else
 fi
 
 echo
-echo "=== 7. token/queue models ==="
+# The AIV single-wave grid bound and the pair of egress oracles. The bound is
+# the one declaration the device's early return and the host launcher's refusal
+# share, so compiling it from a host translation unit is the §6.1 gate for it;
+# the oracle check ties the rotated-basis reference to the model-basis one
+# through the dense rotation, before either grades a device run.
+echo "=== 7. split-K grid bound and the two egress oracles ==="
+printf '%-62s ' tests/cpu/test_splitk_grid_bound.cpp
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror -I.        tests/cpu/test_splitk_grid_bound.cpp        -o "${out}/test_splitk_grid_bound" 2> "${out}/gate.err"; then
+    echo OK
+    "${out}/test_splitk_grid_bound" | tail -3 || status=1
+else
+    echo FAIL
+    sed -n '1,40p' "${out}/gate.err"
+    status=1
+fi
+
+echo
+echo "=== 8. token/queue models ==="
 python3 tests/cpu/test_reshape_wave_model.py || status=1
 echo
 python3 tests/cpu/test_decode_ring_model.py | tail -4 || status=1

@@ -8,6 +8,31 @@
 //                     H, one temporal block, and every Global Memory region
 //                     the active tile does not own left as a canary
 //   --no-fixture-check  skip the host fixture validation (it is ~1 s)
+//   --leg L           which rotation specialization to launch:
+//                       contract      INGRESS_ROTATE=1 EGRESS_UNROTATE=1 (default)
+//                       prerotated    INGRESS_ROTATE=0 EGRESS_UNROTATE=1
+//                       rotated-basis INGRESS_ROTATE=0 EGRESS_UNROTATE=0
+//
+// WHAT THE TWO BYPASS LEGS ARE CHECKED AGAINST, AND WHY IT IS THE SAME ORACLE
+//
+// On `prerotated` the harness uploads `GoldenQRot` in bf16 as the query --
+// which is bit for bit the A operand the contract leg's 64 Mmads and Fixpipe
+// produce -- so every downstream golden is UNCHANGED: the scores stay
+// bit-exact, acc stays inside its ULP budget, and the egress oracle is the
+// same one. A prologue bypass that staged the wrong panel, or staged it into
+// the wrong L1 page, cannot agree with that.
+//
+// And `pi_table` is flooded with the canary rather than filled on both bypass
+// legs. That is the isolation claim stated as an input rather than as a trace
+// read: if anything still consumed the rotation table, the A operand would be
+// built out of 0x7FC0BEEF and no score panel would be bit-exact. The same
+// treatment is given to the three Gather tables and the sign diagonal on
+// `rotated-basis`, which is the leg that must not touch them.
+//
+// On `rotated-basis` the egress oracle changes, and only the egress: the
+// pre-gate row is Acc / l itself (the cache's rotated basis, with Pi's 1/16
+// already inside the cached values, so NOT scaled again), and the context is
+// that gated elementwise.
 //
 // Two regimes, and each catches what the other cannot
 // ---------------------------------------------------
@@ -57,6 +82,19 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+
+// INGRESS_ROTATE = 0, EGRESS_UNROTATE = 1.
+extern "C" void launch_camodel_paged_decode_attention_prerotated(
+    void*, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
+    std::uint32_t*, float*, std::uint32_t*, float*, float*, std::uint16_t*,
+    float*, float*, float*, std::uint16_t*, float*, std::uint32_t, std::uint32_t,
+    std::uint32_t);
+// INGRESS_ROTATE = 0, EGRESS_UNROTATE = 0.
+extern "C" void launch_camodel_paged_decode_attention_rotated_basis(
+    void*, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
+    std::uint32_t*, float*, std::uint32_t*, float*, float*, std::uint16_t*,
+    float*, float*, float*, std::uint16_t*, float*, std::uint32_t, std::uint32_t,
+    std::uint32_t);
 
 extern "C" void launch_camodel_paged_decode_attention(
     void*, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
@@ -136,13 +174,34 @@ CanarySweep sweep_inactive(const std::uint32_t* words, std::size_t words_per_blo
 }
 
 // ------------------------------------------------------------------- options
+// The rotation specialization this run launches. `kContract` is the operator's
+// standing behaviour and the default, so a command line from before this
+// option existed means what it did before.
+enum class Leg { kContract, kPrerotated, kRotatedBasis };
+
 struct Options {
     std::uint32_t strips = static_cast<std::uint32_t>(kStrips);
     std::uint32_t strip_begin = 0;
     std::uint32_t block = static_cast<std::uint32_t>(kGrid);  // kGrid == every block
     bool canary = false;
     bool fixture_check = true;
+    Leg leg = Leg::kContract;
 };
+
+// True on the legs whose query arrives already rotated: no prologue, no
+// `pi_table` read, no `out_qrot` write.
+bool ingress_rotates(Leg leg) { return leg == Leg::kContract; }
+// True on the legs that apply Pi^T at the egress.
+bool egress_unrotates(Leg leg) { return leg != Leg::kRotatedBasis; }
+
+const char* leg_name(Leg leg)
+{
+    switch (leg) {
+        case Leg::kPrerotated: return "prerotated";
+        case Leg::kRotatedBasis: return "rotated-basis";
+        default: return "contract";
+    }
+}
 
 std::uint32_t parse_u32(std::string_view text, const char* what)
 {
@@ -170,6 +229,13 @@ Options parse(int argc, char** argv)
             options.block = parse_u32(next("--block"), "--block");
         } else if (flag == "--no-fixture-check") {
             options.fixture_check = false;
+        } else if (flag == "--leg") {
+            const std::string_view value = next("--leg");
+            if (value == "contract") options.leg = Leg::kContract;
+            else if (value == "prerotated") options.leg = Leg::kPrerotated;
+            else if (value == "rotated-basis") options.leg = Leg::kRotatedBasis;
+            else throw std::invalid_argument("--leg must be contract, prerotated "
+                                             "or rotated-basis");
         } else if (flag == "--canary") {
             const auto strip = parse_u32(next("--canary strip"), "--canary strip");
             const auto head = parse_u32(next("--canary head"), "--canary head");
@@ -205,7 +271,8 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "usage error: %s\n", error.what());
         std::fprintf(stderr,
                      "usage: %s [--strips N] [--strip-begin T] [--block B]\n"
-                     "          [--canary T H] [--no-fixture-check]\n",
+                     "          [--canary T H] [--no-fixture-check]\n"
+                     "          [--leg contract|prerotated|rotated-basis]\n",
                      argv[0]);
         return 2;
     }
@@ -300,15 +367,36 @@ int main(int argc, char** argv)
         // tables are read whole by whichever block runs, so they are always
         // real. Head separation comes from the cache slice and the gate.
         auto* q_half = static_cast<std::uint16_t*>(q.host_payload());
-        for (int head = 0; head < kKvHeads; ++head)
+        for (int head = 0; head < kKvHeads; ++head) {
+            // On a bypass leg the operand is Q . Pi, which is exactly the bf16
+            // panel the contract leg's Fixpipe writes to `out_qrot` and reads
+            // back as L0A. Handing it over directly is what makes every
+            // downstream golden the SAME golden.
+            const std::vector<float> prerotated =
+                ingress_rotates(options.leg) ? std::vector<float>{} : GoldenQRot(head);
             for (int row = 0; row < kTokens; ++row)
-                for (int channel = 0; channel < kHeadSize; ++channel)
-                    q_half[(static_cast<std::size_t>(head) * kTokens + row) * kHeadSize +
-                           channel] = float_to_bfloat16_rne(QueryEntry(row, channel));
+                for (int channel = 0; channel < kHeadSize; ++channel) {
+                    const std::size_t at =
+                        static_cast<std::size_t>(row) * kHeadSize + channel;
+                    const float value = ingress_rotates(options.leg)
+                                            ? QueryEntry(row, channel)
+                                            : prerotated[at];
+                    q_half[static_cast<std::size_t>(head) * kTokens * kHeadSize + at] =
+                        float_to_bfloat16_rne(value);
+                }
+        }
 
-        const RotationTable table = BuildRotationTable();
-        std::memcpy(pi_table.host_payload(), table.row_major.data(),
-                    table.row_major.size() * 2);
+        // The rotation table is an INGRESS operand. On a bypass leg nothing
+        // may read it, so it is flooded rather than filled: a prologue that
+        // still ran would build L0A out of 0x7FC0BEEF and not one score panel
+        // would come back bit-exact.
+        if (ingress_rotates(options.leg)) {
+            const RotationTable table = BuildRotationTable();
+            std::memcpy(pi_table.host_payload(), table.row_major.data(),
+                        table.row_major.size() * 2);
+        } else {
+            fill_payload(pi_table, kTileCanary);
+        }
 
         auto* gate_floats = static_cast<float*>(gate.host_payload());
         for (int head = 0; head < kKvHeads; ++head)
@@ -323,21 +411,30 @@ int main(int argc, char** argv)
             table_words[temporal] = static_cast<std::uint32_t>(BlockTableEntry(temporal));
 
         // The three sub-DataBlock egress stages: byte offsets of i ^ stride,
-        // and the sign (i & stride) ? -1 : +1.
-        auto* offsets = static_cast<std::uint32_t*>(gather_offsets.host_payload());
-        auto* signs = static_cast<float*>(gather_signs.host_payload());
-        for (int stage = 0; stage < kEgressGatherCount; ++stage) {
-            const int stride = kEgressGatherStride[stage];
-            for (int i = 0; i < kHeadSize; ++i) {
-                offsets[static_cast<std::size_t>(stage) * kHeadSize + i] =
-                    static_cast<std::uint32_t>((i ^ stride) * 4);
-                signs[static_cast<std::size_t>(stage) * kHeadSize + i] =
-                    (i & stride) ? -1.0f : 1.0f;
+        // and the sign (i & stride) ? -1 : +1. All three tables, and the sign
+        // diagonal, are butterfly operands: on the rotated-basis leg they are
+        // flooded for the same reason `pi_table` is, and a butterfly that ran
+        // anyway would gather through canary offsets rather than quietly agree.
+        if (egress_unrotates(options.leg)) {
+            auto* offsets = static_cast<std::uint32_t*>(gather_offsets.host_payload());
+            auto* signs = static_cast<float*>(gather_signs.host_payload());
+            for (int stage = 0; stage < kEgressGatherCount; ++stage) {
+                const int stride = kEgressGatherStride[stage];
+                for (int i = 0; i < kHeadSize; ++i) {
+                    offsets[static_cast<std::size_t>(stage) * kHeadSize + i] =
+                        static_cast<std::uint32_t>((i ^ stride) * 4);
+                    signs[static_cast<std::size_t>(stage) * kHeadSize + i] =
+                        (i & stride) ? -1.0f : 1.0f;
+                }
             }
+            auto* pi_signs = static_cast<float*>(pi_sign_buffer.host_payload());
+            for (int i = 0; i < kHeadSize; ++i)
+                pi_signs[i] = static_cast<float>(PiSign(i));
+        } else {
+            fill_payload(gather_offsets, kTileCanary);
+            fill_payload(gather_signs, kTileCanary);
+            fill_payload(pi_sign_buffer, kTileCanary);
         }
-        auto* pi_signs = static_cast<float*>(pi_sign_buffer.host_payload());
-        for (int i = 0; i < kHeadSize; ++i)
-            pi_signs[i] = static_cast<float>(PiSign(i));
 
         // Outputs start as canary so an unwritten word is distinguishable from
         // a zero the kernel might legitimately produce.
@@ -369,7 +466,14 @@ int main(int argc, char** argv)
         std::memcpy(scale_snapshot.data(), scale_floats, kScaleCacheFloats * 4);
 
         // --------------------------------------------------------- the launch
-        launch_camodel_paged_decode_attention(
+        // The device symbol is the thing a caller picks; one call site, three
+        // symbols, same operand list.
+        const auto launcher =
+            options.leg == Leg::kContract ? launch_camodel_paged_decode_attention
+            : options.leg == Leg::kPrerotated
+                ? launch_camodel_paged_decode_attention_prerotated
+                : launch_camodel_paged_decode_attention_rotated_basis;
+        launcher(
             session.stream, static_cast<std::uint16_t*>(q.payload()),
             static_cast<std::uint16_t*>(pi_table.payload()),
             static_cast<std::int8_t*>(key_cache.payload()),
@@ -443,6 +547,13 @@ int main(int argc, char** argv)
             static_cast<const std::uint16_t*>(out_context.host_payload());
         const auto* rotated_out = static_cast<const float*>(out_rotated.host_payload());
 
+        // The two halfwords `fill_payload`'s 32-bit canary leaves in a
+        // uint16 view, in memory order. On a bypass leg this is what every
+        // `out_qrot` word must still be.
+        const std::uint16_t qrot_canary[2] = {
+            static_cast<std::uint16_t>(kTileCanary & 0xFFFFu),
+            static_cast<std::uint16_t>(kTileCanary >> 16)};
+
         std::size_t qrot_bad = 0;
         std::size_t score_bad = 0;
         std::uint64_t worst_state_ulp = 0;
@@ -461,10 +572,18 @@ int main(int argc, char** argv)
             const int head = static_cast<int>(block / kTemporalBlocks);
             const GoldenState golden = GoldenDecode(head, window);
 
-            // 1. the 64-Mmad ingress rotation, bit-exactly
+            // 1. the 64-Mmad ingress rotation, bit-exactly -- or, on a
+            //    bypass leg, the absence of it. The prologue is the only thing
+            //    that writes `out_qrot`, so on a leg that does not run it every
+            //    word must come back exactly as the host flooded it. That is a
+            //    stronger statement than a numerical one: a bypass that still
+            //    issued the Fixpipe would land a plausible panel here.
             const std::vector<float> rot = GoldenQRot(head);
             for (std::size_t i = 0; i < rot.size(); ++i) {
-                const std::uint16_t want = float_to_bfloat16_rne(rot[i]);
+                const std::uint16_t want =
+                    ingress_rotates(options.leg)
+                        ? float_to_bfloat16_rne(rot[i])
+                        : qrot_canary[(block * rot.size() + i) % 2];
                 if (qrot_words_out[block * rot.size() + i] != want) ++qrot_bad;
             }
 
@@ -510,7 +629,14 @@ int main(int argc, char** argv)
                     normalized[c] =
                         golden.acc[static_cast<std::size_t>(query) * kHeadSize + c] /
                         golden.l[query];
-                const std::vector<float> want_row = EgressButterfly(normalized.data());
+                // The pre-gate row. On the rotated-basis leg it is Acc / l
+                // itself: Pi's 1/16 is already inside the cached values, so
+                // the rotated basis is NOT scaled again, and a leg that
+                // applied the normalisation twice would land 24 dB low here
+                // rather than merely out of budget.
+                const std::vector<float> want_row =
+                    egress_unrotates(options.leg) ? EgressButterfly(normalized.data())
+                                                  : normalized;
                 for (int c = 0; c < kHeadSize; ++c) {
                     const float got =
                         rotated_out[block * acc_words +
@@ -525,9 +651,26 @@ int main(int argc, char** argv)
             }
 
             // 5b. the fused egress: Acc . Pi gated by sigmoid(gate), in bf16
+            //      -- or, on the rotated-basis leg, Acc / l gated the same way.
+            //      The gate is elementwise and does not commute with Pi, so
+            //      this is a second oracle line and not the first one rotated.
+            std::vector<float> rotated_basis_context;
+            if (!egress_unrotates(options.leg)) {
+                rotated_basis_context.resize(golden.context.size());
+                for (int query = 0; query < kTokens; ++query)
+                    for (int c = 0; c < kHeadSize; ++c) {
+                        const std::size_t at =
+                            static_cast<std::size_t>(query) * kHeadSize + c;
+                        const float g = GateEntry(head, query, c);
+                        rotated_basis_context[at] =
+                            (golden.acc[at] / golden.l[query]) /
+                            (1.0f + std::exp(-g));
+                    }
+            }
             for (std::size_t i = 0; i < golden.context.size(); ++i) {
                 const float want = bfloat16_to_float(float_to_bfloat16_rne(
-                    golden.context[i]));
+                    egress_unrotates(options.leg) ? golden.context[i]
+                                                  : rotated_basis_context[i]));
                 const float got =
                     bfloat16_to_float(context_out[block * context_words * 2 + i]);
                 worst_context_abs =
@@ -576,11 +719,16 @@ int main(int argc, char** argv)
                          transposed_match, nan_count, canary_count);
         }
 
-        expect(qrot_bad == 0, "out_qrot is bit-exact against the host rotation");
+        expect(qrot_bad == 0,
+               ingress_rotates(options.leg)
+                   ? "out_qrot is bit-exact against the host rotation"
+                   : "out_qrot is untouched: the ingress prologue did not run");
         expect(score_bad == 0, "every raw score panel is bit-exact");
-        std::printf("  rotation: %zu/%zu Q_rot entries wrong\n", qrot_bad,
+        std::printf("  rotation: %zu/%zu Q_rot entries %s\n", qrot_bad,
                     (last_block - first_block) *
-                        static_cast<std::size_t>(kTokens) * kHeadSize);
+                        static_cast<std::size_t>(kTokens) * kHeadSize,
+                    ingress_rotates(options.leg) ? "wrong"
+                                                 : "written by a bypassed prologue");
         std::printf("  scores:   %zu/%zu panel entries wrong (bit-exact check)\n",
                     score_bad, (last_block - first_block) *
                                    static_cast<std::size_t>(options.strips) * kScores);
@@ -778,8 +926,8 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "FAIL %d check(s)\n", failures);
         return 1;
     }
-    std::printf("PASS paged decode attention: strips %u from %u",
-                options.strips, options.strip_begin);
+    std::printf("PASS paged decode attention: leg %s, strips %u from %u",
+                leg_name(options.leg), options.strips, options.strip_begin);
     if (options.block < static_cast<std::uint32_t>(kGrid))
         std::printf(", block %u isolated\n", options.block);
     else

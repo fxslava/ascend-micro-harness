@@ -2,12 +2,21 @@
 """Audit the MIX_AIC_1_2 paged decode attention operator from its CAModel traces.
 
 Usage:
-  analyze_paged_decode_trace.py [--strips N] <aiv0_popped> <aiv0_complete>
+  analyze_paged_decode_trace.py [--strips N] [--no-ingress-rotation]
+                                <aiv0_popped> <aiv0_complete>
                                 <aiv1_popped> <aiv1_complete>
                                 <aic_popped>  <aic_complete>
 
 --strips is the strip count the kernel was launched with, 8 if omitted. Every
 per-strip assertion is scaled by it; none is relaxed.
+
+--no-ingress-rotation audits a leg launched with INGRESS_ROTATE = false, where
+the query arrives rotated and the 64-Mmad prologue is not issued. It does not
+RELAX check 0: it changes what that check asks for. The Cube's Mmad floor
+becomes the score GEMM's own count, and the prologue's 64 Mmads must be ABSENT
+-- a total at or above the rotating leg's is a prologue that is still running
+under a flag that says it is not. Every other check is unchanged, because
+nothing else about the schedule is.
 
 Nine numbered checks, each fatal (1b counts with 1):
 
@@ -40,7 +49,10 @@ Nine numbered checks, each fatal (1b counts with 1):
      staging flag from each of the two Vector cores;
   5. the instruction budget: 64 rotation Mmads plus 8 per strip, one Fixpipe
      for the rotated query plus one per strip, and 16 UB -> L1 bursts per
-     strip (a 256-channel bf16 panel is 16 C0 column strips);
+     strip (a 256-channel bf16 panel is 16 C0 column strips). Under
+     --no-ingress-rotation the first two terms of the first two budgets drop to
+     zero and the budgets stay EXACT, so the prologue's absence is a count the
+     run produces rather than a check that was skipped;
   6. no Global Memory store anywhere on the staging core, which is how "the
      dequantised key page never leaves the chip" is proved rather than
      asserted;
@@ -154,7 +166,7 @@ def intersect(a, b):
     return out
 
 
-def kernel_body_ran(v0, v1, c):
+def kernel_body_ran(v0, v1, c, strips=8, ingress_rotation=True):
     """Fail unless all three audited cores actually executed the kernel body.
 
     Checks 1, 1b and 2 below are balance properties: on an empty instruction
@@ -171,14 +183,32 @@ def kernel_body_ran(v0, v1, c):
     the Cube issues Mmads, AIV0 runs the recurrence on the vector pipes.
     """
     counts = {}
+    # On a leg with no ingress rotation the Cube's work is the score GEMM
+    # alone: SCORE_MMADS_PER_STRIP accumulating Mmads per strip and not one
+    # more. Asking for ROTATION_MMADS there would fail a correct run at one
+    # strip and pass it vacuously at eight, which is the opposite of a check.
+    rotation_mmads = ROTATION_MMADS if ingress_rotation else 0
     for name, records in (("AIV0", v0), ("AIV1", v1), ("AIC", c)):
         if name == "AIV1":
             want, what = CV_BURSTS_PER_STRIP, "UB -> L1 staging burst"
             saw = sum(1 for _, (_, _, op) in records.items()
                       if "MOV_UB_TO_L1" in op)
         elif name == "AIC":
-            want, what = ROTATION_MMADS, "Mmad"
+            want = rotation_mmads + SCORE_MMADS_PER_STRIP
+            what = "Mmad"
             saw = sum(1 for _, (_, _, op) in records.items() if "MMAD" in op)
+            if not ingress_rotation:
+                # The prologue is gone, so the Cube's Mmads are the GEMM's and
+                # the count is EXACT rather than a floor. A leg that still ran
+                # the prologue lands 64 above this.
+                expected = SCORE_MMADS_PER_STRIP * strips
+                if saw != expected:
+                    raise SystemExit(
+                        f"AIC issued {saw} Mmad(s) on a leg declared free of "
+                        f"the ingress rotation; {strips} strip(s) of score "
+                        f"GEMM is exactly {expected}. A count "
+                        f"{ROTATION_MMADS} above this is the prologue still "
+                        f"running under a flag that says it is not.")
         else:
             want, what = 1, "vector instruction"
             saw = sum(1 for _, (_, pipe, _) in records.items()
@@ -192,7 +222,8 @@ def kernel_body_ran(v0, v1, c):
                 f"other than 0.")
         counts[name] = saw
     print(f"  all three audited cores ran the kernel body: "
-          f"{counts['AIV1']} staging burst(s), {counts['AIC']} Mmad(s), "
+          f"{counts['AIV1']} staging burst(s), {counts['AIC']} Mmad(s)"
+          f"{'' if ingress_rotation else ' (score GEMM only, no prologue)'}, "
           f"{counts['AIV0']} vector instruction(s)")
 
 
@@ -420,7 +451,7 @@ def busy(records, complete, keep):
 
 
 def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
-         aic_popped, aic_complete, strips):
+         aic_popped, aic_complete, strips, ingress_rotation=True):
     v0_in, v0_out = read(aiv0_popped), read(aiv0_complete)
     v1_in, v1_out = read(aiv1_popped), read(aiv1_complete)
     c_in, c_out = read(aic_popped), read(aic_complete)
@@ -429,7 +460,7 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
           f"ring depth {STAGE_DEPTH}")
 
     # ---- 0. the audited cores are the ones that ran -------------------
-    kernel_body_ran(v0_in, v1_in, c_in)
+    kernel_body_ran(v0_in, v1_in, c_in, strips, ingress_rotation)
 
     # ---- 1. intra-core HardEvent balance ------------------------------
     for name, records in (("AIV0", v0_in), ("AIV1", v1_in), ("AIC", c_in)):
@@ -481,18 +512,22 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
     print(f"  quorum: the Cube waited {strips} flag(s) from each Vector core")
 
     # ---- 5. instruction budget ----------------------------------------
+    # The prologue's terms are 64 Mmads and one Fixpipe; on a leg that does not
+    # run it they are zero, and the budget is still an equality.
+    rotation_mmads = ROTATION_MMADS if ingress_rotation else 0
+    rotation_fixpipes = ROTATION_FIXPIPES if ingress_rotation else 0
     mmads = sum(1 for _, (_, _, op) in c_in.items() if "MMAD" in op)
-    want_mmads = ROTATION_MMADS + SCORE_MMADS_PER_STRIP * strips
+    want_mmads = rotation_mmads + SCORE_MMADS_PER_STRIP * strips
     if mmads != want_mmads:
         raise SystemExit(
-            f"expected {want_mmads} Mmads ({ROTATION_MMADS} rotation + "
+            f"expected {want_mmads} Mmads ({rotation_mmads} rotation + "
             f"{SCORE_MMADS_PER_STRIP} x {strips} score), saw {mmads}"
         )
     fixpipes = sum(1 for _, (_, _, op) in c_in.items() if "FIX_L0C_TO_DST" in op)
-    want_fix = ROTATION_FIXPIPES + strips
+    want_fix = rotation_fixpipes + strips
     if fixpipes != want_fix:
         raise SystemExit(
-            f"expected {want_fix} Fixpipes ({ROTATION_FIXPIPES} rotated query + "
+            f"expected {want_fix} Fixpipes ({rotation_fixpipes} rotated query + "
             f"one per strip), saw {fixpipes}"
         )
     cv_moves = sum(1 for _, (_, _, op) in v1_in.items() if "MOV_UB_TO_L1" in op)
@@ -552,13 +587,13 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
     cv_ticks = dispatch_ticks(v1_in, lambda p, op: "MOV_UB_TO_L1" in op)
     cadence("AIV1 UB->L1 staging bursts", cv_ticks[::CV_BURSTS_PER_STRIP], strips,
             expected=strips)
-    # The score Mmads only: skip the rotation prologue's 64.
+    # The score Mmads only: skip the rotation prologue's, however many it ran.
     mmad_ticks = dispatch_ticks(c_in, lambda p, op: "MMAD" in op)
-    score_mmads = mmad_ticks[ROTATION_MMADS:]
+    score_mmads = mmad_ticks[rotation_mmads:]
     cadence("AIC score Mmad groups", score_mmads[::SCORE_MMADS_PER_STRIP], strips,
             expected=strips)
     fix_ticks = dispatch_ticks(c_in, lambda p, op: "FIX_L0C_TO_DST" in op)
-    cadence("AIC Fixpipe to UB", fix_ticks[ROTATION_FIXPIPES:], strips,
+    cadence("AIC Fixpipe to UB", fix_ticks[rotation_fixpipes:], strips,
             expected=strips)
 
     print("\nmeasured engine overlap (merged in-flight spans)")
@@ -583,9 +618,16 @@ def main(aiv0_popped, aiv0_complete, aiv1_popped, aiv1_complete,
 if __name__ == "__main__":
     args = sys.argv[1:]
     strips = 8
-    if args and args[0] == "--strips":
-        strips = int(args[1])
-        args = args[2:]
+    ingress_rotation = True
+    while args and args[0].startswith("--"):
+        if args[0] == "--strips":
+            strips = int(args[1])
+            args = args[2:]
+        elif args[0] == "--no-ingress-rotation":
+            ingress_rotation = False
+            args = args[1:]
+        else:
+            raise SystemExit(__doc__)
     if len(args) != 6:
         raise SystemExit(__doc__)
-    main(*args, strips)
+    main(*args, strips, ingress_rotation)

@@ -39,17 +39,46 @@ extern "C" void launch_turboquant_single_token_decode_splitk_aiv(
     std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
     std::uint32_t, std::uint32_t, std::uint32_t);
 
+// EGRESS_UNROTATE = false: the same operator with Pi^T absorbed downstream, so
+// the context arrives in the cache's rotated basis.
+extern "C" void launch_turboquant_single_token_decode_splitk_rotated_aiv(
+    void*, std::uint16_t*, std::int8_t*, std::int8_t*, float*, std::uint32_t*,
+    float*, float*, float*, turboquant_splitk::WorkerMetrics*, std::uint16_t*,
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t, std::uint32_t);
+
+// Which egress the rig drives. It selects the launcher AND the oracle line
+// together, from one field, so a rig cannot launch one leg and grade it
+// against the other -- which is the failure that would make a bypass look
+// correct because its oracle was also bypassed.
+enum class Basis { kModel, kRotated };
+
 extern "C" void launch_turboquant_paged_decode_splitk_aic(
     void*, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
     std::uint32_t*, std::uint16_t*, float*, std::uint32_t, std::uint32_t,
     std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
     std::uint32_t, std::uint32_t);
 
+// INGRESS_ROTATE = false: the query arrives rotated, so the 64-Mmad prologue,
+// the `pi_table` read and the `qrot` write are all absent.
+extern "C" void launch_turboquant_paged_decode_splitk_prerotated_aic(
+    void*, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
+    std::uint32_t*, std::uint16_t*, float*, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t);
+
+// Which ingress the Cube rig drives. Like `Basis` on the Vector side it picks
+// the launcher AND what the rig expects of `qrot` from one field, so the rig
+// cannot launch the bypass and then grade it as though the prologue had run.
+enum class Ingress { kRotateHere, kPrerotated };
+
 struct AivRig {
     const Fixture& f;
+    Basis basis;
     Buffer q, key, value, scales, table, gate, signs, workspace, metrics, out;
-    AivRig(const Fixture& fixture, int splits)
-        : f(fixture), q(f.q.size() * 2), key(f.key.size()), value(f.value.size()),
+    AivRig(const Fixture& fixture, int splits, Basis egress = Basis::kModel)
+        : f(fixture), basis(egress), q(f.q.size() * 2), key(f.key.size()),
+          value(f.value.size()),
           scales(f.scales.size() * 4), table((f.table.size() * 4 + 31) / 32 * 32),
           gate(f.gate.size() * 4), signs(f.signs.size() * 4),
           workspace(contract::WorkspaceFloats(f.requests, f.heads, splits) * 4),
@@ -78,7 +107,11 @@ struct AivRig {
     }
     void Launch(aclrtStream stream, int splits)
     {
-        launch_turboquant_single_token_decode_splitk_aiv(stream,
+        const auto launcher =
+            basis == Basis::kModel
+                ? launch_turboquant_single_token_decode_splitk_aiv
+                : launch_turboquant_single_token_decode_splitk_rotated_aiv;
+        launcher(stream,
             static_cast<std::uint16_t*>(q.ptr), static_cast<std::int8_t*>(key.ptr),
             static_cast<std::int8_t*>(value.ptr), static_cast<float*>(scales.ptr),
             static_cast<std::uint32_t*>(table.ptr), static_cast<float*>(gate.ptr),
@@ -210,18 +243,25 @@ struct AivRig {
         }
         std::vector<std::uint16_t> actual(f.q.size());
         out.download(actual);
+        // The oracle for the basis this rig launched in, chosen from the same
+        // field the launcher was. `expected_rotated` is NOT `expected` rotated:
+        // the gate is elementwise and does not commute with Pi, so both lines
+        // are computed independently in FP64 by the fixture.
+        const std::vector<float>& reference =
+            basis == Basis::kModel ? f.expected : f.expected_rotated;
+        const char* basis_name = basis == Basis::kModel ? "model" : "rotated";
         for (std::size_t row = 0; row < actual.size() / kChannels; ++row) {
             float scale = 0;
             for (int c = 0; c < kChannels; ++c)
-                scale = std::max(scale, std::abs(f.expected[row * kChannels + c]));
+                scale = std::max(scale, std::abs(reference[row * kChannels + c]));
             // BF16 rounding consumes at most 1/256 of a row's maximum.
             const float tolerance = 0.005f * scale + 1e-6f;
             for (int c = 0; c < kChannels; ++c) {
                 const auto at = row * kChannels + c;
                 const float got = single_token_decode::bfloat16_to_float(actual[at]);
-                if (!std::isfinite(got) || std::abs(got - f.expected[at]) > tolerance) {
-                    std::fprintf(stderr, "context mismatch row=%zu c=%d got=%.9g ref=%.9g tol=%.9g\n",
-                                 row, c, got, f.expected[at], tolerance);
+                if (!std::isfinite(got) || std::abs(got - reference[at]) > tolerance) {
+                    std::fprintf(stderr, "%s-basis context mismatch row=%zu c=%d got=%.9g ref=%.9g tol=%.9g\n",
+                                 basis_name, row, c, got, reference[at], tolerance);
                     throw std::runtime_error("CPU reference validation failed");
                 }
             }
@@ -233,17 +273,34 @@ struct AivRig {
 struct AicRig {
     const Fixture& f;
     int splits, begin, pages;
+    Ingress ingress;
     Buffer q, pi, key, value, scales, table, qrot, workspace;
     std::vector<splitk_decode_test::AicPartial> reference;
-    AicRig(const Fixture& fixture, int k, int first, int count)
-        : f(fixture), splits(k), begin(first), pages(count), q(f.q.size() * 2),
+    AicRig(const Fixture& fixture, int k, int first, int count,
+           Ingress query_basis = Ingress::kRotateHere)
+        : f(fixture), splits(k), begin(first), pages(count), ingress(query_basis),
+          q(f.q.size() * 2),
           pi(paged_decode::kTableElems * 2), key(f.key.size()), value(f.value.size()),
           scales(f.scales.size() * 4), table((f.table.size() * 4 + 31) / 32 * 32),
           qrot(f.requests * f.heads * k * splitk_decode_test::kAicAccFloats * 2),
           workspace(contract::WorkspaceFloats(f.requests, f.heads, k) * 4)
     {
-        q.upload(splitk_decode_test::AicRawQuery(f));
-        pi.upload(paged_decode::BuildRotationTable().row_major);
+        // On the bypass leg the operand is `f.q`, the rotated query -- which is
+        // exactly what the rotating leg's prologue computes and what this rig
+        // checks `qrot` against. So the partial-state oracle is UNCHANGED
+        // between the two legs, and only the expectation for `qrot` differs.
+        if (ingress == Ingress::kRotateHere)
+            q.upload(splitk_decode_test::AicRawQuery(f));
+        else
+            q.upload(f.q);
+        // The rotation table is an ingress operand. Nothing on the bypass leg
+        // may read it, so it is flooded rather than filled: a prologue that
+        // still ran would build L0A out of the canary and no partial state
+        // would come near the oracle.
+        if (ingress == Ingress::kRotateHere)
+            pi.upload(paged_decode::BuildRotationTable().row_major);
+        else
+            pi.fill_canary();
         key.upload(f.key); value.upload(f.value); scales.upload(f.scales);
         auto padded = f.table; padded.resize(table.bytes / 4, 0); table.upload(padded);
         for (int request = 0; request < f.requests; ++request)
@@ -257,7 +314,11 @@ struct AicRig {
     void Reset() { qrot.fill_canary(); workspace.fill_canary(); }
     void Launch(aclrtStream stream, int)
     {
-        launch_turboquant_paged_decode_splitk_aic(stream,
+        const auto launcher =
+            ingress == Ingress::kRotateHere
+                ? launch_turboquant_paged_decode_splitk_aic
+                : launch_turboquant_paged_decode_splitk_prerotated_aic;
+        launcher(stream,
             static_cast<std::uint16_t*>(q.ptr), static_cast<std::uint16_t*>(pi.ptr),
             static_cast<std::int8_t*>(key.ptr), static_cast<std::int8_t*>(value.ptr),
             static_cast<float*>(scales.ptr), static_cast<std::uint32_t*>(table.ptr),
@@ -288,9 +349,26 @@ struct AicRig {
                 const auto acc_base = item * splitk_decode_test::kAicAccFloats + row * kChannels;
                 const float m = w[record], l = w[record + contract::kStateLanes];
                 require(std::isfinite(m) && std::isfinite(l), "nonfinite AIC partial state");
-                require(std::abs(m - ref.m[row]) <= 2e-6 * std::max(1.0, std::abs(ref.m[row])),
+                // Print the numbers before throwing. A bare `require` on a
+                // tolerance says only that something is out of budget, which
+                // on a 32-strip online softmax is not enough to tell an
+                // accumulated-rounding miss from a wrong window or a stale
+                // panel -- and a six-minute model run that can only say "l is
+                // wrong" is a run mostly wasted.
+                const double m_budget = 2e-6 * std::max(1.0, std::abs(ref.m[row]));
+                const double l_budget = 1e-4 * std::max(1.0, ref.l[row]);
+                if (std::abs(m - ref.m[row]) > m_budget ||
+                    std::abs(l - ref.l[row]) > l_budget)
+                    std::fprintf(stderr,
+                                 "AIC partial state item=%zu row=%d pages=%u: "
+                                 "m got %.9g ref %.9g (err %.3e budget %.3e), "
+                                 "l got %.9g ref %.9g (err %.3e budget %.3e)\n",
+                                 item, row, range.count, m, ref.m[row],
+                                 std::abs(m - ref.m[row]), m_budget, l,
+                                 ref.l[row], std::abs(l - ref.l[row]), l_budget);
+                require(std::abs(m - ref.m[row]) <= m_budget,
                         "AIC partial maximum differs from CPU reference");
-                require(std::abs(l - ref.l[row]) <= 1e-4 * std::max(1.0, ref.l[row]),
+                require(std::abs(l - ref.l[row]) <= l_budget,
                         "AIC partial denominator differs from CPU reference");
                 if (!range.count)
                     require(m == -3e38f && l == 0.0f, "empty AIC split did not write exact neutral state");
@@ -312,9 +390,21 @@ struct AicRig {
                                      item, row, c, got, ref.acc[row * kChannels + c]);
                         throw std::runtime_error("AIC accumulator reference failed");
                     }
-                    if (range.count)
-                        require(qr[acc_base + c] == f.q[(item / splits) * 16 * kChannels + row * kChannels + c],
-                                "AIC query rotation differs from BF16 reference");
+                    if (range.count) {
+                        // The prologue is the only writer of `qrot`, so on the
+                        // bypass leg every word must come back as `Reset`
+                        // flooded it. That is a stronger claim than a
+                        // numerical one: a bypass that still issued the
+                        // Fixpipe would land a plausible panel here.
+                        require(qr[acc_base + c] ==
+                                    (ingress == Ingress::kRotateHere
+                                         ? f.q[(item / splits) * 16 * kChannels +
+                                               row * kChannels + c]
+                                         : 0xAAAAu),
+                                ingress == Ingress::kRotateHere
+                                    ? "AIC query rotation differs from BF16 reference"
+                                    : "qrot was written by a bypassed prologue");
+                    }
                 }
             }
         }

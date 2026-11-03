@@ -5,8 +5,17 @@
 #include <algorithm>
 #include <charconv>
 #include <string_view>
+#include <vector>
 
 extern "C" void launch_turboquant_splitk_boundary_aiv(
+    void*, std::uint16_t*, std::int8_t*, std::int8_t*, float*, std::uint32_t*,
+    float*, float*, float*, turboquant_splitk::WorkerMetrics*,
+    std::uint16_t*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t);
+
+// EGRESS_UNROTATE = false: the same probe with the butterfly gather absent and
+// the context emitted in the cache's rotated basis. `--rotated` selects it.
+extern "C" void launch_turboquant_splitk_boundary_rotated_aiv(
     void*, std::uint16_t*, std::int8_t*, std::int8_t*, float*, std::uint32_t*,
     float*, float*, float*, turboquant_splitk::WorkerMetrics*,
     std::uint16_t*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
@@ -33,8 +42,10 @@ int main(int argc, char** argv)
         using namespace single_token_decode;
         namespace contract = turboquant_splitk;
         unsigned begin = 0, strips = 1, strip_begin = 0, head = 2, rows = 1;
+        bool rotated_basis = false;
         for (int i = 1; i < argc; ++i) {
             const std::string_view flag{argv[i]};
+            if (flag == "--rotated") { rotated_basis = true; continue; }
             check_boundary(i + 1 < argc, "missing option value");
             const auto value = number(argv[++i]);
             if (flag == "--page-begin") begin = value;
@@ -94,7 +105,10 @@ int main(int argc, char** argv)
         }
         std::vector<std::vector<std::uint32_t>> snapshots;
         for (auto* buffer : buffers) { snapshots.push_back(buffer->host); buffer->upload(); }
-        launch_turboquant_splitk_boundary_aiv(session.stream,
+        const auto launcher = rotated_basis
+            ? launch_turboquant_splitk_boundary_rotated_aiv
+            : launch_turboquant_splitk_boundary_aiv;
+        launcher(session.stream,
             static_cast<std::uint16_t*>(q.payload()), static_cast<std::int8_t*>(key.payload()),
             static_cast<std::int8_t*>(value.payload()), static_cast<float*>(scale.payload()),
             static_cast<std::uint32_t*>(table.payload()), static_cast<float*>(gate.payload()),
@@ -104,10 +118,30 @@ int main(int argc, char** argv)
         camodel::check(aclrtSynchronizeStream(session.stream), "boundary synchronize");
         for (auto* buffer : buffers) buffer->download();
         const auto expected = decode_boundary::Oracle(window);
+        // The oracle line for the basis this launch emitted in. `context` is
+        // DenseRotate(Acc / l) . sigmoid(0); `normalized` is Acc / l, so the
+        // rotated-basis line is the same 0.5 with the rotation left out, and
+        // both are exactly representable: every score is 3, l is 16 per strip
+        // and the values are small integers, so the quotient is dyadic and
+        // BYTE-exact rather than merely close. That is what makes a bypass
+        // that silently still rotated -- or one that applied Pi's 1 / 16 twice
+        // -- a failure here and not a rounding difference.
+        std::vector<float> reference(rows * 256);
+        for (unsigned lane = 0; lane < rows * 256; ++lane)
+            reference[lane] = rotated_basis ? expected.normalized[lane] * 0.5f
+                                            : expected.context[lane];
         const auto* context = static_cast<const std::uint16_t*>(out.host_payload());
         for (unsigned lane = 0; lane < rows * 256; ++lane)
-            check_boundary(context[head * rows * 256 + lane] == float_to_bfloat16_rne(expected.context[lane]),
+            check_boundary(context[head * rows * 256 + lane] == float_to_bfloat16_rne(reference[lane]),
                     "byte-exact Split-K context mismatch");
+        // The two bases must be distinguishable at this fixture, or a leg that
+        // ignored its template parameter would pass whichever probe it ran.
+        unsigned differing = 0;
+        for (unsigned lane = 0; lane < rows * 256; ++lane)
+            differing += float_to_bfloat16_rne(expected.context[lane]) !=
+                         float_to_bfloat16_rne(expected.normalized[lane] * 0.5f);
+        check_boundary(differing * 4 >= rows * 256,
+                "the two egress bases are too close to tell the legs apart");
         const auto* metric = static_cast<contract::WorkerMetrics*>(metrics.host_payload()) + head;
         for (unsigned lane = 0; lane < 8; ++lane)
             check_boundary(metric->exported[lane] == 1 && metric->tail[lane] == 1 &&
@@ -135,8 +169,10 @@ int main(int argc, char** argv)
                 if (!assigned) { check_boundary(now[byte] == before[byte], "ASSERT_CANARY_INTACT"); ++intact; }
             }
         }
-        std::printf("PASS Split-K boundary page=%u strip=%u count=%u rows=%u: byte-exact context; "
-                    "ASSERT_CANARY_INTACT %zu bytes\n", begin, strip_begin, strips, rows, intact);
+        std::printf("PASS Split-K boundary page=%u strip=%u count=%u rows=%u basis=%s: "
+                    "byte-exact context (%u/%u lanes distinguish the two bases); "
+                    "ASSERT_CANARY_INTACT %zu bytes\n", begin, strip_begin, strips, rows,
+                    rotated_basis ? "rotated" : "model", differing, rows * 256, intact);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL %s\n", e.what());
         return 1;

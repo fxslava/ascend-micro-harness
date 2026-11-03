@@ -944,6 +944,12 @@ __aicore__ inline void StepColumnsValue(ValueEngine& engine, std::uint32_t strip
 // WAR edge that MICROROUTINE_DESIGN_GUIDELINES.md section 0 records for the
 // fused attention operator. It is primed once, carried once per query, and
 // drained once.
+//
+// EGRESS_UNROTATE selects the basis the context leaves in, and nothing else
+// here changes with it: the same gate row, the same single-buffered MTE2/V
+// pair, the same sixteen iterations. The rotation lives one level down, in
+// routine_vector_egress_rotate.hpp, so this loop does not branch at all.
+template <bool EGRESS_UNROTATE>
 __aicore__ inline void EgressQueries(ascend_micro::NativeEgressRotateEngine& eg,
                                      ValueEngine& engine)
 {
@@ -956,12 +962,13 @@ __aicore__ inline void EgressQueries(ascend_micro::NativeEgressRotateEngine& eg,
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(kEvtStatic);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(kEvtStatic);
         eg.select_query(query);
-        ascend_micro::vector_egress_query(eg);
+        ascend_micro::vector_egress_query<EGRESS_UNROTATE>(eg);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kEvtStatic);
     }
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kEvtStatic);
 }
 
+template <bool EGRESS_UNROTATE = true>
 __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
                                       __gm__ float* gm_scale_cache,
                                       __gm__ float* gm_gate,
@@ -1033,7 +1040,14 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
     gm_offsets.SetGlobalBuffer(gm_gather_offsets);
     gm_signs.SetGlobalBuffer(gm_gather_signs);
     gm_signs_pi.SetGlobalBuffer(gm_pi_sign);
-    if (!partial) {
+    // 6 KiB of Gather tables plus the sign diagonal, and all three are
+    // butterfly operands: the leg that absorbs Pi^T downstream reads none of
+    // them. The Unified Buffer slots stay where they are -- every offset in
+    // this arena is a compile-time constant shared by both instantiations, so
+    // the 32-byte bases, the ring bank skew and the register read pad are the
+    // ones already asserted, on both legs -- they simply go unread. A `partial`
+    // task has no egress at all and never read them either.
+    if (!partial && EGRESS_UNROTATE) {
         AscendC::DataCopy(gather_offsets, gm_offsets, kGatherStages * kHeadSize);
         AscendC::DataCopy(gather_signs, gm_signs, kGatherStages * kHeadSize);
         AscendC::DataCopy(pi_sign, gm_signs_pi, kHeadSize);
@@ -1133,7 +1147,7 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t* gm_value_cache,
     eg.context = {kUb, kUbContext, kTokens * kHeadSize};
     eg.rotated = {kUb, kUbRotated, kTokens * kHeadSize};
 
-    EgressQueries(eg, engine);
+    EgressQueries<EGRESS_UNROTATE>(eg, engine);
 
     // ---- the single outflow --------------------------------------------
     // Nothing above this point stores to Global Memory. The archive is read
@@ -1235,6 +1249,42 @@ __aicore__ inline void StepColumnsCube(CubeEngine& engine, std::uint32_t strips,
     (StepColumnCube<Columns>(engine, strips), ...);
 }
 
+//
+// INGRESS_ROTATE: who applies Pi to the query
+// -------------------------------------------
+// `true` is the prologue described above: Q and the 16 resident rotation
+// blocks reach L1, 64 accumulating Mmads compute Q . Pi in L0C, the Fixpipe
+// writes it to `gm_out_qrot` as bf16 ND, and the same ND -> Nz ingress reads it
+// back as the A operand. The GM round trip is not incidental -- it is what
+// makes the prologue checkable on its own, bit-exactly, and `out_qrot` is a
+// published output of this operator.
+//
+// `false` is for a caller whose query is ALREADY rotated upstream, which in
+// this pipeline is the normal case: kernel No. 5 writes `q_rot` and the Vector
+// decode operator ingests it directly. Then all of that is dead work -- 64
+// Mmads, two L1 panels, a Fixpipe, a GM write and a GM read, every one of them
+// recomputing a tensor the caller already has. This leg stages `gm_q`
+// straight into `kL1QRot` and loads L0A from it: no `pi_table` read, no
+// `kL1PiTable` staging, no `rotate_query_*`, no `out_qrot` write.
+//
+// WHAT THE CALLER OWES, AND WHAT BREAKS SILENTLY IF IT DOES NOT
+//
+// On this leg `gm_q` must be Q . Pi, not Q. Both are [16 x 256] bf16 panels in
+// the same layout, so a raw query is accepted, staged, multiplied and gated
+// without faulting, and the answer is a plausible wrong one -- the same class
+// of fault as reusing the ingress stride order in the egress, which this
+// operator's own egress comment records. That is why this is a template
+// parameter behind distinct `__global__` symbols rather than a runtime flag:
+// the basis of the query operand is part of the entry point a caller names.
+//
+// `gm_out_qrot` is left entirely alone on this leg, canary and all, which is
+// what the isolation check in the canary harness reads it for. The L1 arena is
+// NOT re-laid-out: `kL1PiTable` and `kL1Q` keep their addresses and simply go
+// unwritten, so `kL1QRot`, the eight per-strip key pages and every alignment
+// assertion over them are bit-identical between the two legs. Reclaiming those
+// two panels would move `kL1KeyRing`, and a difference between the legs would
+// then no longer be the prologue alone.
+template <bool INGRESS_ROTATE = true>
 __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
                                      __gm__ bfloat16_t* gm_pi_table,
                                      __gm__ bfloat16_t* gm_out_qrot,
@@ -1259,40 +1309,55 @@ __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
     CubeEngine engine{l0_a, l0_b, l0_c};
 
     // ---- prologue: the ingress rotation --------------------------------
-    // Both operands reach L1 as Nz images. The page conversion is a no-op for
-    // the 16 x 256 panel and a real rearrangement for the 32 x 32 blocks; see
-    // routine_stage_page_zn_bf16.hpp.
-    ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_q + q_base, kL1Q, kHeadSize);
-    ascend_micro::stage_blocks_nz<kTableBlocks, kGroup>(gm_pi_table, kL1PiTable);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+    if constexpr (INGRESS_ROTATE) {
+        // Both operands reach L1 as Nz images. The page conversion is a no-op
+        // for the 16 x 256 panel and a real rearrangement for the 32 x 32
+        // blocks; see routine_stage_page_zn_bf16.hpp.
+        ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_q + q_base, kL1Q, kHeadSize);
+        ascend_micro::stage_blocks_nz<kTableBlocks, kGroup>(gm_pi_table, kL1PiTable);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
 
-    ascend_micro::rotate_query_stage_l0(kL1PiTable, kL1Q, l0_a, l0_b);
-    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
+        ascend_micro::rotate_query_stage_l0(kL1PiTable, kL1Q, l0_a, l0_b);
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
 
-    ascend_micro::rotate_query_compute(l0_a, l0_b, l0_c);
-    // 64 accumulating Mmads feed the transfer below, so the L0C dependency is
-    // an explicit M_FIX token rather than a unitFlag pairing.
-    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(kEvtStatic);
+        ascend_micro::rotate_query_compute(l0_a, l0_b, l0_c);
+        // 64 accumulating Mmads feed the transfer below, so the L0C dependency
+        // is an explicit M_FIX token rather than a unitFlag pairing.
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(kEvtStatic);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(kEvtStatic);
 
-    // Q_rot out to Global Memory as bf16 ND: both the runner's bit-exact check
-    // on the ingress rotation and the A operand's own source, because the
-    // route back in is the same GM -> L1 ND -> Nz ingress the query uses.
-    ascend_micro::rotate_query_to_gm(gm_out_qrot, l0_c);
-    // There is no FIX_MTE2 route. Draining FIX into the scalar stream stalls
-    // instruction issue, so the MTE2 read below is issued only after the
-    // Fixpipe has retired and its Global Memory write has committed.
-    AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtStatic);
+        // Q_rot out to Global Memory as bf16 ND: both the runner's bit-exact
+        // check on the ingress rotation and the A operand's own source, because
+        // the route back in is the same GM -> L1 ND -> Nz ingress the query
+        // uses.
+        ascend_micro::rotate_query_to_gm(gm_out_qrot, l0_c);
+        // There is no FIX_MTE2 route. Draining FIX into the scalar stream
+        // stalls instruction issue, so the MTE2 read below is issued only after
+        // the Fixpipe has retired and its Global Memory write has committed.
+        AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtStatic);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtStatic);
 
-    ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_out_qrot, kL1QRot, kHeadSize);
-    // The Mmads must have retired before L0A is overwritten with Q_rot.
-    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEvtStatic);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+        ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_out_qrot, kL1QRot, kHeadSize);
+        // The Mmads must have retired before L0A is overwritten with Q_rot.
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(kEvtStatic);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEvtStatic);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+    } else {
+        // The query arrives rotated, so `kL1QRot` is an ingress destination
+        // rather than a Fixpipe result, and the same ND -> Nz page conversion
+        // that staged `kL1Q` stages it. One MTE2_MTE1 pair, which is the only
+        // edge L0A's source needs: no Mmad has run, so there is no M_MTE1 to
+        // wait for, no Fixpipe to drain and no Global Memory write to order
+        // against -- and no edge is skipped that the rotating leg needed for a
+        // hazard this leg still has.
+        ascend_micro::stage_page_nz<kTokens, kHeadSize>(gm_q + q_base, kL1QRot,
+                                                        kHeadSize);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtStatic);
+    }
 
     ascend_micro::load_query_rotated(kL1QRot, l0_a);
     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtStatic);
@@ -1326,8 +1391,6 @@ __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
 
 }
 
-}  // namespace paged_decode
-
 // `active_block` selects one grid block, or kGrid for all of them; `strips` and
 // `strip_begin` select a window of a page's eight strips. Together they are the
 // single-tile canary protocol's isolation knob: one block, one strip, every
@@ -1336,7 +1399,25 @@ __aicore__ inline void run_cube_core(__gm__ bfloat16_t* gm_q,
 // The gate is identical on all three cores of a block, because it is a function
 // of the block index alone. A gate that differed between the AIC and the AIVs
 // of one block would deadlock the launch.
-extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
+//
+// THE THREE SYMBOLS BELOW IT, AND WHY NOT FOUR
+//
+// One body, three `__global__` symbols, each differing from its neighbour in
+// exactly ONE of the two rotation controls:
+//
+//   camodel_paged_decode_attention                <true,  true>   the contract
+//   camodel_paged_decode_attention_prerotated     <false, true>   - ingress
+//   camodel_paged_decode_attention_rotated_basis  <false, false>  - egress too
+//
+// That is a chain, not a matrix, and it is deliberate. Comparing the first two
+// isolates the ingress prologue, because they differ in nothing else and their
+// contexts must agree bit for bit when the second is handed the first's
+// `out_qrot`. Comparing the second two isolates the egress basis the same way.
+// `<true, false>` would be the fourth cell and has no caller: a pipeline that
+// has not rotated its query upstream is not one that has absorbed Pi^T
+// downstream either, and a symbol nothing launches is a symbol nothing checks.
+template <bool INGRESS_ROTATE, bool EGRESS_UNROTATE>
+__aicore__ inline void camodel_paged_decode_body(
     __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table, __gm__ std::int8_t* key_cache,
     __gm__ std::int8_t* value_cache, __gm__ float* scale_cache,
     __gm__ std::uint32_t* block_table, __gm__ float* gate,
@@ -1346,10 +1427,6 @@ extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
     __gm__ float* out_rotated, uint32_t strips, uint32_t strip_begin,
     uint32_t active_block)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    AscendC::InitSocState();
-    using namespace paged_decode;
-
     if (strips == 0u || strips > kStrips || strip_begin + strips > kStrips) return;
 
     // GetBlockIdx() ranges over [0, numBlocks) on the AIC and [0, 2*numBlocks)
@@ -1378,9 +1455,10 @@ extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
     const std::uint32_t out_base = block * kPanel;
 
     if ASCEND_IS_AIC {
-        run_cube_core(q, pi_table, out_qrot + out_base, q_base, strips);
+        run_cube_core<INGRESS_ROTATE>(q, pi_table, out_qrot + out_base, q_base, strips);
     } else if (AscendC::GetSubBlockIdx() == 0) {
-        run_value_core(value_cache, scale_cache, gate, gather_offsets, gather_signs,
+        run_value_core<EGRESS_UNROTATE>(
+                       value_cache, scale_cache, gate, gather_offsets, gather_signs,
                        pi_sign, out_scores + block * kStrips * kScores,
                        out_state + block * 2u * kTokens * kStateLanes,
                        out_acc + out_base, nullptr, out_context + out_base,
@@ -1399,7 +1477,16 @@ extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
 
 // Dynamic single-token schema with M=16 packed shared-KV query rows. The
 // legacy entry above keeps its validation ABI and standalone egress behavior.
-extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
+//
+// Two symbols over this body, differing only in the ingress: the production
+// pipeline hands this operator a query kernel No. 5 has already rotated, and
+// on that path the 64-Mmad prologue recomputes a tensor the caller is holding.
+// There is no egress knob here at all -- a `partial` task exports (m, l, Acc)
+// to its workspace partition and runs no egress, so the basis of the CONTEXT
+// is decided by whatever reduces those partials, not here. `qrot` is written
+// only by the rotating leg.
+template <bool INGRESS_ROTATE>
+__aicore__ inline void paged_decode_splitk_body(
     __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table,
     __gm__ std::int8_t* key, __gm__ std::int8_t* value, __gm__ float* scales,
     __gm__ uint32_t* table, __gm__ bfloat16_t* qrot,
@@ -1407,9 +1494,6 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
     uint32_t block_size, uint32_t cache_pages, uint32_t seq_pages,
     uint32_t splits, uint32_t page_begin, uint32_t page_count, uint32_t seq_len)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    AscendC::InitSocState();
-    using namespace paged_decode;
     if (requests == 0u || heads == 0u || splits == 0u || splits > 16u ||
         block_size == 0u || block_size > kBlockSize || block_size % kTokens != 0u ||
         seq_pages == 0u || seq_pages > cache_pages || page_begin > seq_pages ||
@@ -1430,8 +1514,8 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
     if ASCEND_IS_AIC {
         // Q rotation is amortized over the entire page range, not repeated
         // per page. The modulo-8 strip pipeline is primed/drained per page.
-        run_cube_core(q, pi_table, qrot + item * kPanel, head_item * kPanel,
-                      strips, range.count, true);
+        run_cube_core<INGRESS_ROTATE>(q, pi_table, qrot + item * kPanel,
+                      head_item * kPanel, strips, range.count, true);
     } else if (AscendC::GetSubBlockIdx() == 0) {
         // Empty temporal workers publish a neutral partial without any
         // mode-4 flags, query rotation, or normalization of a zero sum.
@@ -1479,6 +1563,105 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
     }
 }
 
+}  // namespace paged_decode
+
+// ------------------------------------------------- the launched symbols
+// Each one is a task-type declaration, a SOC init and a call. Nothing else
+// lives here, so the bodies above are the only place the schedule exists.
+extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
+    __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table, __gm__ std::int8_t* key_cache,
+    __gm__ std::int8_t* value_cache, __gm__ float* scale_cache,
+    __gm__ std::uint32_t* block_table, __gm__ float* gate,
+    __gm__ std::uint32_t* gather_offsets, __gm__ float* gather_signs,
+    __gm__ float* pi_sign, __gm__ bfloat16_t* out_qrot, __gm__ float* out_scores,
+    __gm__ float* out_state, __gm__ float* out_acc, __gm__ bfloat16_t* out_context,
+    __gm__ float* out_rotated, uint32_t strips, uint32_t strip_begin,
+    uint32_t active_block)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::InitSocState();
+    paged_decode::camodel_paged_decode_body<true, true>(
+        q, pi_table, key_cache, value_cache, scale_cache, block_table, gate,
+        gather_offsets, gather_signs, pi_sign, out_qrot, out_scores, out_state,
+        out_acc, out_context, out_rotated, strips, strip_begin, active_block);
+}
+
+// INGRESS_ROTATE = false: `q` is Q . Pi already. `pi_table` and `out_qrot` are
+// untouched, and the 64-Mmad prologue is not issued.
+extern "C" __global__ __aicore__ void camodel_paged_decode_attention_prerotated(
+    __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table, __gm__ std::int8_t* key_cache,
+    __gm__ std::int8_t* value_cache, __gm__ float* scale_cache,
+    __gm__ std::uint32_t* block_table, __gm__ float* gate,
+    __gm__ std::uint32_t* gather_offsets, __gm__ float* gather_signs,
+    __gm__ float* pi_sign, __gm__ bfloat16_t* out_qrot, __gm__ float* out_scores,
+    __gm__ float* out_state, __gm__ float* out_acc, __gm__ bfloat16_t* out_context,
+    __gm__ float* out_rotated, uint32_t strips, uint32_t strip_begin,
+    uint32_t active_block)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::InitSocState();
+    paged_decode::camodel_paged_decode_body<false, true>(
+        q, pi_table, key_cache, value_cache, scale_cache, block_table, gate,
+        gather_offsets, gather_signs, pi_sign, out_qrot, out_scores, out_state,
+        out_acc, out_context, out_rotated, strips, strip_begin, active_block);
+}
+
+// Both controls off: a pre-rotated query in, and the context out in the
+// cache's rotated basis for a downstream W_o' = Pi^T W_o or a fused gate.
+// `pi_table`, `out_qrot`, `gather_offsets`, `gather_signs` and `pi_sign` are
+// all untouched; `out_rotated` carries the pre-gate row in the rotated basis.
+extern "C" __global__ __aicore__ void camodel_paged_decode_attention_rotated_basis(
+    __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table, __gm__ std::int8_t* key_cache,
+    __gm__ std::int8_t* value_cache, __gm__ float* scale_cache,
+    __gm__ std::uint32_t* block_table, __gm__ float* gate,
+    __gm__ std::uint32_t* gather_offsets, __gm__ float* gather_signs,
+    __gm__ float* pi_sign, __gm__ bfloat16_t* out_qrot, __gm__ float* out_scores,
+    __gm__ float* out_state, __gm__ float* out_acc, __gm__ bfloat16_t* out_context,
+    __gm__ float* out_rotated, uint32_t strips, uint32_t strip_begin,
+    uint32_t active_block)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::InitSocState();
+    paged_decode::camodel_paged_decode_body<false, false>(
+        q, pi_table, key_cache, value_cache, scale_cache, block_table, gate,
+        gather_offsets, gather_signs, pi_sign, out_qrot, out_scores, out_state,
+        out_acc, out_context, out_rotated, strips, strip_begin, active_block);
+}
+
+extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
+    __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table,
+    __gm__ std::int8_t* key, __gm__ std::int8_t* value, __gm__ float* scales,
+    __gm__ uint32_t* table, __gm__ bfloat16_t* qrot,
+    __gm__ float* workspace, uint32_t requests, uint32_t heads,
+    uint32_t block_size, uint32_t cache_pages, uint32_t seq_pages,
+    uint32_t splits, uint32_t page_begin, uint32_t page_count, uint32_t seq_len)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::InitSocState();
+    paged_decode::paged_decode_splitk_body<true>(
+        q, pi_table, key, value, scales, table, qrot, workspace, requests, heads,
+        block_size, cache_pages, seq_pages, splits, page_begin, page_count, seq_len);
+}
+
+// The production dispatch when the query is rotated upstream: same partitions,
+// same page window, same tail arithmetic, 64 fewer Mmads per item and no
+// `qrot` write. `pi_table` and `qrot` stay in the ABI so one call site serves
+// both symbols.
+extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_prerotated_aic(
+    __gm__ bfloat16_t* q, __gm__ bfloat16_t* pi_table,
+    __gm__ std::int8_t* key, __gm__ std::int8_t* value, __gm__ float* scales,
+    __gm__ uint32_t* table, __gm__ bfloat16_t* qrot,
+    __gm__ float* workspace, uint32_t requests, uint32_t heads,
+    uint32_t block_size, uint32_t cache_pages, uint32_t seq_pages,
+    uint32_t splits, uint32_t page_begin, uint32_t page_count, uint32_t seq_len)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::InitSocState();
+    paged_decode::paged_decode_splitk_body<false>(
+        q, pi_table, key, value, scales, table, qrot, workspace, requests, heads,
+        block_size, cache_pages, seq_pages, splits, page_begin, page_count, seq_len);
+}
+
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 
 #include <cassert>
@@ -1486,11 +1669,43 @@ extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
 
 #include "turboquant_decode_tail.hpp"
 
+#define TQ_DECODE_VALIDATION_SIGNATURE                                        \
+    __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*,               \
+    __gm__ std::int8_t*, __gm__ float*, __gm__ std::uint32_t*, __gm__ float*,  \
+    __gm__ std::uint32_t*, __gm__ float*, __gm__ float*, __gm__ bfloat16_t*,   \
+    __gm__ float*, __gm__ float*, __gm__ float*, __gm__ bfloat16_t*,           \
+    __gm__ float*, uint32_t, uint32_t, uint32_t
+
 extern "C" __global__ __aicore__ void camodel_paged_decode_attention(
-    __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*,
-    __gm__ float*, __gm__ std::uint32_t*, __gm__ float*, __gm__ std::uint32_t*,
-    __gm__ float*, __gm__ float*, __gm__ bfloat16_t*, __gm__ float*, __gm__ float*,
-    __gm__ float*, __gm__ bfloat16_t*, __gm__ float*, uint32_t, uint32_t, uint32_t);
+    TQ_DECODE_VALIDATION_SIGNATURE);
+extern "C" __global__ __aicore__ void camodel_paged_decode_attention_prerotated(
+    TQ_DECODE_VALIDATION_SIGNATURE);
+extern "C" __global__ __aicore__ void camodel_paged_decode_attention_rotated_basis(
+    TQ_DECODE_VALIDATION_SIGNATURE);
+
+namespace {
+// The strip window is the same refusal on all three legs, so it is one
+// function. A rotation control changes the arithmetic, never the geometry.
+void paged_decode_strip_window_gate(std::uint32_t strips, std::uint32_t strip_begin)
+{
+    assert(strips >= 1u && strips <= paged_decode::kStrips);
+    if (strips < 1u || strips > paged_decode::kStrips ||
+        strip_begin + strips > paged_decode::kStrips)
+        throw std::invalid_argument("paged decode strips must select a window of 0..8");
+}
+}  // namespace
+
+// One launcher per device symbol, because the device symbol is the thing a
+// caller picks. The macro below is the argument list only -- the three
+// launchers are otherwise written out, so a grep for a launcher name finds a
+// function rather than an expansion.
+#define TQ_DECODE_VALIDATION_ARGS                                             \
+    reinterpret_cast<bfloat16_t*>(q), reinterpret_cast<bfloat16_t*>(pi_table), \
+        key_cache, value_cache, scale_cache, block_table, gate,               \
+        gather_offsets, gather_signs, pi_sign,                                \
+        reinterpret_cast<bfloat16_t*>(out_qrot), out_scores, out_state,        \
+        out_acc, reinterpret_cast<bfloat16_t*>(out_context), out_rotated,      \
+        strips, strip_begin, active_block
 
 extern "C" void launch_camodel_paged_decode_attention(
     void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key_cache,
@@ -1500,31 +1715,63 @@ extern "C" void launch_camodel_paged_decode_attention(
     std::uint16_t* out_context, float* out_rotated, std::uint32_t strips,
     std::uint32_t strip_begin, std::uint32_t active_block)
 {
-    assert(strips >= 1u && strips <= paged_decode::kStrips);
-    if (strips < 1u || strips > paged_decode::kStrips ||
-        strip_begin + strips > paged_decode::kStrips)
-        throw std::invalid_argument("paged decode strips must select a window of 0..8");
+    paged_decode_strip_window_gate(strips, strip_begin);
     camodel_paged_decode_attention<<<paged_decode::kGrid, nullptr, stream>>>(
-        reinterpret_cast<bfloat16_t*>(q), reinterpret_cast<bfloat16_t*>(pi_table),
-        key_cache, value_cache, scale_cache, block_table, gate, gather_offsets,
-        gather_signs, pi_sign, reinterpret_cast<bfloat16_t*>(out_qrot), out_scores,
-        out_state, out_acc, reinterpret_cast<bfloat16_t*>(out_context), out_rotated,
-        strips, strip_begin, active_block);
+        TQ_DECODE_VALIDATION_ARGS);
 }
 
-extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
-    __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*,
-    __gm__ std::int8_t*, __gm__ float*, __gm__ uint32_t*, __gm__ bfloat16_t*,
-    __gm__ float*, uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+// INGRESS_ROTATE = false. `q` must already be Q . Pi; `pi_table` is unread and
+// `out_qrot` unwritten, which is what the canary harness checks it for.
+extern "C" void launch_camodel_paged_decode_attention_prerotated(
+    void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key_cache,
+    std::int8_t* value_cache, float* scale_cache, std::uint32_t* block_table,
+    float* gate, std::uint32_t* gather_offsets, float* gather_signs, float* pi_sign,
+    std::uint16_t* out_qrot, float* out_scores, float* out_state, float* out_acc,
+    std::uint16_t* out_context, float* out_rotated, std::uint32_t strips,
+    std::uint32_t strip_begin, std::uint32_t active_block)
+{
+    paged_decode_strip_window_gate(strips, strip_begin);
+    camodel_paged_decode_attention_prerotated<<<paged_decode::kGrid, nullptr,
+                                                stream>>>(
+        TQ_DECODE_VALIDATION_ARGS);
+}
 
-extern "C" void launch_turboquant_paged_decode_splitk_aic(
-    void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key,
-    std::int8_t* value, float* scales, std::uint32_t* table,
-    std::uint16_t* qrot, float* workspace, std::uint32_t requests,
-    std::uint32_t heads, std::uint32_t block_size, std::uint32_t cache_pages,
-    std::uint32_t seq_pages, std::uint32_t splits, std::uint32_t page_begin,
-    std::uint32_t page_count, std::uint32_t seq_len)
+// Both controls off: pre-rotated query in, rotated-basis context out.
+extern "C" void launch_camodel_paged_decode_attention_rotated_basis(
+    void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key_cache,
+    std::int8_t* value_cache, float* scale_cache, std::uint32_t* block_table,
+    float* gate, std::uint32_t* gather_offsets, float* gather_signs, float* pi_sign,
+    std::uint16_t* out_qrot, float* out_scores, float* out_state, float* out_acc,
+    std::uint16_t* out_context, float* out_rotated, std::uint32_t strips,
+    std::uint32_t strip_begin, std::uint32_t active_block)
+{
+    paged_decode_strip_window_gate(strips, strip_begin);
+    camodel_paged_decode_attention_rotated_basis<<<paged_decode::kGrid, nullptr,
+                                                   stream>>>(
+        TQ_DECODE_VALIDATION_ARGS);
+}
+
+#define TQ_DECODE_SPLITK_SIGNATURE                                            \
+    __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*,               \
+    __gm__ std::int8_t*, __gm__ float*, __gm__ uint32_t*, __gm__ bfloat16_t*,  \
+    __gm__ float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, \
+    uint32_t, uint32_t, uint32_t
+
+extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_aic(
+    TQ_DECODE_SPLITK_SIGNATURE);
+extern "C" __global__ __aicore__ void turboquant_paged_decode_splitk_prerotated_aic(
+    TQ_DECODE_SPLITK_SIGNATURE);
+
+namespace {
+// Both legs refuse the same geometries, in the same order, with the same
+// messages. One function, for the reason the AIV launchers share theirs: a
+// refusal that held on one symbol and not the other is a silent all-canary
+// output on whichever leg was forgotten.
+void paged_decode_splitk_gates(std::uint32_t requests, std::uint32_t heads,
+                               std::uint32_t block_size, std::uint32_t cache_pages,
+                               std::uint32_t seq_pages, std::uint32_t splits,
+                               std::uint32_t page_begin, std::uint32_t page_count,
+                               std::uint32_t seq_len)
 {
     if (!requests || !heads || !splits || splits > 16 || !seq_pages ||
         !block_size || block_size > paged_decode::kBlockSize || block_size % 16 ||
@@ -1544,11 +1791,45 @@ extern "C" void launch_turboquant_paged_decode_splitk_aic(
                 "paged_decode_splitk_aic: seqLen has live tokens past the end of "
                 "the page window; the launch would silently truncate the sequence");
     }
+}
+}  // namespace
+
+#define TQ_DECODE_SPLITK_ARGS                                                 \
+    reinterpret_cast<bfloat16_t*>(q), reinterpret_cast<bfloat16_t*>(pi_table), \
+        key, value, scales, table, reinterpret_cast<bfloat16_t*>(qrot),        \
+        workspace, requests, heads, block_size, cache_pages, seq_pages,        \
+        splits, page_begin, page_count, seq_len
+
+extern "C" void launch_turboquant_paged_decode_splitk_aic(
+    void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key,
+    std::int8_t* value, float* scales, std::uint32_t* table,
+    std::uint16_t* qrot, float* workspace, std::uint32_t requests,
+    std::uint32_t heads, std::uint32_t block_size, std::uint32_t cache_pages,
+    std::uint32_t seq_pages, std::uint32_t splits, std::uint32_t page_begin,
+    std::uint32_t page_count, std::uint32_t seq_len)
+{
+    paged_decode_splitk_gates(requests, heads, block_size, cache_pages, seq_pages,
+                              splits, page_begin, page_count, seq_len);
     turboquant_paged_decode_splitk_aic<<<requests * heads * splits, nullptr, stream>>>(
-        reinterpret_cast<bfloat16_t*>(q), reinterpret_cast<bfloat16_t*>(pi_table),
-        key, value, scales, table, reinterpret_cast<bfloat16_t*>(qrot), workspace,
-        requests, heads, block_size, cache_pages, seq_pages, splits, page_begin,
-        page_count, seq_len);
+        TQ_DECODE_SPLITK_ARGS);
+}
+
+// INGRESS_ROTATE = false: `q` is Q . Pi already, `pi_table` is unread and
+// `qrot` unwritten. 64 Mmads, two L1 panels, a Fixpipe and a GM round trip
+// per item do not happen.
+extern "C" void launch_turboquant_paged_decode_splitk_prerotated_aic(
+    void* stream, std::uint16_t* q, std::uint16_t* pi_table, std::int8_t* key,
+    std::int8_t* value, float* scales, std::uint32_t* table,
+    std::uint16_t* qrot, float* workspace, std::uint32_t requests,
+    std::uint32_t heads, std::uint32_t block_size, std::uint32_t cache_pages,
+    std::uint32_t seq_pages, std::uint32_t splits, std::uint32_t page_begin,
+    std::uint32_t page_count, std::uint32_t seq_len)
+{
+    paged_decode_splitk_gates(requests, heads, block_size, cache_pages, seq_pages,
+                              splits, page_begin, page_count, seq_len);
+    turboquant_paged_decode_splitk_prerotated_aic<<<requests * heads * splits,
+                                                    nullptr, stream>>>(
+        TQ_DECODE_SPLITK_ARGS);
 }
 
 #endif

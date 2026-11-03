@@ -4,6 +4,31 @@
 // rotate it back out of the cache's channel basis, and gate it.
 // Ascend 950PR / arch35 / dav-3510 / CANN 9.2.
 //
+// EGRESS_UNROTATE, and what is NOT changed by it
+// ----------------------------------------------
+// `vector_egress_query<true>` is the whole routine as described below and the
+// default, so every caller that existed before this parameter did compiles to
+// the same instruction stream it did before: same buffers, same order, same
+// destinations. `false` elides the eight butterfly stages and publishes the
+// context in the CACHE's rotated basis, for a caller that has absorbed Pi^T
+// into whatever reads the context next.
+//
+// Two things about the bypass leg are easy to get wrong and are handled here
+// rather than at the call site:
+//
+//   * the 1 / 16. `normalise` folds Pi's normalisation into its input, so the
+//     bypass must NOT apply it -- the cache already holds Pi . V with the 1/16
+//     inside Pi, which makes Acc / l exactly Pi . ctx. Scaling it again would
+//     emit Pi . ctx / 16, a plausible number 24 dB low.
+//   * the ping-pong parity. Eight stages starting in `buffer_a` leave the
+//     result in `buffer_b`, and `gate_and_cast` reads `buffer_b`. With no
+//     stages to run, the normalisation therefore lands in `buffer_b` directly,
+//     so the gate chain is the same four instructions reading the same buffer
+//     on both legs and no operation becomes in-place. That shape is load
+//     bearing: the first revision of this routine computed the gate with three
+//     IN-PLACE vector operations and matched none of nine candidate egress
+//     formulations on the device.
+//
 // Why a rotation is needed at all
 // -------------------------------
 // The KV cache stores values already rotated by Pi, because that is what the
@@ -183,6 +208,7 @@ struct NativeEgressRotateEngine {
     // else in this harness. With them the device matched none of nine
     // candidate egress formulations, which is what two independent faults
     // looks like. Every destination below is distinct from its sources.
+    template <bool UNROTATE = true>
     __aicore__ inline void normalise()
     {
         AscendC::Duplicate(l_broadcast, l_cur, kChannelLanes);
@@ -190,7 +216,22 @@ struct NativeEgressRotateEngine {
         AscendC::Div<float, kEgressPreciseDiv>(permuted, acc_row, l_broadcast,
                                                kChannelLanes);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(buffer_a, permuted, kEgressScale, kChannelLanes);
+        if constexpr (UNROTATE) {
+            AscendC::Muls(buffer_a, permuted, kEgressScale, kChannelLanes);
+        } else {
+            // Acc / l IS the context in the cache's rotated basis: no 1/16,
+            // because Pi carries it and the cache was written through Pi. The
+            // copy is a `Muls` by one, which is exact in FP32 for every finite
+            // value and for both signed zeros, and it lands in `buffer_b` so
+            // that the gate chain below is identical on both legs.
+            AscendC::Muls(buffer_b, permuted, 1.0f, kChannelLanes);
+            AscendC::PipeBarrier<PIPE_V>();
+            // The pre-gate row, published here for the same reason `rotate()`
+            // publishes it: it is the only place the basis change can be
+            // separated from the gate from outside the kernel. On this leg it
+            // is the rotated-basis context rather than the model-basis one.
+            AscendC::Adds(rotated_row, buffer_b, 0.0f, kChannelLanes);
+        }
     }
 
     // A block-aligned stage. Within each 2S-lane group the lower S lanes get
@@ -280,13 +321,20 @@ struct NativeEgressRotateEngine {
 // One query's egress. The caller loops over the queries, calling
 // `select_query` and refilling `gate` before each one, and owns the MTE2 edge
 // that makes `gate` readable and the MTE3 edge that publishes `context`.
-template <class Engine>
+//
+// `UNROTATE = false` drops the rotation and nothing else: the normalisation,
+// the gate, the cast, the barriers between them and the buffer each one reads
+// are the same, so a difference between the two legs is the basis change and
+// cannot be anything else.
+template <bool UNROTATE = true, class Engine>
 __aicore__ inline void vector_egress_query(Engine& engine)
 {
-    engine.normalise();
+    engine.template normalise<UNROTATE>();
     AscendC::PipeBarrier<PIPE_V>();
-    engine.rotate();
-    AscendC::PipeBarrier<PIPE_V>();
+    if constexpr (UNROTATE) {
+        engine.rotate();
+        AscendC::PipeBarrier<PIPE_V>();
+    }
     engine.gate_and_cast();
 }
 

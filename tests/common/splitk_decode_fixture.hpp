@@ -87,6 +87,11 @@ struct Fixture {
     std::vector<float> scales, gate, signs;
     std::vector<std::uint32_t> table;
     std::vector<float> expected;
+    // The same context in the CACHE's rotated basis: what EGRESS_UNROTATE =
+    // false emits. It is NOT `expected` rotated -- the sigmoid gate is
+    // elementwise and does not commute with Pi, so the two differ by more than
+    // a change of basis and each needs its own oracle line.
+    std::vector<float> expected_rotated;
 
     // `live` defaults to -1, meaning "every allocated token is live", which
     // is what every caller from before the tail change meant. Pass a smaller
@@ -109,7 +114,8 @@ struct Fixture {
           key(static_cast<std::size_t>(batch) * pages * heads * page_tokens * 128),
           value(key.size()), scales(static_cast<std::size_t>(batch) * pages *
                                    heads * page_tokens * 2),
-          gate(q.size()), signs(kChannels), table(batch * pages), expected(q.size())
+          gate(q.size()), signs(kChannels), table(batch * pages), expected(q.size()),
+          expected_rotated(q.size())
     {
         for (int c = 0; c < kChannels; ++c)
             signs[c] = static_cast<float>(single_token_decode::PiSign(c));
@@ -242,8 +248,18 @@ struct Fixture {
                     // Dense matrix rotation checks the register butterfly's
                     // egress ordering independently of its factorization.
                     const auto rotated = single_token_decode::DenseRotate(normalized.data());
-                    for (int c = 0; c < kChannels; ++c)
-                        expected[base + c] = rotated[c] / (1.0f + std::exp(-gate[base + c]));
+                    for (int c = 0; c < kChannels; ++c) {
+                        const float sigmoid_denominator =
+                            1.0f + std::exp(-gate[base + c]);
+                        expected[base + c] = rotated[c] / sigmoid_denominator;
+                        // The bypass leg gates the normalized accumulator
+                        // where it already is, before any rotation. Nothing
+                        // about the softmax above differs, which is what makes
+                        // a disagreement between the two legs a statement
+                        // about the egress alone.
+                        expected_rotated[base + c] =
+                            normalized[c] / sigmoid_denominator;
+                    }
                 }
     }
 };
