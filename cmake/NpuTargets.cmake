@@ -4,6 +4,12 @@ function(add_ascend_micro_npu_targets)
   # The BiSheng system-header reclassification, defined once in the top-level
   # CMakeLists.txt so this leg and the simulator leg cannot drift apart.
   set(CANN_SYSTEM_OPTIONS ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS})
+  ascendc_library(turboquant_fused_decode_opt_npu SHARED
+      kernels/ops/turboquant/turboquant_fused_decode_opt.cpp)
+  ascendc_compile_definitions(turboquant_fused_decode_opt_npu PRIVATE ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(turboquant_fused_decode_opt_npu PRIVATE
+      -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
   set(BASELINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/baseline")
   set(BASELINE_SOURCE "${BASELINE_DIR}/turboquant_paged_attention.cpp")
   ascendc_library(turboquant_a8_npu SHARED
@@ -140,7 +146,8 @@ function(add_ascend_micro_npu_targets)
   target_include_directories(bench_turboquant_decode_splitk PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(bench_turboquant_decode_splitk PRIVATE
-      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
+      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu
+      turboquant_fused_decode_opt_npu ascendcl)
   target_compile_options(bench_turboquant_decode_splitk PRIVATE
       -Wall -Wextra -Werror)
 

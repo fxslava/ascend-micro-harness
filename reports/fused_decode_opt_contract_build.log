@@ -1,0 +1,3 @@
+Building CXX object CMakeFiles/test_fused_decode_opt_contract.dir/tests/cpu/test_fused_decode_opt_contract.cpp.o
+Linking CXX executable lib/test_fused_decode_opt_contract
+Built target test_fused_decode_opt_contract

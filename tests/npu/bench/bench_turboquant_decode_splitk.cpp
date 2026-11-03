@@ -5,6 +5,7 @@
 #include "../../common/aic_splitk_decode_fixture.hpp"
 #include "../../../include/turboquant_splitk_contract.hpp"
 #include "../turboquant_splitk_rigs.hpp"
+#include "../turboquant_fused_decode_opt_rig.hpp"
 
 #include <charconv>
 #include <cmath>
@@ -40,6 +41,9 @@ struct Options {
     bool single = false;
     std::string impl = "aiv", csv_out;
     int page_begin = 0, page_count = -1;
+    bool Aiv() const { return impl == "aiv" || impl == "both" || impl == "all"; }
+    bool Aic() const { return impl == "aic" || impl == "both" || impl == "all"; }
+    bool Opt() const { return impl == "fused-opt" || impl == "all"; }
 };
 
 int number(std::string_view s)
@@ -68,13 +72,18 @@ std::vector<int> list(std::string_view s)
 Options parse(int argc, char** argv)
 {
     Options o;
+    bool explicit_splits = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--help") {
             std::puts("--context N[,N...] --splitk K[,K...] --warmup N --iters N "
                       "--requests N --heads N --rows N --page-tokens N\n"
-                      "--impl aiv|aic|both --single --csv-out PATH --page-begin P --page-count P\n"
+                      "--impl aiv|aic|both|fused-opt|all --single --csv-out PATH --page-begin P --page-count P\n"
                       "Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8,12,16.\n"
+                      "fused-opt: separate KV4/FP8 fixture; --rows is GQA query heads per KV head; K 1..8.\n"
+                      "Its default K sweep is 1,2,4,8. --impl all leaves opt columns NA at K>8.\n"
+                      "fused-opt supports --rows 1..16; legacy/all supports --rows 1..8.\n"
+                      "fused-opt page-tokens: 64 or 128; other implementations: 16 or 128.\n"
                       "Use --page-tokens 16 --heads 1 --context 48 for a short CAModel run.");
             std::exit(0);
         }
@@ -82,7 +91,7 @@ Options parse(int argc, char** argv)
         require(i + 1 < argc, "option requires a value");
         const std::string_view value(argv[++i]);
         if (arg == "--context") o.contexts = list(value);
-        else if (arg == "--splitk") o.splits = list(value);
+        else if (arg == "--splitk") { o.splits = list(value); explicit_splits = true; }
         else if (arg == "--warmup") o.warmup = number(value);
         else if (arg == "--iters") o.iters = number(value);
         else if (arg == "--requests") o.requests = number(value);
@@ -96,10 +105,15 @@ Options parse(int argc, char** argv)
         else throw std::runtime_error("unknown option: " + std::string(arg));
     }
     if (o.single) { o.warmup = 0; o.iters = 1; }
-    require(o.impl == "aiv" || o.impl == "aic" || o.impl == "both", "impl must be aiv, aic or both");
+    require(o.Aiv() || o.Aic() || o.Opt(), "impl must be aiv, aic, both, fused-opt or all");
+    if (o.impl == "fused-opt" && !explicit_splits) o.splits = {1, 2, 4, 8};
     require(o.page_begin >= 0 && o.page_count >= -1, "invalid AIC page window");
-    require(o.page_tokens == 16 || o.page_tokens == 128, "page-tokens must be 16 or 128");
-    require(o.heads > 0 && o.heads <= 4 && o.rows > 0 && o.rows <= 8, "heads must be 1..4 and rows 1..8");
+    require(o.Opt() ? (o.page_tokens == 64 || o.page_tokens == 128) :
+            (o.page_tokens == 16 || o.page_tokens == 128), "unsupported page-tokens for implementation");
+    if (o.Aiv() || o.Aic()) require(o.page_tokens != 64, "64-token pages require --impl fused-opt");
+    require(o.heads > 0 && o.heads <= 4 && o.rows > 0 &&
+            o.rows <= (o.impl == "fused-opt" ? 16 : 8),
+            "heads must be 1..4; rows 1..16 for fused-opt, otherwise 1..8");
     for (int n : o.contexts) {
         require(n > 0 && n <= 16384 && n % o.page_tokens == 0,
                 "context must be a multiple of page-tokens, at most 16384");
@@ -109,7 +123,8 @@ Options parse(int argc, char** argv)
         if (o.impl != "aic") require(o.page_begin == 0 && (o.page_count == -1 || o.page_count == pages),
                 "partial page windows require --impl aic; both compares full contexts");
     }
-    for (int k : o.splits) require(k >= 1 && k <= 16, "splitk must be 1..16");
+    for (int k : o.splits) require(k >= 1 && k <= (o.impl == "fused-opt" ? 8 : 16),
+                                 "splitk must be 1..8 for fused-opt, otherwise 1..16");
     require(o.iters > 0 && o.warmup >= 0 && o.requests > 0 && o.requests <= 16,
             "invalid iteration or batch bound");
     return o;
@@ -247,7 +262,8 @@ std::string field(double value, bool available, int precision = 3)
 }
 
 void row(int n, int k, int grid, const Measurement& aiv, const Measurement& aic,
-         double baseline, double aiv_bytes, double aic_bytes, std::ofstream& csv)
+         const Measurement& opt, int opt_grid, double baseline, double opt_baseline,
+         double aiv_bytes, double aic_bytes, double opt_bytes, std::ofstream& csv)
 {
     const auto av = field(aiv.us, aiv.timed);
     const auto speed = field(aiv.timed ? baseline / aiv.us : 0, aiv.timed && baseline > 0);
@@ -257,15 +273,22 @@ void row(int n, int k, int grid, const Measurement& aiv, const Measurement& aic,
     const auto cbw = field(aic.timed ? aic_bytes * 16 / aic.us / 1000 : 0, aic.timed);
     const auto tail = field(aiv.tail, aiv.present, 0);
     const auto exported = field(aiv.export_region, aiv.present, 0);
-    std::printf("| %11d | %10d | %6d | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s |\n",
+    const auto opt_time = field(opt.us, opt.timed);
+    const auto opt_speed = field(opt.timed && opt.us > 0 ? opt_baseline / opt.us : 0,
+                                 opt.timed && opt_baseline > 0);
+    const auto opt_bw = field(opt.timed ? opt_bytes / opt.us / 1000 : 0, opt.timed);
+    const auto opt_blocks = opt.present ? std::to_string(opt_grid) : "NA";
+    std::printf("| %11d | %10d | %6d | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %8s | %13s | %11s | %11s |\n",
                 n, k, grid, av.c_str(), speed.c_str(), abw.c_str(), cr.c_str(), cn.c_str(),
-                cbw.c_str(), tail.c_str(), exported.c_str());
+                cbw.c_str(), tail.c_str(), exported.c_str(), opt_blocks.c_str(),
+                opt_time.c_str(), opt_speed.c_str(), opt_bw.c_str());
     if (csv.is_open()) {
         csv << n << ',' << k << ',' << grid << ',' << av << ',' << speed << ',' << abw << ','
             << cr << ',' << cn << ',' << cbw << ','
             << field(aic.timed ? aic_bytes / aic.us / 1000 : 0, aic.timed) << ','
             << tail << ',' << exported << ','
-            << aiv.launches << ',' << aic.launches << '\n';
+            << aiv.launches << ',' << aic.launches << ',' << opt_blocks << ','
+            << opt_time << ',' << opt_speed << ',' << opt_bw << ',' << opt.launches << '\n';
         csv.flush();
         require(static_cast<bool>(csv), "CSV write failed");
     }
@@ -287,38 +310,48 @@ int main(int argc, char** argv)
         if (!o.csv_out.empty()) {
             csv.open(o.csv_out, std::ios::out | std::ios::trunc);
             require(csv.is_open(), "cannot open --csv-out path");
-            csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,export_ticks,aiv_launches,aic_launches\n";
+            csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,export_ticks,aiv_launches,aic_launches,opt_grid,opt_us,opt_speedup,opt_kv_cache_gbs,opt_launches\n";
         }
         if (o.single) std::puts("[PROFILING MODE] Single launch mode active for msprof op.");
         std::puts("AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.");
         std::puts("AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.");
+        if (o.Opt()) {
+            std::puts("OPT: KV4/FP8, FP32 pre-rotated GQA queries, FP16 rotated-basis output; complete in-launch Split-K combine.");
+            std::printf("OPT GQA query heads per KV head=%d; OPT Grid is the actual dispatch (capped at 32 blocks).\n", o.rows);
+            std::puts("OPT speedup uses its own K=1 baseline; cache GB/s excludes fragmented canary pages. Worker timestamps: unavailable.");
+            if (o.impl == "all") std::puts("OPT columns are NA for unsupported K>8. Fixtures/precision differ; no cross-implementation speedup is inferred.");
+        }
         if (o.single) std::puts("Single samples replace p50; tail/export show maxima. No implicit K=1 launch.");
         std::printf("impl=%s requests=%d heads=%d AIV_rows=%d AIC_rows=16 page_tokens=%d warmup=%d iters=%d\n",
                     o.impl.c_str(), o.requests, o.heads, o.rows, o.page_tokens, o.warmup, o.iters);
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
-        std::printf("| %11s | %10s | %6s | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s |\n",
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
+        std::printf("| %11s | %10s | %6s | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %8s | %13s | %11s | %11s |\n",
                     "Context (N)", "Splits (K)", "Grid", o.single ? "AIV (us)" : "AIV p50(us)",
                     "AIV Speedup", "AIV KV GB/s", "AIC Batch Raw(us)",
                     o.single ? "AIC Model(us/req)" : "AIC Model p50(us/req)", "AIC Model GB/s",
-                    "Tail (ticks)", o.single ? "Export (ticks)" : "Export p50(ticks)");
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
+                    "Tail (ticks)", o.single ? "Export (ticks)" : "Export p50(ticks)",
+                    "OPT Grid", o.single ? "OPT Fused(us)" : "OPT p50(us)", "OPT Speedup", "OPT KV GB/s");
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
         tq_npu::Session session;
         Events events;
         struct Comparison { int n, k; double aiv, aic; };
         std::vector<Comparison> comparisons;
-        std::uint64_t aiv_launches = 0, aic_launches = 0;
+        std::uint64_t aiv_launches = 0, aic_launches = 0, opt_launches = 0;
         for (int n : o.contexts) {
             std::unique_ptr<Fixture> av, ac;
-            if (o.impl != "aic") av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
-            if (o.impl != "aiv") ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens));
+            std::unique_ptr<fused_decode_opt_test::Fixture> opt_fixture;
+            if (o.Aiv()) av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
+            if (o.Aic()) ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens));
+            if (o.Opt()) opt_fixture.reset(new fused_decode_opt_test::Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
             std::vector<int> sweep;
-            if (!o.single && av) sweep.push_back(1);
+            if (!o.single && (av || opt_fixture)) sweep.push_back(1);
             for (int k : o.splits)
                 if (std::find(sweep.begin(), sweep.end(), k) == sweep.end()) sweep.push_back(k);
-            double baseline = 0;
+            double baseline = 0, opt_baseline = 0;
             for (int k : sweep) {
-                Measurement aiv, aic;
-                double aiv_bytes = 0, aic_bytes = 0;
+                Measurement aiv, aic, opt;
+                double aiv_bytes = 0, aic_bytes = 0, opt_bytes = 0;
+                int opt_grid = 0;
                 if (av) {
                     Device d(*av, k);
                     aiv = measure(d, o, k, session.stream, events);
@@ -333,12 +366,20 @@ int main(int argc, char** argv)
                     aic_launches += aic.launches;
                     aic_bytes = static_cast<double>(ac->key.size() + ac->value.size() + ac->scales.size() * 4) * pages / ac->pages;
                 }
-                row(n, k, o.requests * o.heads * k, aiv, aic, baseline, aiv_bytes, aic_bytes, csv);
+                if (opt_fixture && k <= 8) {
+                    tq_splitk_rig::FusedOptRig d(*opt_fixture, k);
+                    opt = measure(d, o, k, session.stream, events);
+                    opt_launches += opt.launches; opt_grid = d.config.grid;
+                    if (k == 1 && opt.timed) opt_baseline = opt.us;
+                    opt_bytes = opt_fixture->cache_bytes();
+                }
+                row(n, k, o.requests * o.heads * k, aiv, aic, opt, opt_grid,
+                    baseline, opt_baseline, aiv_bytes, aic_bytes, opt_bytes, csv);
                 if (aiv.timed && aic.timed)
                     comparisons.push_back({n, k, aiv.us, aic.us / 16});
             }
         }
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
         for (const auto& c : comparisons)
             std::printf("Modeled comparison N=%d K=%d: AIC %.3f us/row vs AIV %.3f us/decode (%s).\n",
                         c.n, c.k, c.aic, c.aiv, c.aic < c.aiv ? "AIC amortized model lower" : "AIV lower");
@@ -353,10 +394,11 @@ int main(int argc, char** argv)
                             entry.first, entry.second);
             else std::printf("Modeled crossover K=%d: not observed in the tested contexts.\n", entry.first);
         }
-        if (o.impl == "both" && comparisons.empty())
+        if (o.Aiv() && o.Aic() && comparisons.empty())
             std::puts("Modeled crossover unavailable: device event timing is unavailable.");
-        std::printf("PASS: CPU references matched. Kernel launches: AIV=%llu AIC=%llu.\n",
-                    static_cast<unsigned long long>(aiv_launches), static_cast<unsigned long long>(aic_launches));
+        std::printf("PASS: CPU references matched. Kernel launches: AIV=%llu AIC=%llu OPT=%llu.\n",
+                    static_cast<unsigned long long>(aiv_launches), static_cast<unsigned long long>(aic_launches),
+                    static_cast<unsigned long long>(opt_launches));
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

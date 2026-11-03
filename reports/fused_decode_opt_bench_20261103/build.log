@@ -1,0 +1,1039 @@
+[  0%] Creating directories for 'camodel_fused_decode_opt_kernel_precompile'
+[  0%] Creating directories for 'camodel_single_token_decode_splitk_kernel_precompile'
+[ 12%] Creating directories for 'camodel_paged_decode_attention_kernel_precompile'
+[ 12%] No download step for 'camodel_fused_decode_opt_kernel_precompile'
+[ 12%] No download step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[ 12%] No download step for 'camodel_paged_decode_attention_kernel_precompile'
+[ 12%] No update step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[ 12%] No update step for 'camodel_fused_decode_opt_kernel_precompile'
+[ 12%] No update step for 'camodel_paged_decode_attention_kernel_precompile'
+[ 12%] No patch step for 'camodel_fused_decode_opt_kernel_precompile'
+[ 12%] No patch step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[ 12%] No patch step for 'camodel_paged_decode_attention_kernel_precompile'
+[ 25%] Performing configure step for 'camodel_fused_decode_opt_kernel_precompile'
+[ 25%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[ 25%] Performing configure step for 'camodel_paged_decode_attention_kernel_precompile'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    DYNAMIC_MODE
+    INCLUDE_DIR
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_precompile-prefix/src/camodel_fused_decode_opt_kernel_precompile-build
+[ 25%] Performing build step for 'camodel_fused_decode_opt_kernel_precompile'
+-- Detecting C compiler ABI info - done
+[100%] Building CXX object CMakeFiles/precompile_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+-- Detecting CXX compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    DYNAMIC_MODE
+    INCLUDE_DIR
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_precompile-prefix/src/camodel_paged_decode_attention_kernel_precompile-build
+[ 25%] Performing build step for 'camodel_paged_decode_attention_kernel_precompile'
+[100%] Building CXX object CMakeFiles/precompile_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    DYNAMIC_MODE
+    INCLUDE_DIR
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_precompile-prefix/src/camodel_single_token_decode_splitk_kernel_precompile-build
+[ 25%] Performing build step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[100%] Building CXX object CMakeFiles/precompile_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target precompile_obj
+[100%] Built target precompile_obj
+[100%] Built target precompile_obj
+[100%] Built target check_src_template
+[100%] Built target check_src_template
+[ 25%] No install step for 'camodel_fused_decode_opt_kernel_precompile'
+[ 25%] No install step for 'camodel_single_token_decode_splitk_kernel_precompile'
+[ 25%] Completed 'camodel_fused_decode_opt_kernel_precompile'
+[ 25%] Completed 'camodel_single_token_decode_splitk_kernel_precompile'
+[ 25%] Built target camodel_fused_decode_opt_kernel_precompile
+[ 25%] Built target camodel_single_token_decode_splitk_kernel_precompile
+[ 25%] Creating directories for 'camodel_fused_decode_opt_kernel_preprocess'
+[100%] Built target check_src_template
+[ 25%] Creating directories for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 25%] No install step for 'camodel_paged_decode_attention_kernel_precompile'
+[ 25%] Completed 'camodel_paged_decode_attention_kernel_precompile'
+[ 25%] No download step for 'camodel_fused_decode_opt_kernel_preprocess'
+[ 25%] No download step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 25%] No update step for 'camodel_fused_decode_opt_kernel_preprocess'
+[ 25%] Built target camodel_paged_decode_attention_kernel_precompile
+[ 25%] Creating directories for 'camodel_paged_decode_attention_kernel_preprocess'
+[ 25%] No update step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 25%] No patch step for 'camodel_fused_decode_opt_kernel_preprocess'
+[ 25%] No patch step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 25%] Performing configure step for 'camodel_fused_decode_opt_kernel_preprocess'
+[ 25%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 25%] No download step for 'camodel_paged_decode_attention_kernel_preprocess'
+[ 25%] No update step for 'camodel_paged_decode_attention_kernel_preprocess'
+[ 25%] No patch step for 'camodel_paged_decode_attention_kernel_preprocess'
+[ 25%] Performing configure step for 'camodel_paged_decode_attention_kernel_preprocess'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Configuring done
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_preprocess-prefix/src/camodel_fused_decode_opt_kernel_preprocess-build
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_preprocess-prefix/src/camodel_paged_decode_attention_kernel_preprocess-build
+[ 25%] Performing prepare_core_objects step for 'camodel_paged_decode_attention_kernel_preprocess'
+[ 25%] Performing prepare_core_objects step for 'camodel_fused_decode_opt_kernel_preprocess'
+CANN preprocess: removed 0 consumed core object(s) in /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_preprocess-prefix/src/camodel_paged_decode_attention_kernel_preprocess-build
+CANN preprocess: removed 0 consumed core object(s) in /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_preprocess-prefix/src/camodel_fused_decode_opt_kernel_preprocess-build
+[ 25%] Performing build step for 'camodel_paged_decode_attention_kernel_preprocess'
+[ 25%] Performing build step for 'camodel_fused_decode_opt_kernel_preprocess'
+[ 33%] Building CXX object CMakeFiles/preprocess_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[ 66%] Building CXX object CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[ 33%] Building CXX object CMakeFiles/preprocess_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build
+[ 25%] Performing prepare_core_objects step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+CANN preprocess: removed 0 consumed core object(s) in /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build
+[ 25%] Performing build step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 33%] Building CXX object CMakeFiles/preprocess_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[ 33%] Built target preprocess_obj
+[ 66%] Building CXX object CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+[ 66%] Built target preprocess_obj
+[100%] Building CXX object CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+[ 33%] Built target preprocess_obj
+[ 66%] Building CXX object CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[ 66%] Built target aiv_obj
+[100%] Building CXX object CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target aic_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_preprocess-prefix/src/camodel_fused_decode_opt_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_preprocess-prefix/src/camodel_fused_decode_opt_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o[100%] Built target merge_aic_obj_text
+[100%] Building CXX object CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[100%] Built target aic_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o[100%] Built target merge_aiv_obj_text
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_preprocess-prefix/src/camodel_single_token_decode_splitk_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o[100%] Built target merge_aic_obj_text
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+[100%] Built target _host_cpp
+[ 37%] No install step for 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 37%] Completed 'camodel_single_token_decode_splitk_kernel_preprocess'
+[ 37%] Built target camodel_single_token_decode_splitk_kernel_preprocess
+[ 37%] Creating directories for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 50%] No download step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 50%] No update step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 50%] No patch step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 50%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+[100%] Built target aiv_obj
+[ 50%] Creating directories for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 50%] No download step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 50%] No update step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 50%] No patch step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 50%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+-- The C compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_aiv_device-prefix/src/camodel_single_token_decode_splitk_kernel_aiv_device-build
+[ 50%] Performing build step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[100%] Building CXX object CMakeFiles/device_aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_single_token_decode_splitk_kernel/auto_gen_turboquant_single_token_decode_splitk_aiv.cpp.o
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    BUILD_MODE
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_aic_device-prefix/src/camodel_single_token_decode_splitk_kernel_aic_device-build
+[ 50%] Performing build step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 50%] No install step for 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 50%] Completed 'camodel_single_token_decode_splitk_kernel_aic_device'
+[ 50%] Built target camodel_single_token_decode_splitk_kernel_aic_device
+[ 50%] Creating directories for 'camodel_single_token_decode_splitk_kernel_host'
+[ 50%] No download step for 'camodel_single_token_decode_splitk_kernel_host'
+[ 50%] No update step for 'camodel_single_token_decode_splitk_kernel_host'
+[ 50%] No patch step for 'camodel_single_token_decode_splitk_kernel_host'
+[ 50%] Performing configure step for 'camodel_single_token_decode_splitk_kernel_host'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ASCEND_PYTHON_EXECUTABLE
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_host-prefix/src/camodel_single_token_decode_splitk_kernel_host-build
+[ 50%] Performing build step for 'camodel_single_token_decode_splitk_kernel_host'
+[100%] Building CXX object CMakeFiles/host_bisheng_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target host_bisheng_obj
+[ 50%] Performing install step for 'camodel_single_token_decode_splitk_kernel_host'
+Consolidate compiler generated dependencies of target host_bisheng_obj
+[100%] Built target host_bisheng_obj
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_host_dir/./objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[ 50%] Completed 'camodel_single_token_decode_splitk_kernel_host'
+[ 50%] Built target camodel_single_token_decode_splitk_kernel_host
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_preprocess-prefix/src/camodel_paged_decode_attention_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_preprocess-prefix/src/camodel_paged_decode_attention_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o[100%] Built target merge_aiv_obj_text
+[100%] Built target device_aiv_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_aiv_device-prefix/src/camodel_single_token_decode_splitk_kernel_aiv_device-build/CMakeFiles/device_aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_single_token_decode_splitk_kernel/auto_gen_turboquant_single_token_decode_splitk_aiv.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_aiv_device_dir/device_aiv.o
+[100%] Built target merge_aiv_device_obj
+[ 50%] No install step for 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 50%] Completed 'camodel_single_token_decode_splitk_kernel_aiv_device'
+[ 50%] Built target camodel_single_token_decode_splitk_kernel_aiv_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_aiv_device_dir/device_aiv.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_merge_obj_dir/device_aiv.o
+[ 50%] Built target camodel_single_token_decode_splitk_kernel_merge_obj
+[ 50%] Building CXX object CMakeFiles/camodel_single_token_decode_splitk_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_splitk_kernel/host_stub.cpp.o
+[ 50%] Built target camodel_single_token_decode_splitk_kernel_host_stub_obj
+[ 50%] Linking CXX shared library lib/libcamodel_single_token_decode_splitk_kernel.so
+/usr/local/Ascend/cann-9.2.0-beta.2/bin/ascendc_pack_kernel /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/camodel_single_token_decode_splitk_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_splitk_kernel/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_merge_obj_dir/device_aiv.o 1 /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/camodel_single_token_decode_splitk_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_splitk_kernel/host_stub.cpp.o
+recompile: /usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s -shared -Wl,-soname,libcamodel_single_token_decode_splitk_kernel.so -o lib/libcamodel_single_token_decode_splitk_kernel.so CMakeFiles/camodel_single_token_decode_splitk_kernel_host_stub_obj.dir/auto_gen/camodel_single_token_decode_splitk_kernel/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_single_token_decode_splitk_kernel_host_dir/objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o    -L/usr/local/Ascend/cann-9.2.0-beta.2/lib64  -L/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib  -Wl,-rpath,/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib: /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendc_runtime.a -lascend_dump -lc_sec
+[ 50%] Built target camodel_single_token_decode_splitk_kernel
+[100%] Built target aic_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_preprocess-prefix/src/camodel_paged_decode_attention_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_preprocess-prefix/src/camodel_paged_decode_attention_kernel_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o[100%] Built target merge_aic_obj_text
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+[100%] Built target _host_cpp
+[ 50%] No install step for 'camodel_paged_decode_attention_kernel_preprocess'
+[ 50%] Completed 'camodel_paged_decode_attention_kernel_preprocess'
+[ 50%] Built target camodel_paged_decode_attention_kernel_preprocess
+[ 50%] Creating directories for 'camodel_paged_decode_attention_kernel_aic_device'
+[ 50%] Creating directories for 'camodel_paged_decode_attention_kernel_aiv_device'
+[ 50%] Creating directories for 'camodel_paged_decode_attention_kernel_host'
+[ 50%] No download step for 'camodel_paged_decode_attention_kernel_aiv_device'
+[ 62%] No download step for 'camodel_paged_decode_attention_kernel_aic_device'
+[ 62%] No download step for 'camodel_paged_decode_attention_kernel_host'
+[ 62%] No update step for 'camodel_paged_decode_attention_kernel_aiv_device'
+[ 62%] No update step for 'camodel_paged_decode_attention_kernel_host'
+[ 62%] No update step for 'camodel_paged_decode_attention_kernel_aic_device'
+[ 62%] No patch step for 'camodel_paged_decode_attention_kernel_aic_device'
+[ 62%] No patch step for 'camodel_paged_decode_attention_kernel_aiv_device'
+[ 62%] No patch step for 'camodel_paged_decode_attention_kernel_host'
+[ 62%] Performing configure step for 'camodel_paged_decode_attention_kernel_aiv_device'
+[ 62%] Performing configure step for 'camodel_paged_decode_attention_kernel_aic_device'
+[ 62%] Performing configure step for 'camodel_paged_decode_attention_kernel_host'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ASCEND_PYTHON_EXECUTABLE
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_host-prefix/src/camodel_paged_decode_attention_kernel_host-build
+[ 75%] Performing build step for 'camodel_paged_decode_attention_kernel_host'
+[100%] Building CXX object CMakeFiles/host_bisheng_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_aiv_device-prefix/src/camodel_paged_decode_attention_kernel_aiv_device-build
+[ 75%] Performing build step for 'camodel_paged_decode_attention_kernel_aiv_device'
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_aic_device-prefix/src/camodel_paged_decode_attention_kernel_aic_device-build
+[100%] Building CXX object CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_paged_decode_attention_kernel/auto_gen_turboquant_paged_decode_attention.cpp.o
+[ 75%] Performing build step for 'camodel_paged_decode_attention_kernel_aic_device'
+[100%] Building CXX object CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_paged_decode_attention_kernel/auto_gen_turboquant_paged_decode_attention.cpp.o
+[100%] Built target host_bisheng_obj
+[ 75%] Performing install step for 'camodel_paged_decode_attention_kernel_host'
+Consolidate compiler generated dependencies of target host_bisheng_obj
+[100%] Built target host_bisheng_obj
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_host_dir/./objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[ 75%] Completed 'camodel_paged_decode_attention_kernel_host'
+[ 75%] Built target camodel_paged_decode_attention_kernel_host
+[100%] Built target device_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_aic_device-prefix/src/camodel_paged_decode_attention_kernel_aic_device-build/CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_paged_decode_attention_kernel/auto_gen_turboquant_paged_decode_attention.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_aic_device_dir/device.o
+[100%] Built target merge_device_obj
+[ 75%] No install step for 'camodel_paged_decode_attention_kernel_aic_device'
+[100%] Built target device_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_aiv_device-prefix/src/camodel_paged_decode_attention_kernel_aiv_device-build/CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_paged_decode_attention_kernel/auto_gen_turboquant_paged_decode_attention.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_aiv_device_dir/device.o
+[ 75%] Completed 'camodel_paged_decode_attention_kernel_aic_device'
+[100%] Built target merge_device_obj
+[ 75%] No install step for 'camodel_paged_decode_attention_kernel_aiv_device'
+[ 75%] Built target camodel_paged_decode_attention_kernel_aic_device
+[ 75%] Completed 'camodel_paged_decode_attention_kernel_aiv_device'
+[ 75%] Built target camodel_paged_decode_attention_kernel_aiv_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_aic_device_dir/device.o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_aiv_device_dir/device.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_merge_obj_dir/device.o
+[ 75%] Built target camodel_paged_decode_attention_kernel_merge_obj
+[ 75%] Building CXX object CMakeFiles/camodel_paged_decode_attention_kernel_host_stub_obj.dir/auto_gen/camodel_paged_decode_attention_kernel/host_stub.cpp.o
+[ 75%] Built target camodel_paged_decode_attention_kernel_host_stub_obj
+[ 75%] Linking CXX shared library lib/libcamodel_paged_decode_attention_kernel.so
+/usr/local/Ascend/cann-9.2.0-beta.2/bin/ascendc_pack_kernel /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/camodel_paged_decode_attention_kernel_host_stub_obj.dir/auto_gen/camodel_paged_decode_attention_kernel/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_merge_obj_dir/device.o 0 /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/camodel_paged_decode_attention_kernel_host_stub_obj.dir/auto_gen/camodel_paged_decode_attention_kernel/host_stub.cpp.o
+recompile: /usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s -shared -Wl,-soname,libcamodel_paged_decode_attention_kernel.so -o lib/libcamodel_paged_decode_attention_kernel.so CMakeFiles/camodel_paged_decode_attention_kernel_host_stub_obj.dir/auto_gen/camodel_paged_decode_attention_kernel/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_paged_decode_attention_kernel_host_dir/objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o    -L/usr/local/Ascend/cann-9.2.0-beta.2/lib64  -L/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib  -Wl,-rpath,/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib: /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendc_runtime.a -lascend_dump -lc_sec
+[ 75%] Built target camodel_paged_decode_attention_kernel
+[100%] Built target aiv_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_preprocess-prefix/src/camodel_fused_decode_opt_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_preprocess-prefix/src/camodel_fused_decode_opt_kernel_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o[100%] Built target merge_aiv_obj_text
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+[100%] Built target _host_cpp
+[ 75%] No install step for 'camodel_fused_decode_opt_kernel_preprocess'
+[ 75%] Completed 'camodel_fused_decode_opt_kernel_preprocess'
+[ 75%] Built target camodel_fused_decode_opt_kernel_preprocess
+[ 75%] Creating directories for 'camodel_fused_decode_opt_kernel_aic_device'
+[ 75%] Creating directories for 'camodel_fused_decode_opt_kernel_aiv_device'
+[ 75%] Creating directories for 'camodel_fused_decode_opt_kernel_host'
+[ 75%] No download step for 'camodel_fused_decode_opt_kernel_host'
+[ 75%] No download step for 'camodel_fused_decode_opt_kernel_aiv_device'
+[ 75%] No download step for 'camodel_fused_decode_opt_kernel_aic_device'
+[ 75%] No update step for 'camodel_fused_decode_opt_kernel_host'
+[ 87%] No update step for 'camodel_fused_decode_opt_kernel_aiv_device'
+[ 87%] No update step for 'camodel_fused_decode_opt_kernel_aic_device'
+[ 87%] No patch step for 'camodel_fused_decode_opt_kernel_aiv_device'
+[ 87%] No patch step for 'camodel_fused_decode_opt_kernel_host'
+[ 87%] No patch step for 'camodel_fused_decode_opt_kernel_aic_device'
+[ 87%] Performing configure step for 'camodel_fused_decode_opt_kernel_aiv_device'
+[ 87%] Performing configure step for 'camodel_fused_decode_opt_kernel_aic_device'
+[ 87%] Performing configure step for 'camodel_fused_decode_opt_kernel_host'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Detecting CXX compiler ABI info - done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_aiv_device-prefix/src/camodel_fused_decode_opt_kernel_aiv_device-build
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_aic_device-prefix/src/camodel_fused_decode_opt_kernel_aic_device-build
+[ 87%] Performing build step for 'camodel_fused_decode_opt_kernel_aiv_device'
+[ 87%] Performing build step for 'camodel_fused_decode_opt_kernel_aic_device'
+[100%] Building CXX object CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_fused_decode_opt_kernel/auto_gen_turboquant_fused_decode_opt.cpp.o
+[100%] Building CXX object CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_fused_decode_opt_kernel/auto_gen_turboquant_fused_decode_opt.cpp.o
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ASCEND_PYTHON_EXECUTABLE
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_host-prefix/src/camodel_fused_decode_opt_kernel_host-build
+[ 87%] Performing build step for 'camodel_fused_decode_opt_kernel_host'
+[100%] Building CXX object CMakeFiles/host_bisheng_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+[100%] Built target host_bisheng_obj
+[ 87%] Performing install step for 'camodel_fused_decode_opt_kernel_host'
+Consolidate compiler generated dependencies of target host_bisheng_obj
+[100%] Built target host_bisheng_obj
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_host_dir/./objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+[ 87%] Completed 'camodel_fused_decode_opt_kernel_host'
+[ 87%] Built target camodel_fused_decode_opt_kernel_host
+[100%] Built target device_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_aic_device-prefix/src/camodel_fused_decode_opt_kernel_aic_device-build/CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_fused_decode_opt_kernel/auto_gen_turboquant_fused_decode_opt.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_aic_device_dir/device.o
+[100%] Built target merge_device_obj
+[ 87%] No install step for 'camodel_fused_decode_opt_kernel_aic_device'
+[100%] Completed 'camodel_fused_decode_opt_kernel_aic_device'
+[100%] Built target camodel_fused_decode_opt_kernel_aic_device
+[100%] Built target device_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_aiv_device-prefix/src/camodel_fused_decode_opt_kernel_aiv_device-build/CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/camodel_fused_decode_opt_kernel/auto_gen_turboquant_fused_decode_opt.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_aiv_device_dir/device.o
+[100%] Built target merge_device_obj
+[100%] No install step for 'camodel_fused_decode_opt_kernel_aiv_device'
+[100%] Completed 'camodel_fused_decode_opt_kernel_aiv_device'
+[100%] Built target camodel_fused_decode_opt_kernel_aiv_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_aic_device_dir/device.o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_aiv_device_dir/device.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_merge_obj_dir/device.o
+[100%] Built target camodel_fused_decode_opt_kernel_merge_obj
+[100%] Building CXX object CMakeFiles/camodel_fused_decode_opt_kernel_host_stub_obj.dir/auto_gen/camodel_fused_decode_opt_kernel/host_stub.cpp.o
+[100%] Built target camodel_fused_decode_opt_kernel_host_stub_obj
+[100%] Linking CXX shared library lib/libcamodel_fused_decode_opt_kernel.so
+/usr/local/Ascend/cann-9.2.0-beta.2/bin/ascendc_pack_kernel /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/camodel_fused_decode_opt_kernel_host_stub_obj.dir/auto_gen/camodel_fused_decode_opt_kernel/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_merge_obj_dir/device.o 0 /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/camodel_fused_decode_opt_kernel_host_stub_obj.dir/auto_gen/camodel_fused_decode_opt_kernel/host_stub.cpp.o
+recompile: /usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s -shared -Wl,-soname,libcamodel_fused_decode_opt_kernel.so -o lib/libcamodel_fused_decode_opt_kernel.so CMakeFiles/camodel_fused_decode_opt_kernel_host_stub_obj.dir/auto_gen/camodel_fused_decode_opt_kernel/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/camodel_fused_decode_opt_kernel_host_dir/objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o    -L/usr/local/Ascend/cann-9.2.0-beta.2/lib64  -L/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib  -Wl,-rpath,/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib: /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendc_runtime.a -lascend_dump -lc_sec
+[100%] Built target camodel_fused_decode_opt_kernel
+[100%] Building CXX object CMakeFiles/bench_decode_splitk_sim.dir/tests/npu/bench/bench_turboquant_decode_splitk.cpp.o
+[100%] Linking CXX executable lib/bench_decode_splitk_sim
+[100%] Built target bench_decode_splitk_sim
+[  0%] Creating directories for 'turboquant_fused_decode_opt_npu_precompile'
+[  0%] Creating directories for 'turboquant_paged_decode_npu_precompile'
+[  0%] Creating directories for 'turboquant_single_token_decode_splitk_npu_precompile'
+[  0%] No download step for 'turboquant_fused_decode_opt_npu_precompile'
+[  0%] No download step for 'turboquant_paged_decode_npu_precompile'
+[  0%] No download step for 'turboquant_single_token_decode_splitk_npu_precompile'
+[  0%] No update step for 'turboquant_paged_decode_npu_precompile'
+[  0%] No update step for 'turboquant_fused_decode_opt_npu_precompile'
+[  0%] No update step for 'turboquant_single_token_decode_splitk_npu_precompile'
+[  0%] No patch step for 'turboquant_fused_decode_opt_npu_precompile'
+[  0%] No patch step for 'turboquant_paged_decode_npu_precompile'
+[  0%] No patch step for 'turboquant_single_token_decode_splitk_npu_precompile'
+[  0%] Performing configure step for 'turboquant_fused_decode_opt_npu_precompile'
+[  0%] Performing configure step for 'turboquant_paged_decode_npu_precompile'
+[  0%] Performing configure step for 'turboquant_single_token_decode_splitk_npu_precompile'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features - done
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Configuring done
+-- Generating done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    DYNAMIC_MODE
+    INCLUDE_DIR
+
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    DYNAMIC_MODE
+    INCLUDE_DIR
+
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_precompile-prefix/src/turboquant_single_token_decode_splitk_npu_precompile-build
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_precompile-prefix/src/turboquant_fused_decode_opt_npu_precompile-build
+[  0%] Performing build step for 'turboquant_single_token_decode_splitk_npu_precompile'
+[  0%] Performing build step for 'turboquant_fused_decode_opt_npu_precompile'
+[100%] Building CXX object CMakeFiles/precompile_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+[100%] Building CXX object CMakeFiles/precompile_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    DYNAMIC_MODE
+    INCLUDE_DIR
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_precompile-prefix/src/turboquant_paged_decode_npu_precompile-build
+[  0%] Performing build step for 'turboquant_paged_decode_npu_precompile'
+[100%] Built target precompile_obj
+[100%] Built target precompile_obj
+[100%] Building CXX object CMakeFiles/precompile_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[100%] Built target check_src_template
+[100%] Built target check_src_template
+[  0%] No install step for 'turboquant_fused_decode_opt_npu_precompile'
+[ 11%] No install step for 'turboquant_single_token_decode_splitk_npu_precompile'
+[ 11%] Completed 'turboquant_single_token_decode_splitk_npu_precompile'
+[ 11%] Completed 'turboquant_fused_decode_opt_npu_precompile'
+[ 11%] Built target turboquant_single_token_decode_splitk_npu_precompile
+[ 11%] Built target turboquant_fused_decode_opt_npu_precompile
+[ 11%] Creating directories for 'turboquant_single_token_decode_splitk_npu_preprocess'
+[ 11%] Creating directories for 'turboquant_fused_decode_opt_npu_preprocess'
+[ 11%] No download step for 'turboquant_single_token_decode_splitk_npu_preprocess'
+[ 11%] No download step for 'turboquant_fused_decode_opt_npu_preprocess'
+[ 11%] No update step for 'turboquant_single_token_decode_splitk_npu_preprocess'
+[ 11%] No update step for 'turboquant_fused_decode_opt_npu_preprocess'
+[ 11%] No patch step for 'turboquant_single_token_decode_splitk_npu_preprocess'
+[ 11%] No patch step for 'turboquant_fused_decode_opt_npu_preprocess'
+[ 11%] Performing configure step for 'turboquant_single_token_decode_splitk_npu_preprocess'
+[ 22%] Performing configure step for 'turboquant_fused_decode_opt_npu_preprocess'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+[100%] Built target precompile_obj
+[100%] Built target check_src_template
+[ 22%] No install step for 'turboquant_paged_decode_npu_precompile'
+[ 22%] Completed 'turboquant_paged_decode_npu_precompile'
+[ 22%] Built target turboquant_paged_decode_npu_precompile
+[ 22%] Creating directories for 'turboquant_paged_decode_npu_preprocess'
+[ 22%] No download step for 'turboquant_paged_decode_npu_preprocess'
+[ 22%] No update step for 'turboquant_paged_decode_npu_preprocess'
+[ 22%] No patch step for 'turboquant_paged_decode_npu_preprocess'
+[ 22%] Performing configure step for 'turboquant_paged_decode_npu_preprocess'
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_preprocess-prefix/src/turboquant_fused_decode_opt_npu_preprocess-build
+[ 22%] Performing prepare_core_objects step for 'turboquant_fused_decode_opt_npu_preprocess'
+CANN preprocess: removed 0 consumed core object(s) in /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_preprocess-prefix/src/turboquant_fused_decode_opt_npu_preprocess-build
+[ 22%] Performing build step for 'turboquant_fused_decode_opt_npu_preprocess'
+-- Detecting CXX compiler ABI info - done
+[ 33%] Building CXX object CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+[ 66%] Building CXX object CMakeFiles/preprocess_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_preprocess-prefix/src/turboquant_single_token_decode_splitk_npu_preprocess-build
+[ 22%] Performing prepare_core_objects step for 'turboquant_single_token_decode_splitk_npu_preprocess'
+CANN preprocess: removed 0 consumed core object(s) in /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_preprocess-prefix/src/turboquant_single_token_decode_splitk_npu_preprocess-build
+[ 22%] Performing build step for 'turboquant_single_token_decode_splitk_npu_preprocess'
+[ 33%] Building CXX object CMakeFiles/preprocess_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+-- Detecting C compiler ABI info
+[ 66%] Built target preprocess_obj
+-- Detecting C compiler ABI info - done
+[100%] Building CXX object CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+[ 33%] Built target preprocess_obj
+[ 66%] Building CXX object CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_preprocess-prefix/src/turboquant_paged_decode_npu_preprocess-build
+[ 22%] Performing prepare_core_objects step for 'turboquant_paged_decode_npu_preprocess'
+CANN preprocess: removed 0 consumed core object(s) in /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_preprocess-prefix/src/turboquant_paged_decode_npu_preprocess-build
+[ 33%] Performing build step for 'turboquant_paged_decode_npu_preprocess'
+[ 33%] Building CXX object CMakeFiles/preprocess_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[ 33%] Built target preprocess_obj
+[ 66%] Building CXX object CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[ 66%] Built target aiv_obj
+[100%] Building CXX object CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target aic_obj
+[100%] Building CXX object CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[100%] Built target aic_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_preprocess-prefix/src/turboquant_single_token_decode_splitk_npu_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_preprocess-prefix/src/turboquant_single_token_decode_splitk_npu_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o[100%] Built target merge_aiv_obj_text
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_preprocess-prefix/src/turboquant_single_token_decode_splitk_npu_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_preprocess-prefix/src/turboquant_single_token_decode_splitk_npu_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o[100%] Built target merge_aic_obj_text
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+[100%] Built target _host_cpp
+[ 33%] No install step for 'turboquant_single_token_decode_splitk_npu_preprocess'
+[ 33%] Completed 'turboquant_single_token_decode_splitk_npu_preprocess'
+[ 33%] Built target turboquant_single_token_decode_splitk_npu_preprocess
+[ 33%] Creating directories for 'turboquant_single_token_decode_splitk_npu_aiv_device'
+[ 33%] No download step for 'turboquant_single_token_decode_splitk_npu_aiv_device'
+[ 33%] No update step for 'turboquant_single_token_decode_splitk_npu_aiv_device'
+[ 33%] No patch step for 'turboquant_single_token_decode_splitk_npu_aiv_device'
+[ 33%] Performing configure step for 'turboquant_single_token_decode_splitk_npu_aiv_device'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_aiv_device-prefix/src/turboquant_single_token_decode_splitk_npu_aiv_device-build
+[ 33%] Performing build step for 'turboquant_single_token_decode_splitk_npu_aiv_device'
+[100%] Building CXX object CMakeFiles/device_aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_single_token_decode_splitk_npu/auto_gen_turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target aiv_obj
+[ 33%] Creating directories for 'turboquant_single_token_decode_splitk_npu_aic_device'
+[ 33%] No download step for 'turboquant_single_token_decode_splitk_npu_aic_device'
+[ 33%] No update step for 'turboquant_single_token_decode_splitk_npu_aic_device'
+[ 33%] No patch step for 'turboquant_single_token_decode_splitk_npu_aic_device'
+[ 44%] Performing configure step for 'turboquant_single_token_decode_splitk_npu_aic_device'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    BUILD_MODE
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_aic_device-prefix/src/turboquant_single_token_decode_splitk_npu_aic_device-build
+[ 44%] Performing build step for 'turboquant_single_token_decode_splitk_npu_aic_device'
+[ 44%] No install step for 'turboquant_single_token_decode_splitk_npu_aic_device'
+[ 44%] Completed 'turboquant_single_token_decode_splitk_npu_aic_device'
+[ 44%] Built target turboquant_single_token_decode_splitk_npu_aic_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_preprocess-prefix/src/turboquant_paged_decode_npu_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_preprocess-prefix/src/turboquant_paged_decode_npu_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o[100%] Built target merge_aiv_obj_text
+[ 44%] Creating directories for 'turboquant_single_token_decode_splitk_npu_host'
+[ 44%] No download step for 'turboquant_single_token_decode_splitk_npu_host'
+[ 44%] No update step for 'turboquant_single_token_decode_splitk_npu_host'
+[ 44%] No patch step for 'turboquant_single_token_decode_splitk_npu_host'
+[ 44%] Performing configure step for 'turboquant_single_token_decode_splitk_npu_host'
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ASCEND_PYTHON_EXECUTABLE
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_host-prefix/src/turboquant_single_token_decode_splitk_npu_host-build
+[ 44%] Performing build step for 'turboquant_single_token_decode_splitk_npu_host'
+[100%] Building CXX object CMakeFiles/host_bisheng_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[100%] Built target host_bisheng_obj
+[ 44%] Performing install step for 'turboquant_single_token_decode_splitk_npu_host'
+Consolidate compiler generated dependencies of target host_bisheng_obj
+[100%] Built target host_bisheng_obj
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_host_dir/./objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o
+[ 55%] Completed 'turboquant_single_token_decode_splitk_npu_host'
+[ 55%] Built target turboquant_single_token_decode_splitk_npu_host
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_preprocess-prefix/src/turboquant_fused_decode_opt_npu_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_preprocess-prefix/src/turboquant_fused_decode_opt_npu_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o[100%] Built target merge_aic_obj_text
+[100%] Built target device_aiv_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_aiv_device-prefix/src/turboquant_single_token_decode_splitk_npu_aiv_device-build/CMakeFiles/device_aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_single_token_decode_splitk_npu/auto_gen_turboquant_single_token_decode_splitk_aiv.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_aiv_device_dir/device_aiv.o
+[100%] Built target merge_aiv_device_obj
+[ 55%] No install step for 'turboquant_single_token_decode_splitk_npu_aiv_device'
+[ 55%] Completed 'turboquant_single_token_decode_splitk_npu_aiv_device'
+[ 55%] Built target turboquant_single_token_decode_splitk_npu_aiv_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_aiv_device_dir/device_aiv.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_merge_obj_dir/device_aiv.o
+[ 55%] Built target turboquant_single_token_decode_splitk_npu_merge_obj
+[ 55%] Building CXX object CMakeFiles/turboquant_single_token_decode_splitk_npu_host_stub_obj.dir/auto_gen/turboquant_single_token_decode_splitk_npu/host_stub.cpp.o
+[ 55%] Built target turboquant_single_token_decode_splitk_npu_host_stub_obj
+[ 55%] Linking CXX shared library lib/libturboquant_single_token_decode_splitk_npu.so
+/usr/local/Ascend/cann-9.2.0-beta.2/bin/ascendc_pack_kernel /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/turboquant_single_token_decode_splitk_npu_host_stub_obj.dir/auto_gen/turboquant_single_token_decode_splitk_npu/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_merge_obj_dir/device_aiv.o 1 /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/turboquant_single_token_decode_splitk_npu_host_stub_obj.dir/auto_gen/turboquant_single_token_decode_splitk_npu/host_stub.cpp.o
+recompile: /usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s -shared -Wl,-soname,libturboquant_single_token_decode_splitk_npu.so -o lib/libturboquant_single_token_decode_splitk_npu.so CMakeFiles/turboquant_single_token_decode_splitk_npu_host_stub_obj.dir/auto_gen/turboquant_single_token_decode_splitk_npu/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_single_token_decode_splitk_npu_host_dir/objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp.o    -L/usr/local/Ascend/cann-9.2.0-beta.2/lib64  -L/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib  -Wl,-rpath,/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib: /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendc_runtime.a -lascend_dump -lc_sec
+[100%] Built target aic_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_preprocess-prefix/src/turboquant_paged_decode_npu_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_preprocess-prefix/src/turboquant_paged_decode_npu_preprocess-build/CMakeFiles/aic_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o[100%] Built target merge_aic_obj_text
+[ 55%] Built target turboquant_single_token_decode_splitk_npu
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+[100%] Built target _host_cpp
+[ 55%] No install step for 'turboquant_paged_decode_npu_preprocess'
+[ 55%] Completed 'turboquant_paged_decode_npu_preprocess'
+[ 55%] Built target turboquant_paged_decode_npu_preprocess
+[ 66%] Creating directories for 'turboquant_paged_decode_npu_host'
+[ 66%] Creating directories for 'turboquant_paged_decode_npu_aiv_device'
+[ 66%] Creating directories for 'turboquant_paged_decode_npu_aic_device'
+[ 66%] No download step for 'turboquant_paged_decode_npu_aiv_device'
+[ 66%] No download step for 'turboquant_paged_decode_npu_aic_device'
+[ 66%] No download step for 'turboquant_paged_decode_npu_host'
+[ 66%] No update step for 'turboquant_paged_decode_npu_aiv_device'
+[ 66%] No update step for 'turboquant_paged_decode_npu_host'
+[ 77%] No update step for 'turboquant_paged_decode_npu_aic_device'
+[ 77%] No patch step for 'turboquant_paged_decode_npu_aiv_device'
+[ 77%] No patch step for 'turboquant_paged_decode_npu_aic_device'
+[ 77%] No patch step for 'turboquant_paged_decode_npu_host'
+[ 77%] Performing configure step for 'turboquant_paged_decode_npu_aiv_device'
+[ 77%] Performing configure step for 'turboquant_paged_decode_npu_aic_device'
+[ 77%] Performing configure step for 'turboquant_paged_decode_npu_host'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_aiv_device-prefix/src/turboquant_paged_decode_npu_aiv_device-build
+[ 77%] Performing build step for 'turboquant_paged_decode_npu_aiv_device'
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+[100%] Building CXX object CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_paged_decode_npu/auto_gen_turboquant_paged_decode_attention.cpp.o
+-- Detecting CXX compiler ABI info - done
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ASCEND_PYTHON_EXECUTABLE
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_host-prefix/src/turboquant_paged_decode_npu_host-build
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_aic_device-prefix/src/turboquant_paged_decode_npu_aic_device-build
+[ 77%] Performing build step for 'turboquant_paged_decode_npu_host'
+[ 77%] Performing build step for 'turboquant_paged_decode_npu_aic_device'
+[100%] Building CXX object CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_paged_decode_npu/auto_gen_turboquant_paged_decode_attention.cpp.o
+[100%] Building CXX object CMakeFiles/host_bisheng_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[100%] Built target host_bisheng_obj
+[ 77%] Performing install step for 'turboquant_paged_decode_npu_host'
+Consolidate compiler generated dependencies of target host_bisheng_obj
+[100%] Built target host_bisheng_obj
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_host_dir/./objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o
+[ 77%] Completed 'turboquant_paged_decode_npu_host'
+[ 77%] Built target turboquant_paged_decode_npu_host
+[100%] Built target device_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_aiv_device-prefix/src/turboquant_paged_decode_npu_aiv_device-build/CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_paged_decode_npu/auto_gen_turboquant_paged_decode_attention.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_aiv_device_dir/device.o
+[100%] Built target merge_device_obj
+[ 77%] No install step for 'turboquant_paged_decode_npu_aiv_device'
+[ 77%] Completed 'turboquant_paged_decode_npu_aiv_device'
+[100%] Built target device_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_aic_device-prefix/src/turboquant_paged_decode_npu_aic_device-build/CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_paged_decode_npu/auto_gen_turboquant_paged_decode_attention.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_aic_device_dir/device.o
+[ 77%] Built target turboquant_paged_decode_npu_aiv_device
+[100%] Built target merge_device_obj
+[ 77%] No install step for 'turboquant_paged_decode_npu_aic_device'
+[ 77%] Completed 'turboquant_paged_decode_npu_aic_device'
+[ 77%] Built target turboquant_paged_decode_npu_aic_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_aic_device_dir/device.o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_aiv_device_dir/device.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_merge_obj_dir/device.o
+[ 77%] Built target turboquant_paged_decode_npu_merge_obj
+[ 77%] Building CXX object CMakeFiles/turboquant_paged_decode_npu_host_stub_obj.dir/auto_gen/turboquant_paged_decode_npu/host_stub.cpp.o
+[ 77%] Built target turboquant_paged_decode_npu_host_stub_obj
+[ 77%] Linking CXX shared library lib/libturboquant_paged_decode_npu.so
+/usr/local/Ascend/cann-9.2.0-beta.2/bin/ascendc_pack_kernel /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/turboquant_paged_decode_npu_host_stub_obj.dir/auto_gen/turboquant_paged_decode_npu/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_merge_obj_dir/device.o 0 /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/turboquant_paged_decode_npu_host_stub_obj.dir/auto_gen/turboquant_paged_decode_npu/host_stub.cpp.o
+recompile: /usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s -shared -Wl,-soname,libturboquant_paged_decode_npu.so -o lib/libturboquant_paged_decode_npu.so CMakeFiles/turboquant_paged_decode_npu_host_stub_obj.dir/auto_gen/turboquant_paged_decode_npu/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_paged_decode_npu_host_dir/objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_paged_decode_attention.cpp.o    -L/usr/local/Ascend/cann-9.2.0-beta.2/lib64  -L/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib  -Wl,-rpath,/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib: /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendc_runtime.a -lascend_dump -lc_sec
+[ 77%] Built target turboquant_paged_decode_npu
+[100%] Built target aiv_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_preprocess-prefix/src/turboquant_fused_decode_opt_npu_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_preprocess-prefix/src/turboquant_fused_decode_opt_npu_preprocess-build/CMakeFiles/aiv_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o[100%] Built target merge_aiv_obj_text
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+[100%] Built target _host_cpp
+[ 77%] No install step for 'turboquant_fused_decode_opt_npu_preprocess'
+[ 77%] Completed 'turboquant_fused_decode_opt_npu_preprocess'
+[ 77%] Built target turboquant_fused_decode_opt_npu_preprocess
+[ 77%] Creating directories for 'turboquant_fused_decode_opt_npu_host'
+[ 77%] Creating directories for 'turboquant_fused_decode_opt_npu_aiv_device'
+[ 77%] Creating directories for 'turboquant_fused_decode_opt_npu_aic_device'
+[ 77%] No download step for 'turboquant_fused_decode_opt_npu_aic_device'
+[ 77%] No download step for 'turboquant_fused_decode_opt_npu_aiv_device'
+[ 77%] No download step for 'turboquant_fused_decode_opt_npu_host'
+[ 77%] No update step for 'turboquant_fused_decode_opt_npu_aiv_device'
+[ 77%] No update step for 'turboquant_fused_decode_opt_npu_aic_device'
+[ 88%] No update step for 'turboquant_fused_decode_opt_npu_host'
+[ 88%] No patch step for 'turboquant_fused_decode_opt_npu_aiv_device'
+[ 88%] No patch step for 'turboquant_fused_decode_opt_npu_aic_device'
+[ 88%] No patch step for 'turboquant_fused_decode_opt_npu_host'
+[ 88%] Performing configure step for 'turboquant_fused_decode_opt_npu_aic_device'
+[ 88%] Performing configure step for 'turboquant_fused_decode_opt_npu_aiv_device'
+[ 88%] Performing configure step for 'turboquant_fused_decode_opt_npu_host'
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features - done
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Configuring done
+-- Generating done
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ASCEND_PYTHON_EXECUTABLE
+
+
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_host-prefix/src/turboquant_fused_decode_opt_npu_host-build
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_aiv_device-prefix/src/turboquant_fused_decode_opt_npu_aiv_device-build
+[ 88%] Performing build step for 'turboquant_fused_decode_opt_npu_host'
+[100%] Performing build step for 'turboquant_fused_decode_opt_npu_aiv_device'
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_aic_device-prefix/src/turboquant_fused_decode_opt_npu_aic_device-build
+[100%] Building CXX object CMakeFiles/host_bisheng_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+[100%] Building CXX object CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_fused_decode_opt_npu/auto_gen_turboquant_fused_decode_opt.cpp.o
+[100%] Performing build step for 'turboquant_fused_decode_opt_npu_aic_device'
+[100%] Building CXX object CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_fused_decode_opt_npu/auto_gen_turboquant_fused_decode_opt.cpp.o
+[100%] Built target host_bisheng_obj
+[100%] Performing install step for 'turboquant_fused_decode_opt_npu_host'
+Consolidate compiler generated dependencies of target host_bisheng_obj
+[100%] Built target host_bisheng_obj
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_host_dir/./objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o
+[100%] Completed 'turboquant_fused_decode_opt_npu_host'
+[100%] Built target turboquant_fused_decode_opt_npu_host
+[100%] Built target device_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_aic_device-prefix/src/turboquant_fused_decode_opt_npu_aic_device-build/CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_fused_decode_opt_npu/auto_gen_turboquant_fused_decode_opt.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_aic_device_dir/device.o
+[100%] Built target merge_device_obj
+[100%] No install step for 'turboquant_fused_decode_opt_npu_aic_device'
+[100%] Completed 'turboquant_fused_decode_opt_npu_aic_device'
+[100%] Built target turboquant_fused_decode_opt_npu_aic_device
+[100%] Built target device_obj
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_aiv_device-prefix/src/turboquant_fused_decode_opt_npu_aiv_device-build/CMakeFiles/device_obj.dir/tmp/ascend-fused-opt-bench.yOuivK/build/auto_gen/turboquant_fused_decode_opt_npu/auto_gen_turboquant_fused_decode_opt.cpp.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_aiv_device_dir/device.o
+[100%] Built target merge_device_obj
+[100%] No install step for 'turboquant_fused_decode_opt_npu_aiv_device'
+[100%] Completed 'turboquant_fused_decode_opt_npu_aiv_device'
+[100%] Built target turboquant_fused_decode_opt_npu_aiv_device
+/usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_aic_device_dir/device.o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_aiv_device_dir/device.o -static -o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_merge_obj_dir/device.o
+[100%] Built target turboquant_fused_decode_opt_npu_merge_obj
+[100%] Building CXX object CMakeFiles/turboquant_fused_decode_opt_npu_host_stub_obj.dir/auto_gen/turboquant_fused_decode_opt_npu/host_stub.cpp.o
+[100%] Built target turboquant_fused_decode_opt_npu_host_stub_obj
+[100%] Linking CXX shared library lib/libturboquant_fused_decode_opt_npu.so
+/usr/local/Ascend/cann-9.2.0-beta.2/bin/ascendc_pack_kernel /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/turboquant_fused_decode_opt_npu_host_stub_obj.dir/auto_gen/turboquant_fused_decode_opt_npu/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_merge_obj_dir/device.o 0 /tmp/ascend-fused-opt-bench.yOuivK/build/CMakeFiles/turboquant_fused_decode_opt_npu_host_stub_obj.dir/auto_gen/turboquant_fused_decode_opt_npu/host_stub.cpp.o
+recompile: /usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -s -shared -Wl,-soname,libturboquant_fused_decode_opt_npu.so -o lib/libturboquant_fused_decode_opt_npu.so CMakeFiles/turboquant_fused_decode_opt_npu_host_stub_obj.dir/auto_gen/turboquant_fused_decode_opt_npu/host_stub.cpp.o /tmp/ascend-fused-opt-bench.yOuivK/build/turboquant_fused_decode_opt_npu_host_dir/objects-Release/host_bisheng_obj/tmp/ascend-fused-opt-bench.yOuivK/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp.o    -L/usr/local/Ascend/cann-9.2.0-beta.2/lib64  -L/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib  -Wl,-rpath,/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib: /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendc_runtime.a -lascend_dump -lc_sec
+[100%] Built target turboquant_fused_decode_opt_npu
+[100%] Building CXX object CMakeFiles/bench_turboquant_decode_splitk.dir/tests/npu/bench/bench_turboquant_decode_splitk.cpp.o
+[100%] Linking CXX executable lib/bench_turboquant_decode_splitk
+[100%] Built target bench_turboquant_decode_splitk
+Building CXX object CMakeFiles/test_fused_decode_opt_fixture.dir/tests/cpu/test_fused_decode_opt_fixture.cpp.o
+Linking CXX executable lib/test_fused_decode_opt_fixture
+Built target test_fused_decode_opt_fixture

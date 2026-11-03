@@ -1,0 +1,10 @@
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+--context N[,N...] --splitk K[,K...] --warmup N --iters N --requests N --heads N --rows N --page-tokens N
+--impl aiv|aic|both|fused-opt|all --single --csv-out PATH --page-begin P --page-count P
+Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8,12,16.
+fused-opt: separate KV4/FP8 fixture; --rows is GQA query heads per KV head; K 1..8.
+Its default K sweep is 1,2,4,8. --impl all leaves opt columns NA at K>8.
+fused-opt supports --rows 1..16; legacy/all supports --rows 1..8.
+fused-opt page-tokens: 64 or 128; other implementations: 16 or 128.
+Use --page-tokens 16 --heads 1 --context 48 for a short CAModel run.

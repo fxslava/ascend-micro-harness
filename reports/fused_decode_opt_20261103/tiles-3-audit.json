@@ -1,0 +1,542 @@
+{
+  "status": "PASS",
+  "hardevents": "capacity-one, balanced dispatch/completion, empty drain",
+  "cross_core": {
+    "core0.veccore0 waits id m2:10 on SCALAR": {
+      "stalls": [
+        14,
+        21
+      ],
+      "wait_ticks": [
+        29104,
+        31498
+      ],
+      "producer_set_ticks": [
+        26908,
+        31474
+      ],
+      "counter_increment_ticks": [
+        26908,
+        31474
+      ]
+    },
+    "core0.veccore0 waits id m2:6 on SCALAR": {
+      "stalls": [
+        2844,
+        2888
+      ],
+      "wait_ticks": [
+        10532,
+        22623
+      ],
+      "producer_set_ticks": [
+        9533,
+        17994
+      ],
+      "counter_increment_ticks": [
+        9533,
+        17994
+      ]
+    },
+    "core0.veccore0 waits id m2:7 on SCALAR": {
+      "stalls": [
+        3315
+      ],
+      "wait_ticks": [
+        17591
+      ],
+      "producer_set_ticks": [
+        10881
+      ],
+      "counter_increment_ticks": [
+        10881
+      ]
+    },
+    "core0.veccore0 waits id m2:8 on SCALAR": {
+      "stalls": [
+        4364,
+        3162,
+        2207
+      ],
+      "wait_ticks": [
+        16542,
+        22349,
+        26911
+      ],
+      "producer_set_ticks": [
+        15322,
+        22340,
+        26877
+      ],
+      "counter_increment_ticks": [
+        15322,
+        22340,
+        26877
+      ]
+    },
+    "core0.veccore1 waits id m2:10 on SCALAR": {
+      "stalls": [
+        14,
+        21
+      ],
+      "wait_ticks": [
+        29672,
+        32335
+      ],
+      "producer_set_ticks": [
+        26908,
+        31474
+      ],
+      "counter_increment_ticks": [
+        26908,
+        31474
+      ]
+    },
+    "core0.veccore1 waits id m2:6 on SCALAR": {
+      "stalls": [
+        2979,
+        2870
+      ],
+      "wait_ticks": [
+        11588,
+        23683
+      ],
+      "producer_set_ticks": [
+        9533,
+        17994
+      ],
+      "counter_increment_ticks": [
+        9533,
+        17994
+      ]
+    },
+    "core0.veccore1 waits id m2:7 on SCALAR": {
+      "stalls": [
+        3221
+      ],
+      "wait_ticks": [
+        18795
+      ],
+      "producer_set_ticks": [
+        10881
+      ],
+      "counter_increment_ticks": [
+        10881
+      ]
+    },
+    "core0.veccore1 waits id m2:8 on SCALAR": {
+      "stalls": [
+        4286,
+        3425,
+        1822
+      ],
+      "wait_ticks": [
+        17730,
+        23128,
+        27864
+      ],
+      "producer_set_ticks": [
+        15322,
+        22340,
+        26877
+      ],
+      "counter_increment_ticks": [
+        15322,
+        22340,
+        26877
+      ]
+    },
+    "core0.cubecore0 waits id m2:0 on SCALAR": {
+      "stalls": [
+        290
+      ],
+      "wait_ticks": [
+        9242
+      ],
+      "producer_set_ticks": [
+        8326,
+        9233
+      ],
+      "counter_increment_ticks": [
+        9233
+      ]
+    },
+    "core0.cubecore0 waits id m2:1 on SCALAR": {
+      "stalls": [
+        269
+      ],
+      "wait_ticks": [
+        10611
+      ],
+      "producer_set_ticks": [
+        9695,
+        10602
+      ],
+      "counter_increment_ticks": [
+        10602
+      ]
+    },
+    "core0.cubecore0 waits id m2:10 on SCALAR": {
+      "stalls": [
+        12,
+        12
+      ],
+      "wait_ticks": [
+        31422,
+        32370
+      ],
+      "producer_set_ticks": [
+        30429,
+        31413,
+        31524,
+        32361
+      ],
+      "counter_increment_ticks": [
+        31413,
+        32361
+      ]
+    },
+    "core0.cubecore0 waits id m2:2 on SCALAR": {
+      "stalls": [
+        269
+      ],
+      "wait_ticks": [
+        17724
+      ],
+      "producer_set_ticks": [
+        16527,
+        17715
+      ],
+      "counter_increment_ticks": [
+        17715
+      ]
+    },
+    "core0.cubecore0 waits id m2:9 on SCALAR": {
+      "stalls": [
+        323,
+        309,
+        309
+      ],
+      "wait_ticks": [
+        14997,
+        22026,
+        26563
+      ],
+      "producer_set_ticks": [
+        13840,
+        14988,
+        20907,
+        22017,
+        25512,
+        26554
+      ],
+      "counter_increment_ticks": [
+        14988,
+        22017,
+        26554
+      ]
+    }
+  },
+  "cores": [
+    {
+      "core": "core0.cubecore0.instr_popped_log.dump",
+      "instructions": 2251,
+      "engines": {
+        "SCALAR": 2037,
+        "MTE1": 28,
+        "MTE2": 2,
+        "CUBE": 27,
+        "FLOWCTRL": 131,
+        "FIXP": 26
+      },
+      "opcodes": {
+        "MOV_XD_SPR": 17,
+        "MOVK": 86,
+        "DC_PRELOAD_XN_IMM": 3,
+        "MOV_XD_IMM": 181,
+        "ADD": 116,
+        "SHR": 6,
+        "AND": 27,
+        "ADD_IMM": 162,
+        "SHL": 63,
+        "MADD": 11,
+        "SUB_IMM": 27,
+        "LD_XD_XN_IMM": 393,
+        "LDP_XI_XJ_XN": 3,
+        "SUB": 8,
+        "ST_XD_XN_IMM": 287,
+        "CMP": 105,
+        "SEL": 4,
+        "MOV_XD_XN": 80,
+        "SBITSET": 98,
+        "MOV_SPR_XN": 20,
+        "OR": 14,
+        "STI_XN_IMM": 60,
+        "STP_XI_XJ_XN": 13,
+        "SFF": 29,
+        "SIGNEXT": 33,
+        "SET_FLAG": 29,
+        "DIV": 7,
+        "MIN": 5,
+        "ZEROEXT": 118,
+        "STI_XN_XM": 39,
+        "MAX": 1,
+        "MUL_IMM": 1,
+        "MUL": 11,
+        "JUMPC": 103,
+        "NEG": 3,
+        "JUMP": 10,
+        "CMPN": 4,
+        "WAIT_FLAG_DEV": 8,
+        "LOAD_2D": 15,
+        "WAIT_FLAG": 29,
+        "MMAD": 6,
+        "FIX_L0C_TO_DST": 6,
+        "SET_CROSS_CORE": 8,
+        "DCI": 1,
+        "END": 1
+      },
+      "flags": {
+        "('CUBE', 'MTE1', 0)": 1,
+        "('CUBE', 'MTE1', 1)": 1,
+        "('CUBE', 'MTE1', 2)": 1,
+        "('MTE1', 'CUBE', 0)": 8,
+        "('CUBE', 'FIXP', 0)": 6,
+        "('FIXP', 'SCALAR', 0)": 8,
+        "('CUBE', 'SCALAR', 0)": 4
+      }
+    },
+    {
+      "core": "core0.veccore0.instr_popped_log.dump",
+      "instructions": 18660,
+      "engines": {
+        "SCALAR": 4718,
+        "PUSHQ": 278,
+        "MTE2": 16,
+        "MTE3": 61,
+        "FLOWCTRL": 573,
+        "VEC": 24,
+        "RVECLP": 142,
+        "RVECSU": 309,
+        "RVECEX": 5519,
+        "RVECST": 3808,
+        "RVECLD": 3212
+      },
+      "opcodes": {
+        "MOV_XD_SPR": 209,
+        "MOVK": 177,
+        "DC_PRELOAD_XN_IMM": 3,
+        "MOV_XD_IMM": 503,
+        "ADD": 305,
+        "SHR": 15,
+        "AND": 144,
+        "ADD_IMM": 299,
+        "SHL": 473,
+        "MADD": 20,
+        "SUB_IMM": 92,
+        "LD_XD_XN_IMM": 515,
+        "LDP_XI_XJ_XN": 7,
+        "NEG": 14,
+        "ST_XD_XN_IMM": 295,
+        "SBITSET": 15,
+        "MOV_SPR_XN": 14,
+        "OR": 21,
+        "MOVEMASK": 4,
+        "STI_XN_IMM": 97,
+        "STP_XI_XJ_XN": 14,
+        "MOV_XD_XN": 261,
+        "CMP": 248,
+        "DIV": 9,
+        "SUB": 33,
+        "MUL_IMM": 1,
+        "SEL": 14,
+        "MIN": 13,
+        "SFF": 32,
+        "ZEROEXT": 385,
+        "SIGNEXT": 53,
+        "MUL": 50,
+        "JUMPC": 239,
+        "INSERT_XD_XN": 370,
+        "CMPN": 4,
+        "JUMP": 60,
+        "SET_FLAG": 34,
+        "WAIT_FLAG": 34,
+        "PUSH_PB": 147,
+        "NOP": 254,
+        "VF": 127,
+        "RV_VLOOP": 142,
+        "RV_SMOV": 100,
+        "RV_PSET": 41,
+        "RV_PLT": 1756,
+        "RV_VDUPS": 11,
+        "RV_VST": 3015,
+        "RV_SMOVI": 76,
+        "MOV_SRC_TO_DST_ALIGN": 8,
+        "RV_SEND": 635,
+        "RV_SMEM_BAR": 581,
+        "RV_VLD": 2625,
+        "RV_VABS_FP": 32,
+        "RV_VLDI": 170,
+        "RV_VBR": 10,
+        "RV_VMAX": 35,
+        "RV_VSEL": 32,
+        "RV_VCMAX": 56,
+        "RV_VSTUI": 80,
+        "RV_VSTAI": 17,
+        "RV_VSTI": 18,
+        "RV_VADDS": 785,
+        "RV_VDIV": 9,
+        "RV_VMUL": 355,
+        "RV_VCVT_F2F": 1624,
+        "MOV_UB_TO_L1": 35,
+        "RV_VCI": 2,
+        "RV_VMULS": 10,
+        "RV_VADD": 101,
+        "LD_XD_XN": 3,
+        "RV_VCVT_I2F": 384,
+        "RV_VDINTLV": 192,
+        "RV_SCBZI": 6,
+        "SET_CROSS_CORE": 8,
+        "WAIT_FLAG_DEV": 8,
+        "RV_VSHRI": 6,
+        "RV_VGATHER2": 6,
+        "RV_VSUB": 27,
+        "RV_VEXP": 27,
+        "RV_VCADD": 24,
+        "DCI": 1,
+        "DCCI": 1,
+        "END": 1,
+        "END_LABEL": 1
+      },
+      "flags": {
+        "('VEC', 'MTE2', 0)": 1,
+        "('MTE2', 'VEC', 3)": 1,
+        "('VEC', 'MTE3', 0)": 8,
+        "('VEC', 'SCALAR', 7)": 2,
+        "('MTE2', 'VEC', 0)": 1,
+        "('MTE2', 'VEC', 1)": 1,
+        "('MTE2', 'VEC', 2)": 1,
+        "('MTE3', 'VEC', 0)": 7,
+        "('MTE3', 'SCALAR', 0)": 8,
+        "('MTE2', 'SCALAR', 0)": 2,
+        "('VEC', 'SCALAR', 0)": 2
+      }
+    },
+    {
+      "core": "core0.veccore1.instr_popped_log.dump",
+      "instructions": 18660,
+      "engines": {
+        "SCALAR": 4718,
+        "PUSHQ": 278,
+        "MTE2": 16,
+        "MTE3": 61,
+        "FLOWCTRL": 573,
+        "VEC": 24,
+        "RVECLP": 142,
+        "RVECSU": 309,
+        "RVECEX": 5519,
+        "RVECST": 3808,
+        "RVECLD": 3212
+      },
+      "opcodes": {
+        "MOV_XD_SPR": 209,
+        "MOVK": 177,
+        "DC_PRELOAD_XN_IMM": 3,
+        "MOV_XD_IMM": 503,
+        "ADD": 305,
+        "SHR": 15,
+        "AND": 144,
+        "ADD_IMM": 299,
+        "SHL": 473,
+        "MADD": 20,
+        "SUB_IMM": 92,
+        "LD_XD_XN_IMM": 515,
+        "LDP_XI_XJ_XN": 7,
+        "NEG": 14,
+        "ST_XD_XN_IMM": 295,
+        "SBITSET": 15,
+        "MOV_SPR_XN": 14,
+        "OR": 21,
+        "MOVEMASK": 4,
+        "STI_XN_IMM": 97,
+        "STP_XI_XJ_XN": 14,
+        "MOV_XD_XN": 261,
+        "CMP": 248,
+        "DIV": 9,
+        "SUB": 33,
+        "MUL_IMM": 1,
+        "SEL": 14,
+        "MIN": 13,
+        "SFF": 32,
+        "ZEROEXT": 385,
+        "SIGNEXT": 53,
+        "MUL": 50,
+        "JUMPC": 239,
+        "INSERT_XD_XN": 370,
+        "CMPN": 4,
+        "JUMP": 60,
+        "SET_FLAG": 34,
+        "WAIT_FLAG": 34,
+        "PUSH_PB": 147,
+        "NOP": 254,
+        "VF": 127,
+        "RV_VLOOP": 142,
+        "RV_SMOV": 100,
+        "RV_PSET": 41,
+        "RV_PLT": 1756,
+        "RV_VDUPS": 11,
+        "RV_VST": 3015,
+        "RV_SMOVI": 76,
+        "RV_SEND": 635,
+        "RV_SMEM_BAR": 581,
+        "MOV_SRC_TO_DST_ALIGN": 8,
+        "RV_VLD": 2625,
+        "RV_VABS_FP": 32,
+        "RV_VLDI": 170,
+        "RV_VBR": 10,
+        "RV_VMAX": 35,
+        "RV_VSEL": 32,
+        "RV_VCMAX": 56,
+        "RV_VSTUI": 80,
+        "RV_VSTAI": 17,
+        "RV_VSTI": 18,
+        "RV_VADDS": 785,
+        "RV_VDIV": 9,
+        "RV_VMUL": 355,
+        "RV_VCVT_F2F": 1624,
+        "MOV_UB_TO_L1": 35,
+        "RV_VCI": 2,
+        "RV_VMULS": 10,
+        "RV_VADD": 101,
+        "LD_XD_XN": 3,
+        "RV_VCVT_I2F": 384,
+        "RV_VDINTLV": 192,
+        "RV_SCBZI": 6,
+        "SET_CROSS_CORE": 8,
+        "WAIT_FLAG_DEV": 8,
+        "RV_VSHRI": 6,
+        "RV_VGATHER2": 6,
+        "RV_VSUB": 27,
+        "RV_VEXP": 27,
+        "RV_VCADD": 24,
+        "DCI": 1,
+        "DCCI": 1,
+        "END": 1,
+        "END_LABEL": 1
+      },
+      "flags": {
+        "('VEC', 'MTE2', 0)": 1,
+        "('MTE2', 'VEC', 3)": 1,
+        "('VEC', 'MTE3', 0)": 8,
+        "('VEC', 'SCALAR', 7)": 2,
+        "('MTE2', 'VEC', 0)": 1,
+        "('MTE2', 'VEC', 1)": 1,
+        "('MTE2', 'VEC', 2)": 1,
+        "('MTE3', 'VEC', 0)": 7,
+        "('MTE3', 'SCALAR', 0)": 8,
+        "('MTE2', 'SCALAR', 0)": 2,
+        "('VEC', 'SCALAR', 0)": 2
+      }
+    }
+  ]
+}
