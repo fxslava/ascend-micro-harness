@@ -42,6 +42,17 @@ Two kinds of set are exempt, and both are checked rather than assumed:
     inter-wave epilogue: the last pair in the sequence must still match the
     announcement's pipe.
 
+A fence may also be DEFERRED: the `SetFlag<x_S>` stays behind the work it
+reports while the `WaitFlag<x_S>` moves to a later point, so that the scalar
+unit enqueues other work before it blocks. The two halves then sit in
+different functions and cannot be paired lexically. Such an announcement is
+accepted on the strength of the WAIT in front of it plus a matching SET
+somewhere in the file, and reported as `deferred` -- which is weaker than the
+adjacent form, because the audit cannot see which pipe work the SET sits
+behind. For those, the ordering is measured in the trace instead:
+scripts/analyze_announce_overtake.py reports how much of the reported pipe had
+retired when the announcement was issued.
+
 Run from the repository root:
 
     python3 scripts/audit_cross_core_fences.py [<source>...]
@@ -171,26 +182,48 @@ def code_lines(text):
     return out
 
 
+def skip_guards(lines, index):
+    """The index of the nearest code line at or before `index` that is not a
+    bare guard opening. `if (...) {` and `} else {` carry no instruction, so
+    they are transparent to the fence scan exactly as they are to
+    `block_start`."""
+    while index >= 0 and GUARD_RE.match(lines[index][1]):
+        index -= 1
+    return index
+
+
 def preceding_fence(lines, index):
     """The route of the SET/WAIT pair immediately in front of lines[index].
 
-    Returns (route, evt) for the innermost pair, or None when the two lines in
-    front of the announcement are not a matched pair. "Immediately" is over
-    code lines, so comments and blank lines are transparent and any instruction
-    in between -- which could be the very work the fence was meant to order --
-    is not.
+    Returns (route, evt, "ok") for an adjacent pair, (route, evt, "deferred")
+    for a lone WAIT whose SET is elsewhere in the file, or None. "Immediately"
+    is over code lines, so comments, blank lines and guard openings are
+    transparent while any instruction in between -- which could be the very
+    work the fence was meant to order -- is not.
     """
-    if index < 2:
+    at = skip_guards(lines, index - 1)
+    if at < 0:
         return None
-    wait = FENCE_WAIT_RE.search(lines[index - 1][1])
-    put = FENCE_SET_RE.search(lines[index - 2][1])
-    if not wait or not put:
+    wait = FENCE_WAIT_RE.search(lines[at][1])
+    if not wait:
         return None
-    if wait.group("route") != put.group("route"):
-        return None
-    if wait.group("evt") != put.group("evt"):
-        return None
-    return wait.group("route"), wait.group("evt")
+    before = skip_guards(lines, at - 1)
+    put = FENCE_SET_RE.search(lines[before][1]) if before >= 0 else None
+    if put and put.group("route") == wait.group("route") \
+            and put.group("evt") == wait.group("evt"):
+        return wait.group("route"), wait.group("evt"), "ok"
+    # Deferred: the SET is not adjacent. Accept it only if one exists at all,
+    # on the same route and event, somewhere in this translation unit.
+    pattern = re.compile(
+        r"\bSetFlag<\s*(?:AscendC::)?HardEvent::%s\s*>\s*\(\s*%s\s*\)"
+        % (re.escape(wait.group("route")), re.escape(wait.group("evt"))))
+    for _, code in lines:
+        if pattern.search(code):
+            return wait.group("route"), wait.group("evt"), "deferred"
+    # A wait with no set anywhere fences nothing. Report it as a BROKEN fence
+    # rather than returning None, so the caller cannot fall through to the
+    # priming route: whoever wrote the wait meant a fence to be here.
+    return wait.group("route"), wait.group("evt"), "orphan"
 
 
 def audit_text(text, name="<text>"):
@@ -219,6 +252,13 @@ def audit_text(text, name="<text>"):
                              "`constexpr pipe_t` declared in this file" % named))
             continue
         fence = preceding_fence(lines, index)
+        if fence is not None and fence[2] == "orphan":
+            findings.append((number, shown, flag, "FAIL",
+                             "a %s wait stands in front of this announcement but "
+                             "no matching SetFlag<%s>(%s) exists in this file, so "
+                             "it fences nothing"
+                             % (fence[0], fence[0], fence[1])))
+            continue
         if fence is None:
             # Allow a run of sets that share one fence: the fence in front of
             # the FIRST set of the run still orders the whole run, because a
@@ -228,8 +268,9 @@ def audit_text(text, name="<text>"):
             shared = None
             while back > 0 and SET_RE.search(lines[back][1]):
                 shared = preceding_fence(lines, back)
-                if shared is not None:
+                if shared is not None and shared[2] != "orphan":
                     break
+                shared = None
                 back -= 1
             fence = shared
         if fence is None:
@@ -260,11 +301,17 @@ def audit_text(text, name="<text>"):
             findings.append((number, shown, flag, "FAIL",
                              "%s has no scalar route; see section 6.2a" % pipe))
             continue
-        route, evt = fence
+        route, evt, kind = fence
         if route != want:
             findings.append((number, shown, flag, "FAIL",
                              "drained %s but announces on %s; expected %s"
                              % (route, pipe, want)))
+            continue
+        if kind == "deferred":
+            findings.append((number, shown, flag, "deferred",
+                             "mode %s, %s(%s) waited here, set elsewhere -- the "
+                             "audit cannot see what the set is behind"
+                             % (mode, route, evt)))
             continue
         findings.append((number, shown, flag, "ok",
                          "mode %s, %s(%s)" % (mode, route, evt)))
@@ -376,6 +423,31 @@ __aicore__ void named_wrong() {
 # The guard that made the structural test vacuous: an announcement alone
 # inside a conditional is NOT a priming set when the loop around it has
 # already run work on the announced pipe.
+# The deferred fence: the WAIT in front of the announcement, the SET in
+# another function. Accepted, and reported as `deferred`.
+SELF_TEST_DEFERRED = """
+__aicore__ void produce() {
+    RecurStrip(engine, strip);
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(evt);
+}
+__aicore__ void announce() {
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(evt);
+    if (strip + kStageDepth < total) {
+        AscendC::CrossCoreSetFlag<2, PIPE_V>(kSync2StageReady);
+    }
+}
+"""
+
+# The same shape with NO set anywhere: the wait fences nothing.
+SELF_TEST_DEFERRED_NO_SET = """
+__aicore__ void announce_only() {
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(evt);
+    if (strip + kStageDepth < total) {
+        AscendC::CrossCoreSetFlag<2, PIPE_V>(kSync2StageReady);
+    }
+}
+"""
+
 SELF_TEST_GUARDED_ANNOUNCE = """
 __aicore__ void guarded() {
     for (std::uint32_t strip = 0; strip < total; ++strip) {
@@ -435,6 +507,8 @@ def self_test():
         ("pipe name declared elsewhere", SELF_TEST_UNKNOWN_PIPE, True),
         ("announcement alone inside a guard", SELF_TEST_GUARDED_ANNOUNCE, True),
         ("priming set alone inside a guard", SELF_TEST_GUARDED_PRIME, False),
+        ("deferred fence, set in another function", SELF_TEST_DEFERRED, False),
+        ("deferred wait with no set anywhere", SELF_TEST_DEFERRED_NO_SET, True),
     )
     for label, source, want_fail in controls:
         verdicts = [row[3] for row in audit_text(source, label)]
@@ -461,7 +535,8 @@ def main(argv):
             failures += 1
             continue
         for number, pipe, flag, verdict, detail in findings:
-            mark = {"ok": "ok    ", "exempt": "exempt", "FAIL": "FAIL  "}[verdict]
+            mark = {"ok": "ok    ", "exempt": "exempt", "FAIL": "FAIL  ",
+                    "deferred": "defer "}[verdict]
             print("  %s line %-5s %-9s %-44s %s"
                   % (mark, number, pipe, flag[:44], detail))
             if verdict == "FAIL":

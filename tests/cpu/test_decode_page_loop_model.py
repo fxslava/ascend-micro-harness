@@ -230,11 +230,6 @@ def schedule(pages, strips, *, no_l1_war=False, no_panel_war=False,
                     pass
                 if not carry_credit:
                     hard("V0", "set", "V_MTE2", slot)
-                # The score slot is free again, folded into the readiness
-                # quorum: the Cube's (recur + STAGE_DEPTH)-th GEMM is the one
-                # that overwrites this panel.
-                if recur + STAGE_DEPTH < total:
-                    emit("V0.V", "m2set", READY, "V0")
             dequant = column - 3
             if 0 <= dequant < total:
                 slot = slot_of(dequant)
@@ -246,6 +241,18 @@ def schedule(pages, strips, *, no_l1_war=False, no_panel_war=False,
                 hard("V0", "wait", "V_MTE2", slot)
                 emit("V0.MTE2", "load_value", slot, load)
                 hard("V0", "set", "MTE2_V", slot)
+            # The DEFERRED announcement. The score slot is free again, folded
+            # into the readiness quorum: the Cube's (recur + STAGE_DEPTH)-th
+            # GEMM is the one that overwrites this panel. It is emitted at the
+            # END of the column, after this column's dequant and load, so that
+            # the scalar unit has enqueued them before it blocks on the V_S
+            # wait that fences the announcement. The fence itself is unchanged
+            # -- the SetFlag<V_S> still sits in the V queue behind the
+            # recurrence; only the WaitFlag moves. `eager_announce` is the
+            # previous placement, and it must still be ACCEPTED: moving a
+            # fence later cannot be justified by a control that fails.
+            if 0 <= recur < total and recur + STAGE_DEPTH < total:
+                emit("V0.V", "m2set", READY, "V0")
         for slot in range(STAGE_DEPTH):
             if not carry_credit:
                 hard("V0", "wait", "V_MTE2", slot)

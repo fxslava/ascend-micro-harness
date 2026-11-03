@@ -253,6 +253,14 @@ static_assert(kStageDepth <= kStrips,
 
 template <std::uint32_t Slot> constexpr std::uint16_t kFlagValueReady   = 0u + Slot;
 template <std::uint32_t Slot> constexpr std::uint16_t kFlagScoreFree    = 4u + Slot;
+// The same channel, named so that section 6.6's fence audit can see that the
+// per-page schedule's two opening sets are PRIMING sets -- "the score ring
+// starts empty" -- and not announcements of earlier pipe work. Same value, so
+// the legacy entry's instruction stream is untouched; the exemption becomes
+// author-declared instead of inferred from the surrounding code, which is the
+// same convention turboquant_reshape_and_cache_a8.cpp uses for
+// kFlagPanelFreePrime.
+template <std::uint32_t Slot> constexpr std::uint16_t kFlagScoreFreePrime = kFlagScoreFree<Slot>;
 template <std::uint32_t Slot> constexpr std::uint16_t kFlagScoreReady   = 8u + Slot;
 template <std::uint32_t Slot> constexpr std::uint16_t kFlagKeyReady     = 16u + Slot;
 
@@ -705,8 +713,8 @@ __aicore__ inline void run_value_core(__gm__ std::int8_t*   gm_value_cache,
     if (strips != 0u) {
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
-        AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFree<0>);
-        AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFree<1>);
+        AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFreePrime<0>);
+        AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagScoreFreePrime<1>);
 
         StepColumnsValue(engine, strips, live_tokens, ColumnSeq{});
 
@@ -1257,22 +1265,35 @@ __aicore__ inline void StreamRecurStrip(std::uint32_t strip, std::uint32_t activ
     // needs. Past that point there is no further GEMM to release, and
     // announcing anyway would leave a token on the channel.
     //
-    // UNFENCED, ON INSTRUCTION, AND UNDER TEST. Section 6.2a requires a V_S
-    // drain here, because a cross-core set issues on the scalar unit and the
-    // `pipe` template argument does not order it -- in this operator's own
-    // trace the mode-2 set appears on FLOWCTRL, exactly where the mode-4 set
-    // appears. The drain was removed on the claim that the mode-2 quorum
-    // guarantees visibility at the CCU and makes it redundant.
+    // Half of the announcement fence: the SET only. It is issued into the V
+    // queue behind the recurrence AND behind the archive copy above, which
+    // reads the same panel -- the announcement means "the score panel of
+    // strip t is free, I have read it", so setting before the archive would
+    // license the Cube to overwrite a panel the Muls is still reading.
     //
-    // That claim is not settled here. What is at risk if it is wrong: this
-    // announcement means "the score panel of strip t is free, I have read
-    // it", so an announcement that overtakes the recurrence lets the Cube's
-    // Fixpipe for strip t + kStageDepth overwrite a panel still being read.
-    // The evidence that decides it is the accumulator against the FP64 oracle
-    // on every rung, plus scripts/analyze_announce_overtake.py over the tick
-    // order. scripts/audit_cross_core_fences.py reports this as unfenced,
-    // which is true and deliberate; see
-    // reports/decode_splitk_aic_scalar_issue.md.
+    // The matching WaitFlag and the announcement itself are DEFERRED to the
+    // end of the column, in stream_value_core. `WaitFlag<V_S>` is the half
+    // that blocks the scalar unit, so holding it back lets this column's
+    // dequant and load be enqueued first and MTE2 start the next ingress
+    // while V is still finishing this recurrence. The guarantee is unchanged:
+    // the announcement still sits behind every V instruction issued before
+    // this SetFlag, which is what section 6.2a asks for and what the
+    // 4,223-instruction lead in reports/decode_splitk_aic_scalar_issue.md
+    // section 4c measured the cost of losing.
+    //
+    // Unconditional, so the place stays capacity-one and balanced; only the
+    // announcement carries the guard, because past strip
+    // total - kStageDepth there is no further GEMM to release.
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(evt);
+}
+
+// The deferred half. Called at the END of a column, once this column's
+// dequant and load have been issued.
+__aicore__ inline void StreamAnnounceScoreFree(std::uint32_t strip, std::uint32_t total)
+{
+    const std::int32_t evt = static_cast<std::int32_t>(SlotOfStrip(strip));
+
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(evt);
     if (strip + kStageDepth < total) {
         AscendC::CrossCoreSetFlag<2, kSync2Aiv0Announce>(kSync2StageReady);
     }
@@ -1344,8 +1365,10 @@ __aicore__ inline void stream_value_core(__gm__ std::int8_t*   gm_value_cache,
             static_cast<std::uint64_t>(window.page_begin) * window.block_size;
 
         for (std::uint32_t column = 0; column < window.total + kPipelineLag; ++column) {
-            if (column >= kPipelineLag && column - kPipelineLag < window.total) {
-                const std::uint32_t strip = column - kPipelineLag;
+            const bool recurs =
+                column >= kPipelineLag && column - kPipelineLag < window.total;
+            const std::uint32_t strip = recurs ? column - kPipelineLag : 0u;
+            if (recurs) {
                 const std::uint32_t active = turboquant_decode_tail::ActiveInStrip(
                     recur_token_base, window.live_seq);
                 StreamRecurStrip(strip, active, window.total);
@@ -1358,6 +1381,11 @@ __aicore__ inline void stream_value_core(__gm__ std::int8_t*   gm_value_cache,
                 StreamLoadValueStrip(engine, ingress, window.scale_plane,
                                      column - 2u);
                 ingress.Advance();
+            }
+            // Deferred: the dequant and the load above are on their queues
+            // before the scalar unit blocks for this column's announcement.
+            if (recurs) {
+                StreamAnnounceScoreFree(strip, window.total);
             }
         }
 

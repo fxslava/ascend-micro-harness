@@ -304,16 +304,58 @@ down to `got=0.630742371` and `mean |deviation| 6.208090e-08`. With
 the early announcement hands it. The four-page defect this operator was just
 fixed for was exactly such a licence going unused until the timing changed.
 
-The drain is **left removed** in this revision, on instruction, with
-`scripts/audit_cross_core_fences.py` reporting it:
+The drain was left removed for one revision while this was measured, with
+`scripts/audit_cross_core_fences.py` reporting it as unfenced rather than being
+disabled -- disabling it would also have stopped it protecting the other three
+announcements here and both reshape-and-cache kernels. It is **restored** in
+the shipped revision, as the deferred wait of section 4c-bis.
 
-```text
-FAIL   kSync2Aiv0Announce=PIPE_V kSync2StageReady   no V_S drain in front of the announcement
-```
+### 4c-bis. The fence is back, as a DEFERRED wait, at no ordering cost
 
-The audit was not disabled. Disabling it would also have stopped it protecting
-the other three announcements here and both reshape-and-cache kernels, and a
-known deviation belongs in a report rather than behind a suppressed check.
+The drain is restored in the form that keeps the guarantee and moves the
+stall. `SetFlag<HardEvent::V_S>` is issued into the V queue and fires when V
+reaches it; `WaitFlag` is the scalar instruction that blocks. So the SET stays
+behind the recurrence -- and behind the archive `Muls`, which reads the same
+panel -- while the WAIT and the announcement move to the end of the column,
+after this column's dequant and load have been issued. The scalar unit
+enqueues the next strip's work before it blocks.
+
+Whether that still fences anything is the same measurement as section 4c, and
+the answer is yes, exactly:
+
+| AIV0 announcement, in order | 1st | 2nd | **3rd** | **4th** |
+| --- | ---: | ---: | ---: | ---: |
+| drain adjacent, pre-change kernel | 2 | 2 | **21,075** | **42,001** |
+| no drain at all | 2 | 2 | **17,274** | **38,174** |
+| **deferred wait, shipped** | 2 | 2 | **21,082** | **41,983** |
+
+The deferred form sits within 7 and 18 instructions of the adjacent form and
+about 3,800 above the unfenced one. **Deferring the wait costs nothing in
+ordering.** Output is bit-identical to every other revision measured here:
+`got=0.630742371`, `mean |deviation| 6.208090e-08`, 0 of 4096 channels over
+tolerance, and the eight-page rung passes too.
+
+It is also the best revision on every scalar axis measured:
+
+| build | ticks | AIV0 SCALAR | per-strip | per-row | cube idle |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| pre-change, drain adjacent | 86,289 | 11,600 | 972 / 243 | 10,048 / 157 | 0.850 |
+| no drain at all | 86,348 | 11,558 | 768 / 192 | 10,112 / 158 | — |
+| **deferred wait** | 86,390 | **11,336** | **744 / 186** | **9,792 / 153** | **0.850** |
+
+**The Cube idle fraction did not drop.** It is 0.850, which is where it was
+before any of this work started. That was the stated goal of the change and it
+is not met, for the reason section 1 gives and section 4e repeats: the Cube
+retires 136 Mmad-class instructions against AIV0's ~84,000 vector
+instructions, so it is waiting on AIV0's arithmetic and not on AIV0's
+instruction issue. Moving the stall lets AIV0's MTE2 ingress start earlier,
+and AIV0's MTE2 is 23 instructions. The tick count is 86,390 against 86,289 --
+the same run to within 0.12%.
+
+What the change IS worth: AIV0's scalar count is 11,336 against 11,600, the
+lowest of any revision measured, with the fence intact. At the 64-strip
+production geometry the per-strip saving scales to roughly 3,600 instructions.
+That is a real improvement and it is not a fix for pipeline starvation.
 
 ### 4d. The audit was quietly exempting the line under test
 
@@ -335,9 +377,34 @@ gate had stopped protecting exactly the line this report is about.
 
 The scope is now the enclosing ITERATION, not the enclosing brace pair: `if`
 and `else` braces are transparent and the scan carries on outward to a loop or
-a function body. Two controls were added and the audit now carries fourteen:
-`announcement alone inside a guard` is rejected, `priming set alone inside a
-guard` is accepted.
+a function body.
+
+Widening it that way then broke two things, both fixed, and the audit now
+carries **sixteen** controls:
+
+* A lone `WaitFlag<x_S>` with no matching SET anywhere fell through to the
+  priming route and was exempted. An author who wrote the wait meant a fence;
+  a missing set is a bug. It now FAILs.
+* The legacy per-page `kFlagScoreFree<0>` / `<1>` primes lost their structural
+  exemption, because the widened scope reaches the function body, which does
+  contain earlier Vector work -- the m/l/Acc `Duplicate`s -- that has nothing
+  to do with what those sets report. Rather than loosen the heuristic again
+  they are now named `kFlagScoreFreePrime`, the same convention
+  `turboquant_reshape_and_cache_a8.cpp` already uses. Same value, so the
+  frozen legacy instruction stream is untouched; the exemption is
+  author-declared instead of inferred.
+
+And the deferred fence needed its own handling. Splitting the SET from the
+WAIT puts the two halves in different functions, which a lexical audit cannot
+pair -- it was exempting the announcement as a priming set, a vacuous pass on
+the one line the pattern is about. A lone WAIT in front of an announcement,
+with a matching SET on the same route and event somewhere in the translation
+unit, is now accepted and reported as `defer` rather than `ok`, with the limit
+stated in the output: **the audit cannot see what the set is behind.** For the
+adjacent form it can at least pin the SET to the work next to it. For a
+deferred one the ordering is a trace property, which is what
+`scripts/analyze_announce_overtake.py` measures and what section 4c-bis
+reports.
 
 ### 4e. What the trace says about overlap
 
