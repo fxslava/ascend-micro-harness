@@ -517,7 +517,121 @@ that unrolling the 16 rows at the strip sites instantiated 128 bodies and did
 not compile in 25 minutes -- phase-major is the opposite move (widen each phase,
 do not replicate the body), but the compile cost is worth checking early.
 
-## 8. Gate status
+## 8. The phase-major prototype: phase 1 widened over all 16 rows
+
+Section 7d said the lever was the per-row loop structure. This is that
+prototype: phase 1 only, hoisted out of the row loop and issued once for all
+16 query rows. Phases 2 to 5 still run per row, unchanged.
+
+It is in `vector_decode_recur_strip_phase_major` and
+`update_max_and_alpha_all`, additive beside the existing entry points, and only
+`turboquant_paged_decode_splitk_aic`'s aligned path calls it. The partial path
+and the other four kernels that share the engine are untouched.
+
+### 8a. Why phase 1, and why the result is bit-identical rather than within budget
+
+The 16 rows are independent -- each carries its own `m`, `l` and `acc`, and no
+row reads another's state -- so phase 1 may run for all of them before any row
+runs phase 2.
+
+Phase 1 is also the one phase whose widening cannot move a bit:
+
+| step | per row | widened | identical because |
+| --- | --- | --- | --- |
+| `Mul` | 16 lanes | 256 lanes, 4 repeats, `src1RepStride = 0` | elementwise |
+| `ReduceRepeat<MAX>` | repeatTime 1 | repeatTime 16, one repeat per row | **MAX selects an operand, it does not round** |
+| `Brcb` | repeatTime 1 | repeatTime 2 | per-element fill |
+| `Max`, `Sub`, `Exp` | 8 lanes | 128 lanes | elementwise over independent rows |
+
+The reduction is the whole point. A SUM tree had to be argued against a ULP
+budget, as §2a did. MAX is associative, commutative *and* exact, so visiting a
+row's 16 lanes in any order returns the same float. The prediction was
+bit-identity, and the gate confirms it exactly: the p4 margin line is
+character-for-character the same before and after, down to
+`got=0.630742371` and `mean signed deviation -6.688996e-10`.
+
+Six instructions per row times 16 rows becomes seven instructions, plus one
+`Adds` that replicates `key_scale` into a 64-lane block -- the `p_x4` shape
+from phase 4, reused.
+
+### 8b. Ticks
+
+| rung | with the tree (§3a) | phase-major | change |
+| --- | ---: | ---: | ---: |
+| pages 4, K 1, 16-token pages | 73,728 | **62,887** | **-14.70%** |
+| pages 8, K 1, 16-token pages | 139,110 | **117,428** | **-15.59%** |
+
+Both read from the run logs, not transcribed from §3a. One widened phase out of
+five is worth about as much as the whole DataBlock tree was.
+
+### 8c. Where it came from
+
+AIV0 at four strips, against the same `ev_p4` baseline §7b measured:
+
+| | baseline | phase-major | change |
+| --- | ---: | ---: | ---: |
+| vector retirements | 48,386 | 45,314 | **-6.3%** |
+| span | 70,350 | 59,480 | **-15.5%** |
+| stalled ticks (gap 16) | 19,190 | 16,133 | **-15.9%** |
+| stall gaps | 842 | 659 | **-21.7%** |
+
+| mnemonic | retired before | retired after | stalls before | stalls after |
+| --- | ---: | ---: | ---: | ---: |
+| `RV_SMOVI` | 1168 | 864 | 517 | **462** |
+| `RV_SMOV` | 448 | 328 | 128 | **64** |
+| `RV_VST` | 6551 | 6359 | 64 | **0** |
+| `RV_SMEM_BAR` | 1865 | 1265 | 0 | 0 |
+| `RV_SEND` | 3895 | 3335 | 0 | 0 |
+| `RV_VLD` | 6416 | 6008 | 0 | 0 |
+| `RV_PLT` | 1812 | 1512 | 0 | 0 |
+| `RV_VLOOPv2` | 976 | 740 | 67 | 67 |
+
+The mechanism §7b named is the one that moved: 424 fewer `SMOVI`/`SMOV`
+operand-setup instructions, and 119 fewer of the 17-tick gaps in front of them.
+
+Two things the prediction got wrong, both in the same direction. §7c estimated
+one widened phase at a few percent, reasoning that phase 1 is six of about
+forty instructions per row. It is 14.7%, because widening a phase also deletes
+the scaffolding around it: 600 fewer `RV_SMEM_BAR`, 560 fewer `RV_SEND` and 300
+fewer `RV_PLT` -- barrier, dispatch and predicate traffic that is charged per
+*instruction*, not per lane, and never appeared in the stall census because it
+never stalls.
+
+The stall *share* barely moves, 27.3% to 27.1%. That is the honest reading:
+this did not make the pipe denser, it removed instructions and the stalls they
+carried, together and in proportion. The remaining 16,133 ticks sit in phases 2
+to 5, which are still per row.
+
+### 8d. Gates
+
+| gate | state |
+| --- | --- |
+| device build, `-Wall -Werror` | **PASS**, 52 s, zero errors, zero warnings |
+| compile-time blowup (the risk in §7d) | **did not occur** -- widening a phase is not unrolling a body |
+| CAModel `cheap`: p1 K1, p4 K1, p4 K2, p4 K4, p8 K1 | **PASS**, 0 channels over tolerance on every rung |
+| bit-identity against the pre-change run | **PASS**, margin lines character-identical |
+| §1a strip-stream token model | **PASS**, unchanged -- the schedule was not touched |
+| §6.6 cross-core fence audit | **PASS**, 16 self-test controls |
+| `tails` (ragged, masked path) | **NOT RUN** |
+| `wide` (128-token pages, 32 strips) | **NOT RUN** |
+| physical NPU | **UNAVAILABLE** on this host |
+
+The masked path was not modified and its operands still start at the base of
+each widened slot, so it is unaffected by construction -- but `tails` is the
+rung that would show it, and it has not been run.
+
+### 8e. What this says about the rest
+
+Phases 2 to 5 are the remaining 16,133 stalled ticks and the bulk of the
+per-row body. Phase 2 (`exponentiate_scores`) and phase 3
+(`update_denominator`) widen on exactly the same argument as phase 1 -- the
+same `Brcb`-then-elementwise shape over independent rows -- except that phase
+3's `ReduceRepeat<SUM>` is a SUM, so that one owes a ULP argument where phase 1
+owed none. Phase 4 is the contraction and is already wide in the channel
+direction; widening it over rows would want the 4096-element `weighted` buffer
+16 times over, which is where UB space, not instruction count, starts to bind.
+
+## 9. Gate status
 
 | gate | state |
 | --- | --- |
@@ -529,7 +643,7 @@ do not replicate the body), but the compile cost is worth checking early.
 | legacy `camodel_paged_decode_attention` ULP gate | see below |
 | `--page-tokens 128` over more than one page | **NOT RUN** |
 | §7 fused streaming FMA | **NOT IMPLEMENTED** -- blocked on the channel-major value page (§7a), and §7b/§7c measure it as a regression |
-| §7d phase-major recurrence | **NOT ATTEMPTED** |
+| §7d phase-major recurrence | **PROTOTYPED** for phase 1 -- see section 8 |
 | physical NPU | **UNAVAILABLE** on this host |
 
 The legacy gate is the one that matters for this change, because `acc` is the
