@@ -134,7 +134,7 @@ constexpr uint32_t kPipelinePhases =
 // and PRE_ROTATED the same two query bases: true takes the rotated fp32 query, false rotates the raw query
 // once in a prologue and selects the output stage per launch (cube/turboquant_query_basis.h).
 //
-// The schedule is RunCubePhase and RunVectorPhase, and the two have to be read together: every flag is one
+// Read RunCubeSteadyPhase and RunVectorSteadyPhase together: every flag is one
 // edge of the marked graph they form, and the only reason the loop needs no draining barrier is that each
 // edge is point-to-point. Both cores derive the same slot and window index from the same template
 // parameter, so neither is ever told which one the other picked.
@@ -163,6 +163,7 @@ public:
     static_assert(Mm::kSlots == kSlots, "the Cube's L1 ring and the ingest ring have to agree");
     static_assert(kOptFlagProbsReady < kOptFlagReservedFirst,
                   "the schedule's flag ids run into the ids the toolkit reserves for its own barriers");
+    static_assert(kSlots == 3 && kWindows == 2 && kPhases == 6, "three-zone schedule geometry");
     static_assert(kWindows >= 2, "one score window is the lock-step schedule, not this one");
     static_assert(kSlots >= 3, "a two-slot ring cannot keep a read, a stage and a GEMM pair in flight");
 
@@ -444,162 +445,220 @@ private:
         return false;
     }
 
-    // -----------------------------------------------------------------------------------------------
-    // The AIC half.
-    //
-    // Prologue: the score GEMM of tile 0, because the vector unit's first phase waits on its window.
-    // Phase k: the score GEMM of tile k + 1 into the window tile k does not own, then the context GEMM of
-    // tile k. That order matters -- the score GEMM depends on nothing the vector unit is doing right now,
-    // so it goes first and the wait for tile k's probabilities lands as late as it can.
-    // -----------------------------------------------------------------------------------------------
+    // Short tasks exist in isolated probes and empty/short Split-K workers.
+    // Their bounded dispatch is outside the three-zone fast path.
+    __aicore__ inline void RunCubeShortPipeline(PipelineTask &, const uint32_t rows,
+                                               const uint32_t count)
+    {
+        CubeScores<0>(rows);
+        if (count > 1) CubeScores<1>(rows);
+        CubeContext<0>(rows);
+        if (count > 2) CubeScores<2>(rows);
+        if (count > 1) CubeContext<1>(rows);
+        if (count > 2) CubeContext<2>(rows);
+    }
+
+    __aicore__ inline void RunVectorShortPipeline(PipelineTask &task, const TurboQuantTaskHeads &heads)
+    {
+        ReadPipelineTile<0>(task);
+        if (task.numTiles > 1) ReadPipelineTile<1>(task);
+        StageToL1(task, 0);
+        if (task.numTiles > 2) ReadPipelineTile<2>(task);
+        if (task.numTiles > 1) StageToL1(task, 1);
+        VectorSoftmax<0>(task, heads);
+        vector_.ComputeAccumulatorDecay(heads);
+        if (task.numTiles > 2) StageToL1(task, 2);
+        VectorAccumulate(heads);
+        if (task.numTiles > 1) {
+            VectorSoftmax<1>(task, heads);
+            vector_.ComputeAccumulatorDecay(heads);
+            VectorAccumulate(heads);
+        }
+        if (task.numTiles > 2) {
+            VectorSoftmax<2>(task, heads);
+            vector_.ComputeAccumulatorDecay(heads);
+            VectorAccumulate(heads);
+        }
+    }
+
+    // Deep tasks have three zones. Short/empty workers retain the bounded
+    // compatibility path; no boundary predicate enters a steady phase.
     __aicore__ inline void RunCubePipeline(PipelineTask &task, const uint32_t rows)
     {
-        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagSlotReady));
-        mm_.template GemmScores<true>(vector_.Scores(0), mm_.L1Key(0), rows, headSize_, kCubeTileRows);
-        vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::FIX_S>();
-        AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(static_cast<uint16_t>(kOptFlagScoresReady));
-
-        while (task.tile + kPhases <= task.numTiles) {
-            RunCubePeriod<0>(task, rows);
+        if (task.numTiles < kSlots + 1) {
+            RunCubeShortPipeline(task, rows, task.numTiles);
+            return;
+        }
+        // Slot 2 has never been staged. Prime its initial free credit so even
+        // phase zero uses the same unconditional stage wait as every wrap.
+        ReleaseCubeSlot<2>();
+        CubeScores<0>(rows); // tick -1; ticks -3/-2 belong to MTE2/MTE3.
+        const uint32_t steady_limit = task.numTiles - kSlots;
+        while (task.tile + kPhases <= steady_limit) {
+            RunCubeSteadyPhase<0>(rows);
+            RunCubeSteadyPhase<1>(rows);
+            RunCubeSteadyPhase<2>(rows);
+            RunCubeSteadyPhase<3>(rows);
+            RunCubeSteadyPhase<4>(rows);
+            RunCubeSteadyPhase<5>(rows);
             task.tile += kPhases;
         }
-        RunCubeTail<0>(task, rows, task.numTiles - task.tile);
+        RunCubeSteadyTail<0>(rows, steady_limit - task.tile);
     }
 
-    template <uint32_t PHASE>
-    __aicore__ inline void RunCubePeriod(PipelineTask &task, const uint32_t rows)
+    __aicore__ inline void RunVectorPipeline(PipelineTask &task, const TurboQuantTaskHeads &heads)
     {
-        if constexpr (PHASE < kPhases) {
-            RunCubePhase<PHASE>(task, rows, task.tile + PHASE);
-            RunCubePeriod<PHASE + 1>(task, rows);
+        if (task.numTiles < kSlots + 1) {
+            RunVectorShortPipeline(task, heads);
+            return;
         }
+        // Exactly three fill ticks; no length checks in the prologue.
+        ReadPipelineTile<0>(task);                         // -3: read T0
+        ReadPipelineTile<1>(task); StageToL1(task, 0);     // -2: read T1, stage T0
+        ReadPipelineTile<2>(task); StageToL1(task, 1);     // -1: read T2, stage T1
+        const uint32_t steady_limit = task.numTiles - kSlots;
+        while (task.tile + kPhases <= steady_limit) {
+            RunVectorSteadyPhase<0>(task, heads);
+            RunVectorSteadyPhase<1>(task, heads);
+            RunVectorSteadyPhase<2>(task, heads);
+            RunVectorSteadyPhase<3>(task, heads);
+            RunVectorSteadyPhase<4>(task, heads);
+            RunVectorSteadyPhase<5>(task, heads);
+            task.tile += kPhases;
+        }
+        RunVectorSteadyTail<0>(task, heads, steady_limit - task.tile);
     }
 
     template <uint32_t PHASE>
-    __aicore__ inline void RunCubeTail(PipelineTask &task, const uint32_t rows, const uint32_t remaining)
-    {
-        if constexpr (PHASE < kPhases) {
-            if (PHASE < remaining) {
-                RunCubePhase<PHASE>(task, rows, task.tile + PHASE);
-                RunCubeTail<PHASE + 1>(task, rows, remaining);
-            }
-        }
-    }
-
-    template <uint32_t PHASE>
-    __aicore__ inline void RunCubePhase(PipelineTask &task, const uint32_t rows, const uint32_t tile)
+    __aicore__ inline void CubeScores(const uint32_t rows)
     {
         constexpr uint32_t kSlot = PHASE % kSlots;
-        constexpr uint32_t kNextSlot = (PHASE + 1) % kSlots;
-        constexpr uint32_t kNextWindow = (PHASE + 1) % kWindows;
+        constexpr uint32_t kWindow = PHASE % kWindows;
+        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagSlotReady + kSlot));
+        mm_.template GemmScores<true>(vector_.Scores(kWindow), mm_.L1Key(kSlot), rows, headSize_, kCubeTileRows);
+        vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::FIX_S>();
+        AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(
+            static_cast<uint16_t>(kOptFlagScoresReady + kWindow));
+    }
 
-        if (tile + 1 < task.numTiles) {
-            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagSlotReady + kNextSlot));
-            mm_.template GemmScores<true>(vector_.Scores(kNextWindow), mm_.L1Key(kNextSlot), rows, headSize_,
-                                          kCubeTileRows);
-            vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::FIX_S>();
-            AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(
-                static_cast<uint16_t>(kOptFlagScoresReady + kNextWindow));
-        }
-
+    template <uint32_t PHASE>
+    __aicore__ inline void CubeContext(const uint32_t rows)
+    {
+        constexpr uint32_t kSlot = PHASE % kSlots;
         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagProbsReady));
         mm_.template GemmContext<true>(vector_.Context(), mm_.L1Value(kSlot), rows, kCubeTileRows, headSize_);
         vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::FIX_S>();
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(static_cast<uint16_t>(kOptFlagContextReady));
-
-        // Both of this slot's operands are in L0 now, so the slot is free -- but post the token only if a
-        // later tile is going to wait for it. A token nothing consumes is an event leak across launches.
-        if (tile + kSlots < task.numTiles) {
-            vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::FIX_S>();
-            AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(
-                static_cast<uint16_t>(kOptFlagSlotFree + kSlot));
-        }
-    }
-
-    // -----------------------------------------------------------------------------------------------
-    // The AIV half.
-    //
-    // Prologue: prime the ingest ring with up to kSlots reads, then stage tiles 0 and 1 into L1 -- tile 1
-    // as well, because the Cube's first phase runs the score GEMM of tile 1 and must not wait on it.
-    // Phase k: the softmax of tile k, the MTE2 read of tile k + kSlots into the slot that softmax just
-    // finished with, the decay, the L1 stage of tile k + 2, and the accumulate of tile k.
-    // -----------------------------------------------------------------------------------------------
-    __aicore__ inline void RunVectorPipeline(PipelineTask &task, const TurboQuantTaskHeads &heads)
-    {
-        const uint32_t primed = task.numTiles < kSlots ? task.numTiles : kSlots;
-        for (uint32_t slot = 0; slot < primed; ++slot) {
-            NextTile(task.read, task.token, task.contextLen, task.blockEnd);
-            vector_.ReadTileToSlot(task.read.physical, task.read.base, task.kvHead, slot);
-        }
-        StageToL1(task, 0);
-        if (task.numTiles > 1) {
-            StageToL1(task, 1);
-        }
-
-        while (task.tile + kPhases <= task.numTiles) {
-            RunVectorPeriod<0>(task, heads);
-            task.tile += kPhases;
-        }
-        RunVectorTail<0>(task, heads, task.numTiles - task.tile);
     }
 
     template <uint32_t PHASE>
-    __aicore__ inline void RunVectorPeriod(PipelineTask &task, const TurboQuantTaskHeads &heads)
+    __aicore__ inline void ReleaseCubeSlot()
     {
-        if constexpr (PHASE < kPhases) {
-            RunVectorPhase<PHASE>(task, heads, task.tile + PHASE);
-            RunVectorPeriod<PHASE + 1>(task, heads);
-        }
+        constexpr uint32_t kSlot = PHASE % kSlots;
+        vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::FIX_S>();
+        AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(
+            static_cast<uint16_t>(kOptFlagSlotFree + kSlot));
     }
 
     template <uint32_t PHASE>
-    __aicore__ inline void RunVectorTail(PipelineTask &task, const TurboQuantTaskHeads &heads,
-                                         const uint32_t remaining)
+    __aicore__ inline void ReadPipelineTile(PipelineTask &task)
     {
-        if constexpr (PHASE < kPhases) {
-            if (PHASE < remaining) {
-                RunVectorPhase<PHASE>(task, heads, task.tile + PHASE);
-                RunVectorTail<PHASE + 1>(task, heads, remaining);
-            }
-        }
+        constexpr uint32_t kSlot = PHASE % kSlots;
+        NextTile(task.read, task.token, task.contextLen, task.blockEnd);
+        vector_.ReadTileToSlot(task.read.physical, task.read.base, task.kvHead, kSlot);
     }
 
     template <uint32_t PHASE>
-    __aicore__ inline void RunVectorPhase(PipelineTask &task, const TurboQuantTaskHeads &heads, const uint32_t tile)
+    __aicore__ inline void VectorSoftmax(PipelineTask &task, const TurboQuantTaskHeads &heads)
     {
         constexpr uint32_t kSlot = PHASE % kSlots;
         constexpr uint32_t kWindow = PHASE % kWindows;
-        constexpr uint32_t kStageSlot = (PHASE + 2) % kSlots;
-
         NextTile(task.consume, task.token, task.contextLen, task.blockEnd);
-
         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady + kWindow));
         vector_.ComputeSoftmaxAndStageProbs(mm_, task.consume.valid, heads, kSlot, kWindow);
         vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::MTE3_S>();
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(static_cast<uint16_t>(kOptFlagProbsReady));
+    }
 
-        // The run-ahead read. Slot kSlot held tile `tile`: its packed plane was consumed by the L1 stage
-        // two phases ago and its scale lanes by the softmax just above, so the slot is dead and the one
-        // edge the read needs is V -> MTE2 against this subcore's own vector work.
-        if (tile + kSlots < task.numTiles) {
-            SyncVectorToMte2();
-            NextTile(task.read, task.token, task.contextLen, task.blockEnd);
-            vector_.ReadTileToSlot(task.read.physical, task.read.base, task.kvHead, kSlot);
-        }
-
-        vector_.ComputeAccumulatorDecay(heads);
-
-        // Tile `tile + 2`'s L1 operands, two tiles ahead, so the Cube's next phase finds them staged. The
-        // L1 slot it writes last held tile `tile - 1`, which the Cube released with kOptFlagSlotFree.
-        if (tile + 2 < task.numTiles) {
-            if (tile + 2 >= kSlots) {
-                AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagSlotFree + kStageSlot));
-            }
-            StageToL1(task, kStageSlot);
-        }
-
+    __aicore__ inline void VectorAccumulate(const TurboQuantTaskHeads &heads)
+    {
         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagContextReady));
         vector_.ComputeAccumulate(heads);
+    }
+
+    template <uint32_t PHASE>
+    __aicore__ inline void RunCubeSteadyPhase(const uint32_t rows)
+    {
+        CubeScores<PHASE + 1>(rows);
+        CubeContext<PHASE>(rows);
+        ReleaseCubeSlot<PHASE>();
+    }
+
+    template <uint32_t PHASE>
+    __aicore__ inline void RunVectorSteadyPhase(PipelineTask &task, const TurboQuantTaskHeads &heads)
+    {
+        constexpr uint32_t kStageSlot = (PHASE + 2) % kSlots;
+        VectorSoftmax<PHASE>(task, heads);
+        SyncVectorToMte2();
+        ReadPipelineTile<PHASE>(task);
+        vector_.ComputeAccumulatorDecay(heads);
+        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagSlotFree + kStageSlot));
+        StageToL1(task, kStageSlot);
+        VectorAccumulate(heads);
+    }
+
+    // The remainder dispatch selects the drain's phase statically as well.
+    // It never resets phase to zero at N-3, including all five ragged residues.
+    template <uint32_t PHASE>
+    __aicore__ inline void RunCubeSteadyTail(const uint32_t rows, const uint32_t remaining)
+    {
+        if constexpr (PHASE < kPhases - 1) {
+            if (PHASE < remaining) {
+                RunCubeSteadyPhase<PHASE>(rows);
+                RunCubeSteadyTail<PHASE + 1>(rows, remaining);
+                return;
+            }
+        }
+        RunCubeDrain<PHASE>(rows);
+    }
+
+    template <uint32_t PHASE>
+    __aicore__ inline void RunVectorSteadyTail(PipelineTask &task, const TurboQuantTaskHeads &heads,
+                                              const uint32_t remaining)
+    {
+        if constexpr (PHASE < kPhases - 1) {
+            if (PHASE < remaining) {
+                RunVectorSteadyPhase<PHASE>(task, heads);
+                RunVectorSteadyTail<PHASE + 1>(task, heads, remaining);
+                return;
+            }
+        }
+        RunVectorDrain<PHASE>(task, heads);
+    }
+
+    template <uint32_t PHASE>
+    __aicore__ inline void RunCubeDrain(const uint32_t rows)
+    {
+        CubeScores<PHASE + 1>(rows); CubeContext<PHASE>(rows);     // N-3: no refill credit
+        CubeScores<PHASE + 2>(rows); CubeContext<PHASE + 1>(rows); // N-2
+        CubeContext<PHASE + 2>(rows);                            // N-1: no scores
+    }
+
+    template <uint32_t PHASE>
+    __aicore__ inline void RunVectorDrain(PipelineTask &task, const TurboQuantTaskHeads &heads)
+    {
+        constexpr uint32_t kStageSlot = (PHASE + 2) % kSlots;
+        VectorSoftmax<PHASE>(task, heads);                       // N-3: no read
+        vector_.ComputeAccumulatorDecay(heads);
+        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagSlotFree + kStageSlot));
+        StageToL1(task, kStageSlot);
+        VectorAccumulate(heads);
+        VectorSoftmax<PHASE + 1>(task, heads);                   // N-2: no stage
+        vector_.ComputeAccumulatorDecay(heads);
+        VectorAccumulate(heads);
+        VectorSoftmax<PHASE + 2>(task, heads);                   // N-1: final softmax/context
+        vector_.ComputeAccumulatorDecay(heads);
+        VectorAccumulate(heads);
     }
 
     // The slot's MTE2 read is already posted on the slot's own event id; StageSlotToL1 waits exactly that
@@ -702,30 +761,9 @@ ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(turboquant_mm_fused_decode_opt_kv4fp8_half
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half,
                                                 TurboQuantMode::KV4_FP8, half)
 
-// Isolation changes only the cursor's tile selection. All arithmetic and the
-// ring body are the same ComputeTask/Run*Pipeline methods as production.
-extern "C" __global__ __aicore__ void turboquant_fused_decode_opt_probe(
-    GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR scales, GM_ADDR table,
-    GM_ADDR lengths, GM_ADDR modes, GM_ADDR workspace, GM_ADDR output,
-    uint32_t heads, uint32_t page, uint32_t tile)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    AscendC::InitSocState();
-    AscendC::TPipe pipe;
-    TurboQuantFusedDecodeOpt<TurboQuantMode::KV4_FP8, half> op(&pipe);
-    op.Init(query, key, value, scales, table, lengths, modes, workspace, output,
-        1, heads, 1, 256, 128, 8, 1, 16, 4096, 1.0f, 0.0625f);
-    op.InitProbe(page, tile);
-    op.Process((heads + 15) / 16);
-    DrainFusedDecodeTask();
-}
-
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 #include "kernel_operator.h"
 #include <stdexcept>
-extern "C" __global__ __aicore__ void turboquant_fused_decode_opt_probe(
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-    uint32_t, uint32_t, uint32_t);
 extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_kv4fp8_half(
     GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
@@ -795,16 +833,6 @@ extern "C" void launch_fused_decode_opt(void* stream,
     const ascend_micro::fused_decode_opt::Buffers* b)
 {
     if (!c || !b) throw std::invalid_argument("null fused decode launch descriptor");
-    if (c->probe_page != UINT32_MAX) {
-        if (c->probe_page >= 8 || c->probe_tile >= 2 || c->grid != 1 || c->splits != 1 ||
-            c->tokens != 1 || c->kv_heads != 1 || c->head_size != 256 || c->block_size != 128 ||
-            c->max_blocks != 8 || !c->heads || c->heads > 32)
-            throw std::invalid_argument("unsupported fused decode probe geometry");
-        turboquant_fused_decode_opt_probe<<<1, nullptr, stream>>>(b->query, b->key,
-            b->value, b->scales, b->block_table, b->context_lengths, b->mode_tables,
-            b->workspace, b->output, c->heads, c->probe_page, c->probe_tile);
-        return;
-    }
     vllm_ascend::turboquant_mm_fused_decode_opt_impl(4, vllm_ascend::AscendType::FP16,
         stream, c->grid, b->query, b->key, b->value, b->scales, b->block_table,
         b->context_lengths, b->mode_tables, b->workspace, b->output, c->tokens,

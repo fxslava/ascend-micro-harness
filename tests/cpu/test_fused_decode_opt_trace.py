@@ -27,7 +27,7 @@ class AuditTests(unittest.TestCase):
             lambda m: f'AscendC::SetFlag<AscendC::HardEvent::{m[1]}>(0);\n'
                       f'AscendC::WaitFlag<AscendC::HardEvent::{m[1]}>(0);', source)
         findings = audit_text(source)
-        self.assertEqual(len(findings), 8)
+        self.assertEqual(len(findings), 7)
         self.assertFalse([f for f in findings if f[3] == 'FAIL'], findings)
         broken = source.replace('AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);', '')
         self.assertTrue(any(f[3] == 'FAIL' for f in audit_text(broken)))
