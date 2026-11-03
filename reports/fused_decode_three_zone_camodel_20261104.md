@@ -291,6 +291,154 @@ unmet**, and no varied-score arithmetic regression was run in this session.
 Per §4, "Do not infer the tail-worker merge path from a single-worker probe":
 every case above ran `splits=1`.
 
+## Benchmark and timeline tooling added (2026-11-04, later session)
+
+### Benchmark: zone-structure reporting and coverage gate
+
+`tests/npu/bench/bench_turboquant_decode_splitk.cpp` gains `--impl three-zone`
+and `--zone-report`.
+
+`three-zone` is an **alias**, not a second kernel. The three-zone schedule *is*
+the production fused-opt kernel after `6b38819`, so both spellings dispatch
+`turboquant_mm_fused_decode_opt_kv4fp8_half`; the alias exists so a sweep can
+ask for the zone report without also opting into the AIV/AIC baselines. No
+second symbol was invented to make a comparison look like an A/B.
+
+`--zone-report` prints, per Split-K worker, the zone decomposition the schedule
+must have taken — tiles, deep or short, complete Period-6 bodies, ragged
+residue, drain steps — and then accounts for which zone classes the sweep
+covered. It is a host restatement of the kernel's own selection
+(`kSlots=3`, `kPhases=6`, `steady_limit = numTiles - kSlots`, deep at
+`numTiles >= 4`), so it states which zones a row *must* have used; only the
+CAModel trace audit shows which it did. Worker tile counts mirror the kernel's
+block slicing and are valid for this fixture specifically, whose block table
+maps every logical page.
+
+It also **fails** a sweep that never leaves the short bounded path, because
+such a sweep tests none of the steady loop this refactor introduced while still
+reporting `PASS: CPU references matched`.
+
+Validation is not newly invented: `FusedOptRig::Validate` already compares
+every launch against the fixture's independent FP64 attention oracle, and K=1
+and K>1 are held to the *same* oracle, so a Split-K merge that lost or double
+counted a worker's partial cannot pass. The zone report records the structure
+behind that result rather than adding a second, weaker check.
+
+Measured on CAModel (`bench_decode_splitk_sim`, single launches):
+
+| Config | Tiles | Deep | Periods | Residue | Drain | Class | Result |
+| --- | ---: | --- | ---: | ---: | ---: | --- | --- |
+| `--context 128 --page-tokens 128` | 2 | no | 0 | 0 | 0 | short | PASS |
+| `--context 576 --page-tokens 64` | 9 | yes | 1 | 0 | 3 | deep-exact | PASS |
+| `--context 768 --page-tokens 128` | 12 | yes | 1 | 3 | 3 | deep-ragged | PASS |
+
+All with `--heads 1 --rows 16 --requests 1 --splitk 1 --single`, each reporting
+`PASS: CPU references matched`. The N=12 row reproduces the headline structure
+(one full period plus a residue-3 steady tail plus the drain). Negative control:
+`--context 128` alone fails with
+`--zone-report swept no deep three-zone worker`, as intended.
+
+Event times are `NA` in every row: CAModel reports no device event timing, which
+the benchmark already states. **No latency, speedup or bandwidth number was
+produced by this work**; the timeline below is where CAModel timing analysis
+belongs.
+
+### Timeline: Gantt/Chrome-trace export with measured engine overlap
+
+Two new files:
+
+- `scripts/export_fused_decode_gantt.py` — turns a case's CAModel dumps into
+  Chrome-trace JSON (one process per core, one thread lane per engine) plus a
+  summary of per-engine occupancy and **actual intersecting engine intervals**.
+  Spans pair each instruction between the dispatch log (`instr_popped_log`) and
+  the completion log (`instr_log`).
+- `scripts/run_fused_decode_three_zone_gantt_camodel.sh` — follows
+  `run_decode_pipeline_camodel.sh`: fresh printed tree, host gates, strict
+  build, one case per zone structure, event audit *before* any timeline
+  analysis, then per-case Gantt export and a cross-case overlap table. It
+  optionally drives the native msprof simulator capture through the existing
+  `capture_fused_decode_opt_camodel_json.sh`, so this repository keeps one
+  definition of how msprof is invoked. It complements, and does not replace,
+  `run_fused_decode_three_zone_camodel.sh`, which remains the correctness
+  ladder.
+
+Two pairing hazards were found and handled while building this:
+
+1. **Instruction ids are not unique within a dump.** CAModel writes its dumps
+   when the process stops, so one dump covers every launch and the id counter
+   repeats. Keying a completion by id alone pairs a dispatch with another
+   launch's completion and yields negative durations (first seen as id 3299
+   completing at tick 2890 having dispatched at 2905). Pairing is now
+   occurrence-wise: the k-th dispatch of an id takes the next completion of that
+   id at or after it.
+2. **Not every dispatch has a completion line.** CAModel omits some; those get
+   no span and are counted as `unpaired_dispatches` rather than given a
+   fabricated duration (1766 `RVECST` per vector core at N=12).
+
+**This supplies the overlap evidence that §5 requires and that both this report
+and `6b38819`'s recorded as absent.** Measured intersections of merged
+per-engine interval unions — real concurrency in the model, not source order
+and not balanced-event inference:
+
+All on block 0, the only block a single-task grid runs. `veccore0` and
+`veccore1` track each other closely; `veccore0` is shown.
+
+| Case | Tiles | span_ticks | MTE3&RVECEX | MTE2&RVECEX | MTE2&VEC | CUBE&FIXP (cube) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `short-n3` | 3 | 31,173 | 4,171 | 96 | 1,327 | 757 |
+| `deep-noperiod-n4` | 4 | 39,341 | 5,230 | 661 | 2,292 | 1,054 |
+| `deep-exact-n9` | 9 | 70,210 | 11,241 | 1,410 | 2,938 | 2,342 |
+| `deep-ragged-n12` | 12 | 94,461 | 14,339 | 1,732 | 2,940 | 3,137 |
+| `deep-twoperiod-n16` | 16 | 119,296 | 19,004 | 2,301 | 3,080 | 4,176 |
+
+Both Vector-facing intersections grow monotonically with tile count:
+MTE3/Vector at roughly 1,190 ticks per tile (4,171 → 19,004 across 3 → 16
+tiles) and MTE2/Vector from 96 to 2,301. A schedule that serialised ingress and
+egress against Vector work would not scale this way, so this is the signature
+of a steady loop that genuinely overlaps them. The cube core's CUBE/FIXP
+intersection scales similarly (757 → 4,176).
+
+Ticks are CAModel model ticks: **not nanoseconds, and not silicon throughput.**
+The growth is evidence of overlap structure, not of achieved performance.
+
+The analysis half of the script was exercised over all five zone classes using
+the traces already captured in this session, at no simulator cost. Its
+build-and-run half uses the same runner invocation already proven above. The
+native msprof leg was **not** run (it needs a `build_fused_decode_opt_bench.sh`
+root via `MSPROF_BENCH_ROOT`); the script reports that as `SKIPPED` rather than
+passing silently.
+
+Single-tile timelines for direct overlap inspection were exported to
+`reports/fused_decode_three_zone_camodel_20261104/gantt/`. Note that at one
+tile `MTE2&RVECEX` is only 20 ticks: with a single tile there is no run-ahead
+read to overlap with, so a one-tile Gantt shows within-tile engine structure
+and cannot show pipeline overlap.
+
+### Open finding: `--impl fused-opt --rows 1` fails its own oracle
+
+Found while exercising the bench, and **pre-existing** — it reproduces with the
+unmodified `--impl fused-opt` spelling, so it predates the three-zone work and
+is not caused by these changes:
+
+```
+fused-opt mismatch element=0 got=1.00391 expected=2.06242 bits=3c04 ref=4020
+FAIL: fused-opt CPU attention reference failed
+```
+
+Measured on CAModel: fails at `--rows 1` with `--page-tokens 128 --context 128`
+and with `--page-tokens 64 --context 192`; passes at `--rows 16` for both page
+sizes, including `--page-tokens 64 --context 576`. The observed value is close
+to half the oracle's in both failing cases. So the variable is `--rows`
+(GQA query heads per KV head), not page size.
+
+The accepted range is deliberately left at 1..16 so the failure stays
+reproducible, and the `--help` text now records it instead of claiming support.
+Whether the kernel, the fixture or the oracle is wrong at `rows=1` is not
+diagnosed here. The kernel passes all eleven CAModel correctness cases against
+the simulator runner's own fixture, so this is most likely a bench-fixture
+disagreement rather than a kernel defect — stated as a hypothesis, not a
+conclusion.
+
 ## Limitations
 
 - No physical NPU on this host. Every device number here is CAModel over

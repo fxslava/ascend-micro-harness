@@ -41,10 +41,80 @@ struct Options {
     bool single = false;
     std::string impl = "aiv", csv_out;
     int page_begin = 0, page_count = -1;
+    bool zone_report = false;
     bool Aiv() const { return impl == "aiv" || impl == "both" || impl == "all"; }
     bool Aic() const { return impl == "aic" || impl == "both" || impl == "all"; }
-    bool Opt() const { return impl == "fused-opt" || impl == "all"; }
+    // `three-zone` is an alias, not a second kernel: the three-zone schedule
+    // IS the production fused-opt kernel after the schedule refactor, so both
+    // spellings dispatch the same symbol. The alias exists so a sweep can ask
+    // for the zone report without also opting into the legacy baselines.
+    bool Opt() const { return impl == "fused-opt" || impl == "three-zone" || impl == "all"; }
+    bool OptOnly() const { return impl == "fused-opt" || impl == "three-zone"; }
 };
+
+// ---------------------------------------------------------------------------
+// Zone decomposition of the fused-opt schedule.
+//
+// This mirrors the kernel's own selection in
+// kernels/ops/turboquant/turboquant_fused_decode_opt.cpp: kSlots = 3 L1 ring
+// slots, kPhases = 6 unrolled steady phases, steady_limit = numTiles - kSlots,
+// the deep path taken at numTiles >= kSlots + 1 and a bounded three-step drain.
+// It is a host-side restatement for reporting, so a bench row can say whether
+// it actually entered the steady loop. It is not evidence that the kernel took
+// that path -- the CAModel trace audit is.
+// ---------------------------------------------------------------------------
+constexpr int kZoneSlots = 3, kZonePhases = 6, kZoneTileRows = 64;
+
+struct ZoneShape {
+    int tiles = 0;      // per-worker numTiles
+    bool deep = false;  // the unconditional three-zone path, not the short one
+    int periods = 0;    // complete unrolled Period-6 bodies
+    int residue = 0;    // ragged steady phases following them
+    int drain = 0;      // bounded drain steps
+    bool Empty() const { return tiles == 0; }
+    // Zone class, for coverage accounting.
+    std::string Kind() const
+    {
+        if (Empty()) return "empty";
+        if (!deep) return "short";
+        if (periods == 0) return "deep-noperiod";
+        return residue ? "deep-ragged" : "deep-exact";
+    }
+};
+
+ZoneShape zone_shape(int tiles)
+{
+    ZoneShape z;
+    z.tiles = tiles;
+    if (tiles <= 0) return z;
+    if (tiles < kZoneSlots + 1) return z;  // bounded short/compatibility path
+    z.deep = true;
+    const int steady = tiles - kZoneSlots;
+    z.periods = steady / kZonePhases;
+    z.residue = steady % kZonePhases;
+    z.drain = kZoneSlots;
+    return z;
+}
+
+// Per-worker tile counts. Mirrors the kernel's block slicing: a worker owns
+// [split * blocksPerSplit, min(start + blocksPerSplit, seqBlocks)). Valid for
+// the fused-opt fixture specifically, whose block table maps EVERY logical
+// page; CountTiles skips negative entries, so a fixture with holes would need
+// the table itself rather than this arithmetic.
+std::vector<ZoneShape> worker_zones(int context, int page_tokens, int k)
+{
+    const int seq_blocks = context / page_tokens;
+    const int tiles_per_block = page_tokens / kZoneTileRows;
+    const int workers = k <= 1 ? 1 : k;
+    const int per_split = (seq_blocks + workers - 1) / workers;
+    std::vector<ZoneShape> out;
+    for (int split = 0; split < workers; ++split) {
+        const int start = split * per_split;
+        const int end = std::min(start + per_split, seq_blocks);
+        out.push_back(zone_shape(std::max(0, end - start) * tiles_per_block));
+    }
+    return out;
+}
 
 int number(std::string_view s)
 {
@@ -78,16 +148,23 @@ Options parse(int argc, char** argv)
         if (arg == "--help") {
             std::puts("--context N[,N...] --splitk K[,K...] --warmup N --iters N "
                       "--requests N --heads N --rows N --page-tokens N\n"
-                      "--impl aiv|aic|both|fused-opt|all --single --csv-out PATH --page-begin P --page-count P\n"
+                      "--impl aiv|aic|both|fused-opt|three-zone|all --single --csv-out PATH --page-begin P --page-count P\n"
+                      "--zone-report: per-worker three-zone decomposition and zone-class coverage.\n"
+                      "three-zone is an alias for fused-opt: one kernel, the refactored schedule.\n"
                       "Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8,12,16.\n"
                       "fused-opt: separate KV4/FP8 fixture; --rows is GQA query heads per KV head; K 1..8.\n"
                       "Its default K sweep is 1,2,4,8. --impl all leaves opt columns NA at K>8.\n"
-                      "fused-opt supports --rows 1..16; legacy/all supports --rows 1..8.\n"
+                      "fused-opt accepts --rows 1..16; legacy/all accepts --rows 1..8.\n"
+                      "KNOWN FAILING: fused-opt --rows 1 fails its own CPU attention oracle\n"
+                      "(measured on CAModel 2026-11-04, context 128/192, page-tokens 64 and 128,\n"
+                      "and with --impl fused-opt as well, so it predates the three-zone work).\n"
+                      "--rows 16 passes. The range is left as-is so the failure stays reproducible.\n"
                       "fused-opt page-tokens: 64 or 128; other implementations: 16 or 128.\n"
                       "Use --page-tokens 16 --heads 1 --context 48 for a short CAModel run.");
             std::exit(0);
         }
         if (arg == "--single") { o.single = true; continue; }
+        if (arg == "--zone-report") { o.zone_report = true; continue; }
         require(i + 1 < argc, "option requires a value");
         const std::string_view value(argv[++i]);
         if (arg == "--context") o.contexts = list(value);
@@ -105,14 +182,17 @@ Options parse(int argc, char** argv)
         else throw std::runtime_error("unknown option: " + std::string(arg));
     }
     if (o.single) { o.warmup = 0; o.iters = 1; }
-    require(o.Aiv() || o.Aic() || o.Opt(), "impl must be aiv, aic, both, fused-opt or all");
-    if (o.impl == "fused-opt" && !explicit_splits) o.splits = {1, 2, 4, 8};
+    require(o.Aiv() || o.Aic() || o.Opt(),
+            "impl must be aiv, aic, both, fused-opt, three-zone or all");
+    require(!o.zone_report || o.Opt(), "--zone-report needs fused-opt, three-zone or all");
+    if (o.OptOnly() && !explicit_splits) o.splits = {1, 2, 4, 8};
     require(o.page_begin >= 0 && o.page_count >= -1, "invalid AIC page window");
     require(o.Opt() ? (o.page_tokens == 64 || o.page_tokens == 128) :
             (o.page_tokens == 16 || o.page_tokens == 128), "unsupported page-tokens for implementation");
-    if (o.Aiv() || o.Aic()) require(o.page_tokens != 64, "64-token pages require --impl fused-opt");
+    if (o.Aiv() || o.Aic()) require(o.page_tokens != 64,
+            "64-token pages require --impl fused-opt or three-zone");
     require(o.heads > 0 && o.heads <= 4 && o.rows > 0 &&
-            o.rows <= (o.impl == "fused-opt" ? 16 : 8),
+            o.rows <= (o.OptOnly() ? 16 : 8),
             "heads must be 1..4; rows 1..16 for fused-opt, otherwise 1..8");
     for (int n : o.contexts) {
         require(n > 0 && n <= 16384 && n % o.page_tokens == 0,
@@ -123,7 +203,7 @@ Options parse(int argc, char** argv)
         if (o.impl != "aic") require(o.page_begin == 0 && (o.page_count == -1 || o.page_count == pages),
                 "partial page windows require --impl aic; both compares full contexts");
     }
-    for (int k : o.splits) require(k >= 1 && k <= (o.impl == "fused-opt" ? 8 : 16),
+    for (int k : o.splits) require(k >= 1 && k <= (o.OptOnly() ? 8 : 16),
                                  "splitk must be 1..8 for fused-opt, otherwise 1..16");
     require(o.iters > 0 && o.warmup >= 0 && o.requests > 0 && o.requests <= 16,
             "invalid iteration or batch bound");
@@ -336,6 +416,9 @@ int main(int argc, char** argv)
         Events events;
         struct Comparison { int n, k; double aiv, aic; };
         std::vector<Comparison> comparisons;
+        struct ZoneRow { int n, k; std::vector<ZoneShape> workers; };
+        std::vector<ZoneRow> zone_rows;
+        std::map<std::string, int> zone_classes;
         std::uint64_t aiv_launches = 0, aic_launches = 0, opt_launches = 0;
         for (int n : o.contexts) {
             std::unique_ptr<Fixture> av, ac;
@@ -372,6 +455,17 @@ int main(int argc, char** argv)
                     opt_launches += opt.launches; opt_grid = d.config.grid;
                     if (k == 1 && opt.timed) opt_baseline = opt.us;
                     opt_bytes = opt_fixture->cache_bytes();
+                    // The rig's Validate() already compared every launch of
+                    // this configuration against the fixture's independent
+                    // FP64 attention oracle, and K=1 and K>1 are held to the
+                    // SAME oracle, so a Split-K merge that lost or double
+                    // counted a worker's partial cannot pass. Record the zone
+                    // shape the schedule must have taken for that result.
+                    if (o.zone_report) {
+                        const auto shapes = worker_zones(n, o.page_tokens, k);
+                        for (const auto& z : shapes) ++zone_classes[z.Kind()];
+                        zone_rows.push_back({n, k, shapes});
+                    }
                 }
                 row(n, k, o.requests * o.heads * k, aiv, aic, opt, opt_grid,
                     baseline, opt_baseline, aiv_bytes, aic_bytes, opt_bytes, csv);
@@ -380,6 +474,41 @@ int main(int argc, char** argv)
             }
         }
         std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
+        if (o.zone_report) {
+            std::puts("");
+            std::puts("Three-zone decomposition per Split-K worker. Host restatement of the kernel's own");
+            std::puts("selection (kSlots=3, kPhases=6, steady_limit=numTiles-3, deep at numTiles>=4);");
+            std::puts("it says which zones a row MUST have used, not that the kernel took them -- only");
+            std::puts("the CAModel trace audit shows that. Tiles are 64 tokens (kCubeTileRows).");
+            std::puts("+-------------+------------+--------+-------+-------+---------+---------+-------+----------------+");
+            std::printf("| %11s | %10s | %6s | %5s | %5s | %7s | %7s | %5s | %14s |\n",
+                        "Context (N)", "Splits (K)", "Worker", "Tiles", "Deep", "Periods",
+                        "Residue", "Drain", "Zone class");
+            std::puts("+-------------+------------+--------+-------+-------+---------+---------+-------+----------------+");
+            for (const auto& r : zone_rows)
+                for (std::size_t w = 0; w < r.workers.size(); ++w) {
+                    const auto& z = r.workers[w];
+                    std::printf("| %11d | %10d | %6zu | %5d | %5s | %7d | %7d | %5d | %14s |\n",
+                                r.n, r.k, w, z.tiles, z.Empty() ? "NA" : (z.deep ? "yes" : "no"),
+                                z.periods, z.residue, z.drain, z.Kind().c_str());
+                }
+            std::puts("+-------------+------------+--------+-------+-------+---------+---------+-------+----------------+");
+            std::puts("Zone-class coverage across this sweep:");
+            for (const auto& entry : zone_classes)
+                std::printf("  %-14s workers=%d\n", entry.first.c_str(), entry.second);
+            // Coverage is reported, and the one class this benchmark exists to
+            // exercise is required. A sweep that never left the short bounded
+            // path would otherwise report PASS while testing none of the
+            // steady loop this refactor introduced.
+            const std::size_t deep_classes =
+                zone_classes.count("deep-exact") + zone_classes.count("deep-ragged") +
+                zone_classes.count("deep-noperiod");
+            require(deep_classes > 0, "--zone-report swept no deep three-zone worker: raise --context "
+                              "(a worker needs >=4 tiles, i.e. >=256 tokens of its own slice)");
+            for (const char* kind : {"short", "deep-exact", "deep-ragged"})
+                if (!zone_classes.count(kind))
+                    std::printf("NOTE: zone class %s not covered by this sweep.\n", kind);
+        }
         for (const auto& c : comparisons)
             std::printf("Modeled comparison N=%d K=%d: AIC %.3f us/row vs AIV %.3f us/decode (%s).\n",
                         c.n, c.k, c.aic, c.aiv, c.aic < c.aiv ? "AIC amortized model lower" : "AIV lower");

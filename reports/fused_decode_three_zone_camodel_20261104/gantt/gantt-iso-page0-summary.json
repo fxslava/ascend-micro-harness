@@ -1,0 +1,233 @@
+{
+  "cores": {
+    "core0.cubecore0": {
+      "spans": 1261,
+      "unpaired_dispatches": {},
+      "tick_window": [
+        719,
+        17693
+      ],
+      "span_ticks": 16974,
+      "engines": {
+        "SCALAR": {
+          "spans": 1087,
+          "busy_ticks": 2913,
+          "first_tick": 719,
+          "last_tick": 17693
+        },
+        "MTE1": {
+          "spans": 14,
+          "busy_ticks": 222,
+          "first_tick": 759,
+          "last_tick": 17361
+        },
+        "MTE2": {
+          "spans": 2,
+          "busy_ticks": 8,
+          "first_tick": 759,
+          "last_tick": 783
+        },
+        "CUBE": {
+          "spans": 15,
+          "busy_ticks": 302,
+          "first_tick": 1576,
+          "last_tick": 16858
+        },
+        "FLOWCTRL": {
+          "spans": 133,
+          "busy_ticks": 135,
+          "first_tick": 1617,
+          "last_tick": 17672
+        },
+        "FIXP": {
+          "spans": 10,
+          "busy_ticks": 469,
+          "first_tick": 8669,
+          "last_tick": 16808
+        }
+      },
+      "intersecting_ticks": {
+        "CUBE&MTE1": 175,
+        "CUBE&FIXP": 271
+      }
+    },
+    "core0.veccore0": {
+      "spans": 7778,
+      "unpaired_dispatches": {
+        "RVECST": 277
+      },
+      "tick_window": [
+        673,
+        17189
+      ],
+      "span_ticks": 16516,
+      "engines": {
+        "SCALAR": {
+          "spans": 2598,
+          "busy_ticks": 4362,
+          "first_tick": 673,
+          "last_tick": 17188
+        },
+        "PUSHQ": {
+          "spans": 148,
+          "busy_ticks": 11007,
+          "first_tick": 1413,
+          "last_tick": 16205
+        },
+        "MTE2": {
+          "spans": 10,
+          "busy_ticks": 1762,
+          "first_tick": 1414,
+          "last_tick": 16832
+        },
+        "MTE3": {
+          "spans": 31,
+          "busy_ticks": 5160,
+          "first_tick": 1414,
+          "last_tick": 16836
+        },
+        "FLOWCTRL": {
+          "spans": 246,
+          "busy_ticks": 276,
+          "first_tick": 1666,
+          "last_tick": 17189
+        },
+        "VEC": {
+          "spans": 14,
+          "busy_ticks": 6188,
+          "first_tick": 2183,
+          "last_tick": 16834
+        },
+        "RVECLP": {
+          "spans": 68,
+          "busy_ticks": 68,
+          "first_tick": 2723,
+          "last_tick": 16133
+        },
+        "RVECSU": {
+          "spans": 159,
+          "busy_ticks": 159,
+          "first_tick": 2725,
+          "last_tick": 16168
+        },
+        "RVECEX": {
+          "spans": 2035,
+          "busy_ticks": 3206,
+          "first_tick": 2727,
+          "last_tick": 16180
+        },
+        "RVECST": {
+          "spans": 1147,
+          "busy_ticks": 3209,
+          "first_tick": 2733,
+          "last_tick": 16198
+        },
+        "RVECLD": {
+          "spans": 1322,
+          "busy_ticks": 6103,
+          "first_tick": 2777,
+          "last_tick": 16198
+        }
+      },
+      "intersecting_ticks": {
+        "MTE2&RVECEX": 19,
+        "MTE3&RVECEX": 1785,
+        "MTE2&VEC": 1289
+      }
+    },
+    "core0.veccore1": {
+      "spans": 7778,
+      "unpaired_dispatches": {
+        "RVECST": 277
+      },
+      "tick_window": [
+        683,
+        17190
+      ],
+      "span_ticks": 16507,
+      "engines": {
+        "SCALAR": {
+          "spans": 2598,
+          "busy_ticks": 4292,
+          "first_tick": 683,
+          "last_tick": 17189
+        },
+        "PUSHQ": {
+          "spans": 148,
+          "busy_ticks": 10979,
+          "first_tick": 1490,
+          "last_tick": 16060
+        },
+        "MTE2": {
+          "spans": 10,
+          "busy_ticks": 1441,
+          "first_tick": 1491,
+          "last_tick": 16832
+        },
+        "MTE3": {
+          "spans": 31,
+          "busy_ticks": 4913,
+          "first_tick": 1491,
+          "last_tick": 16836
+        },
+        "FLOWCTRL": {
+          "spans": 246,
+          "busy_ticks": 276,
+          "first_tick": 1743,
+          "last_tick": 17190
+        },
+        "VEC": {
+          "spans": 14,
+          "busy_ticks": 5903,
+          "first_tick": 2270,
+          "last_tick": 16834
+        },
+        "RVECLP": {
+          "spans": 68,
+          "busy_ticks": 68,
+          "first_tick": 2784,
+          "last_tick": 15988
+        },
+        "RVECSU": {
+          "spans": 159,
+          "busy_ticks": 159,
+          "first_tick": 2786,
+          "last_tick": 16023
+        },
+        "RVECEX": {
+          "spans": 2035,
+          "busy_ticks": 3207,
+          "first_tick": 2788,
+          "last_tick": 16035
+        },
+        "RVECST": {
+          "spans": 1147,
+          "busy_ticks": 3209,
+          "first_tick": 2794,
+          "last_tick": 16053
+        },
+        "RVECLD": {
+          "spans": 1322,
+          "busy_ticks": 6103,
+          "first_tick": 2838,
+          "last_tick": 16053
+        }
+      },
+      "intersecting_ticks": {
+        "MTE2&RVECEX": 20,
+        "MTE3&RVECEX": 1785,
+        "MTE2&VEC": 1033
+      }
+    }
+  },
+  "totals": {
+    "spans": 16817,
+    "active_cores": 3
+  },
+  "note": {
+    "source": "/home/dmin/work/three-zone-check-20261103/iso-page0",
+    "units": "CAModel model ticks, NOT nanoseconds and NOT silicon time",
+    "spans_from": "dispatch tick (instr_popped_log) to completion tick (instr_log)",
+    "caveat": "Unpaired dispatches get no span: CAModel omits some instructions from the completion log. Overlap is measured on merged per-engine interval unions, so it is real intersection, not source order."
+  }
+}
