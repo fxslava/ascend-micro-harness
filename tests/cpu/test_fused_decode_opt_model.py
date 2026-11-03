@@ -9,7 +9,7 @@ explored, carrying operand generations and final tokens across consecutive tasks
 from collections import deque
 
 
-def schedule(counts, early_refill=False, wrong_window=False, duplicate=False):
+def schedule(counts, early_refill=False, wrong_window=False, duplicate=False, unprimed=False):
     queues = [[] for _ in range(5)]
     def emit(q, *op): queues[q].append(op)
     def flag(q, op, kind, role, slot=0): emit(q, op, (kind, role, slot))
@@ -22,7 +22,7 @@ def schedule(counts, early_refill=False, wrong_window=False, duplicate=False):
             flag(3 + role, 'set', 'read', role, slot)
         def stage(role, i):
             slot = i % 3
-            if i >= 3: flag(1 + role, 'wait', 'free', role, slot)
+            if i >= (2 if count >= 4 else 3): flag(1 + role, 'wait', 'free', role, slot)
             flag(1 + role, 'wait', 'read', role, slot)
             emit(1 + role, 'stage', role, slot, epoch * 1000 + i)
             flag(1 + role, 'set', 'ready', role, slot)
@@ -45,6 +45,8 @@ def schedule(counts, early_refill=False, wrong_window=False, duplicate=False):
                 if i + 2 < count: stage(role, i + 2)
                 flag(1 + role, 'wait', 'context', role)
                 emit(1 + role, 'accumulate', role, epoch * 1000 + i)
+        if count >= 4 and not unprimed:
+            for role in range(2): flag(0, 'set', 'free', role, 2)
         if count: score(0)
         for i in range(count):
             if i + 1 < count: score(i + 1)
@@ -134,9 +136,9 @@ def explore(queues):
 
 
 if __name__ == '__main__':
-    for n in (0, 1, 2, 3, 4, 6, 7, 16):
+    for n in range(17):
         print(f'PASS N={n} two_tasks states={explore(schedule((n, n)))}')
-    for option in ('early_refill', 'wrong_window', 'duplicate'):
+    for option in ('early_refill', 'wrong_window', 'duplicate', 'unprimed'):
         try: explore(schedule((7,), **{option: True}))
         except AssertionError as e: print(f'PASS negative {option}: {e}')
         else: raise AssertionError(f'negative control not rejected: {option}')

@@ -16,7 +16,12 @@ if [[ "${1:-}" != reuse ]]; then
     python3 -u "$repo/tests/cpu/test_fused_decode_opt_model.py" >"$root/host-model.log"
     python3 "$repo/tests/cpu/test_fused_decode_opt_trace.py" >"$root/host-audit-controls.log" 2>&1
     mkdir -p "$root/src"
-    rsync -a --exclude '.git' --exclude 'reports' --exclude 'bin' --exclude 'build*' "$repo/" "$root/src/"
+    if command -v rsync >/dev/null; then
+        rsync -a --exclude '.git' --exclude 'reports' --exclude 'bin' --exclude 'build*' "$repo/" "$root/src/"
+    else
+        tar -C "$repo" --exclude='.git' --exclude='reports' --exclude='bin' --exclude='build*' -cf - . |
+            tar -C "$root/src" -xf -
+    fi
     cmake -S "$root/src" -B "$root/build" -DASCEND_HOME_PATH="$toolkit" -DSOC_VERSION="$soc" >"$root/configure.log" 2>&1
     cmake --build "$root/build" --target test_camodel_fused_decode_opt turboquant_fused_decode_opt_npu -j4 >"$root/build.log" 2>&1 || { tail -100 "$root/build.log"; exit 1; }
 else

@@ -16,7 +16,9 @@ printf '%s\n' "$root" > "$out/build-root.txt"
     printf '%s\0' kernels/ops/turboquant/turboquant_fused_decode_opt.cpp \
         routines/routine_vector_cube_softmax.hpp routines/routine_vector_online_softmax.hpp \
         routines/routine_turboquant_dequant4.hpp include/turboquant_fused_decode_opt.hpp \
-        tests/camodel/test_camodel_fused_decode_opt.cpp
+        tests/sim/kernel/test_camodel_fused_decode_opt.cpp \
+        tests/sim/kernel/fused_decode_opt_kernel.cpp \
+        tests/sim/kernel/fused_decode_opt_sim_common.hpp
     for path in tests/npu/bench/bench_turboquant_decode_splitk.cpp \
         tests/npu/turboquant_fused_decode_opt_rig.hpp tests/common/fused_decode_opt_fixture.hpp \
         tests/cpu/test_fused_decode_opt_fixture.cpp cmake/SimTargets.cmake cmake/NpuTargets.cmake; do
