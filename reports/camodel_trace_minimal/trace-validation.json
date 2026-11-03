@@ -1,0 +1,48 @@
+{
+  "status": "PASS",
+  "sha256": "76876b2172d0bd735b8f40f398a0fd7a4e3d7b56cf7d55083582274a8ad47a83",
+  "events": 25871,
+  "phases": {
+    "M": 75,
+    "X": 25796
+  },
+  "timestamp_range_us": [
+    0.3866666555404663,
+    15.456666946411133
+  ],
+  "positive_duration_events": 24592,
+  "core_pipe_event_counts": {
+    "core0.cubecore0": {
+      "SCALAR": 355,
+      "MTE2": 37,
+      "MTE1": 27,
+      "CUBE": 72,
+      "FIXP": 4,
+      "FLOWCTRL": 2
+    },
+    "core0.veccore1": {
+      "SCALAR": 320,
+      "PUSHQ": 4,
+      "MTE3": 17,
+      "MTE2": 2,
+      "RVECEX": 64,
+      "RVECLD": 33,
+      "RVECST": 33,
+      "RVECSU": 1,
+      "FLOWCTRL": 4
+    },
+    "core0.veccore0": {
+      "SCALAR": 3269,
+      "PUSHQ": 444,
+      "MTE3": 4,
+      "MTE2": 4,
+      "RVECEX": 6180,
+      "RVECST": 6016,
+      "RVECSU": 325,
+      "RVECLD": 7370,
+      "FLOWCTRL": 5
+    }
+  },
+  "flow_categories": {},
+  "note": "Native CANN pipe categories are tid lanes; cat is optional."
+}

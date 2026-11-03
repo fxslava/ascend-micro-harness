@@ -1,0 +1,9 @@
+Trace loaded: 5.90 MB in 0.13s (45.8 MB/s)
+
+
+Trace health issues:
+
+  Import errors
+    slice_spill_overlapping_complete_event: 17120 | A complete slice (typically a JSON 'X' event) partially overlaps another slice on the same thread track, so it cannot nest there. Instead of dropping it, Perfetto moved it onto a separate overflow track that is merged back onto the thread at display time. No data is lost, but because overlapping duration events are inherently ambiguous (nothing in the trace says how they should nest), the resulting layout might not match what you intended when you emitted these events. See https://github.com/google/perf
+
+Query executed in 13 ms

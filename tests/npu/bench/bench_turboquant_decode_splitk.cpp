@@ -165,7 +165,12 @@ struct Events {
     {
 #if !defined(ASCEND_MICRO_BENCH_SIM)
         check(aclrtCreateEvent(&start), "aclrtCreateEvent start");
-        check(aclrtCreateEvent(&end), "aclrtCreateEvent end");
+        try {
+            check(aclrtCreateEvent(&end), "aclrtCreateEvent end");
+        } catch (...) {
+            aclrtDestroyEvent(start);
+            throw;
+        }
 #endif
     }
     Events(const Events&) = delete;
@@ -205,9 +210,9 @@ Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& e
         d.Launch(stream, k);
         check(aclrtSynchronizeStream(stream), "warmup post-launch synchronize");
         ++result.launches;
-        d.Validate(k);
     }
-    std::vector<double> times, tails, exports;
+    std::vector<double> times;
+    times.reserve(o.iters);
     bool valid_events = true;
     for (int i = 0; i < o.iters; ++i) {
         d.Reset();
@@ -229,23 +234,22 @@ Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& e
         ++result.launches;
         require(std::isfinite(ms) && ms >= 0, "invalid event duration");
         valid_events = valid_events && ms > 0;
-        const auto census = d.Validate(k);
-        if (o.single) {
-            // No percentile sorting or multi-sample accumulation in profiling mode.
-            result.us = ms * 1000.0;
-            result.tail = census.tail_ticks.empty() ? 0 : *std::max_element(census.tail_ticks.begin(), census.tail_ticks.end());
-            result.export_region = census.export_ticks.empty() ? 0 : *std::max_element(census.export_ticks.begin(), census.export_ticks.end());
-        } else {
-            times.push_back(ms * 1000.0);
-            tails.insert(tails.end(), census.tail_ticks.begin(), census.tail_ticks.end());
-            exports.insert(exports.end(), census.export_ticks.begin(), census.export_ticks.end());
-        }
+        times.push_back(ms * 1000.0);
+    }
+    // Exactly one download/oracle pass, after the final launch has completed.
+    // In particular, no validation traffic or CPU oracle work separates samples.
+    // Worker counters describe the final launch, not all latency samples.
+    const auto census = d.Validate(k);
+    if (o.single) {
+        result.us = times.front();
+        result.tail = census.tail_ticks.empty() ? 0 : *std::max_element(census.tail_ticks.begin(), census.tail_ticks.end());
+        result.export_region = census.export_ticks.empty() ? 0 : *std::max_element(census.export_ticks.begin(), census.export_ticks.end());
     }
     if (!o.single) {
         const auto latency = summarize(times);
         result.us = latency.p50; result.p95 = latency.p95;
-        if (!tails.empty()) result.tail = summarize(tails).p50;
-        if (!exports.empty()) result.export_region = summarize(exports).p50;
+        if (!census.tail_ticks.empty()) result.tail = summarize(census.tail_ticks).p50;
+        if (!census.export_ticks.empty()) result.export_region = summarize(census.export_ticks).p50;
     }
     result.timed = valid_events;
 #if defined(ASCEND_MICRO_BENCH_SIM)
@@ -263,25 +267,29 @@ std::string field(double value, bool available, int precision = 3)
 }
 
 void row(int n, int k, int grid, const Measurement& aiv, const Measurement& aic,
-         double baseline, double aiv_bytes, double aic_bytes, std::ofstream& csv)
+         double aiv_baseline, double aic_baseline, double aiv_bytes, double aic_bytes,
+         std::ofstream& csv)
 {
-    const auto av = field(aiv.us, aiv.timed);
-    const auto speed = field(aiv.timed ? baseline / aiv.us : 0, aiv.timed && baseline > 0);
-    const auto abw = field(aiv.timed ? aiv_bytes / aiv.us / 1000 : 0, aiv.timed);
-    const auto cr = field(aic.us, aic.timed);
-    const auto cn = field(aic.us / 16.0, aic.timed);
-    const auto cbw = field(aic.timed ? aic_bytes * 16 / aic.us / 1000 : 0, aic.timed);
+    const bool aiv_timed = aiv.timed && std::isfinite(aiv.us) && aiv.us > 0;
+    const bool aic_timed = aic.timed && std::isfinite(aic.us) && aic.us > 0;
+    const auto av = field(aiv.us, aiv_timed);
+    const auto speed = field(aiv_timed ? aiv_baseline / aiv.us : 0, aiv_timed && aiv_baseline > 0);
+    const auto aic_speed = field(aic_timed ? aic_baseline / aic.us : 0, aic_timed && aic_baseline > 0);
+    const auto abw = field(aiv_timed ? aiv_bytes / aiv.us / 1000 : 0, aiv_timed);
+    const auto cr = field(aic.us, aic_timed);
+    const auto cn = field(aic.us / 16.0, aic_timed);
+    const auto cbw = field(aic_timed ? aic_bytes * 16 / aic.us / 1000 : 0, aic_timed);
     const auto tail = field(aiv.tail, aiv.present, 0);
     const auto exported = field(aiv.export_region, aiv.present, 0);
-    std::printf("| %11d | %10d | %6d | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s |\n",
+    std::printf("| %11d | %10d | %6d | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %11s |\n",
                 n, k, grid, av.c_str(), speed.c_str(), abw.c_str(), cr.c_str(), cn.c_str(),
-                cbw.c_str(), tail.c_str(), exported.c_str());
+                cbw.c_str(), tail.c_str(), exported.c_str(), aic_speed.c_str());
     if (csv.is_open()) {
         csv << n << ',' << k << ',' << grid << ',' << av << ',' << speed << ',' << abw << ','
             << cr << ',' << cn << ',' << cbw << ','
-            << field(aic.timed ? aic_bytes / aic.us / 1000 : 0, aic.timed) << ','
+            << field(aic_timed ? aic_bytes / aic.us / 1000 : 0, aic_timed) << ','
             << tail << ',' << exported << ','
-            << aiv.launches << ',' << aic.launches << '\n';
+            << aiv.launches << ',' << aic.launches << ',' << aic_speed << '\n';
         csv.flush();
         require(static_cast<bool>(csv), "CSV write failed");
     }
@@ -303,21 +311,22 @@ int main(int argc, char** argv)
         if (!o.csv_out.empty()) {
             csv.open(o.csv_out, std::ios::out | std::ios::trunc);
             require(csv.is_open(), "cannot open --csv-out path");
-            csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,export_ticks,aiv_launches,aic_launches\n";
+            csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,export_ticks,aiv_launches,aic_launches,aic_speedup\n";
         }
         if (o.single) std::puts("[PROFILING MODE] Single launch mode active for msprof op.");
         std::puts("AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.");
         std::puts("AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.");
         if (o.single) std::puts("Single samples replace p50; tail/export show maxima. No implicit K=1 launch.");
+        std::puts("Each implementation uses its own K=1 baseline. Validation runs once after sampling; tail/export describe the final launch.");
         std::printf("impl=%s requests=%d heads=%d AIV_rows=%d AIC_rows=16 page_tokens=%d warmup=%d iters=%d\n",
                     o.impl.c_str(), o.requests, o.heads, o.rows, o.page_tokens, o.warmup, o.iters);
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
-        std::printf("| %11s | %10s | %6s | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s |\n",
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+-------------+");
+        std::printf("| %11s | %10s | %6s | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %11s |\n",
                     "Context (N)", "Splits (K)", "Grid", o.single ? "AIV (us)" : "AIV p50(us)",
                     "AIV Speedup", "AIV KV GB/s", "AIC Batch Raw(us)",
                     o.single ? "AIC Model(us/req)" : "AIC Model p50(us/req)", "AIC Model GB/s",
-                    "Tail (ticks)", o.single ? "Export (ticks)" : "Export p50(ticks)");
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
+                    "Tail (ticks)", o.single ? "Export (ticks)" : "Export p50(ticks)", "AIC Speedup");
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+-------------+");
         tq_npu::Session session;
         Events events;
         struct Comparison { int n, k; double aiv, aic; };
@@ -328,10 +337,10 @@ int main(int argc, char** argv)
             if (o.impl != "aic") av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens, o.seq_len));
             if (o.impl != "aiv") ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens, o.seq_len));
             std::vector<int> sweep;
-            if (!o.single && av) sweep.push_back(1);
+            if (!o.single) sweep.push_back(1);
             for (int k : o.splits)
                 if (std::find(sweep.begin(), sweep.end(), k) == sweep.end()) sweep.push_back(k);
-            double baseline = 0;
+            double aiv_baseline = 0, aic_baseline = 0;
             for (int k : sweep) {
                 Measurement aiv, aic;
                 double aiv_bytes = 0, aic_bytes = 0;
@@ -339,7 +348,7 @@ int main(int argc, char** argv)
                     Device d(*av, k);
                     aiv = measure(d, o, k, session.stream, events);
                     aiv_launches += aiv.launches;
-                    if (k == 1 && aiv.timed) baseline = aiv.us;
+                    if (k == 1 && aiv.timed) aiv_baseline = aiv.us;
                     aiv_bytes = static_cast<double>(av->key.size() + av->value.size() + av->scales.size() * 4);
                 }
                 if (ac) {
@@ -347,14 +356,16 @@ int main(int argc, char** argv)
                     AicDevice d(*ac, k, o.page_begin, pages);
                     aic = measure(d, o, k, session.stream, events);
                     aic_launches += aic.launches;
+                    if (k == 1 && aic.timed) aic_baseline = aic.us;
                     aic_bytes = static_cast<double>(ac->key.size() + ac->value.size() + ac->scales.size() * 4) * pages / ac->pages;
                 }
-                row(n, k, o.requests * o.heads * k, aiv, aic, baseline, aiv_bytes, aic_bytes, csv);
+                row(n, k, o.requests * o.heads * k, aiv, aic, aiv_baseline, aic_baseline,
+                    aiv_bytes, aic_bytes, csv);
                 if (aiv.timed && aic.timed)
                     comparisons.push_back({n, k, aiv.us, aic.us / 16});
             }
         }
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+");
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+-------------+");
         for (const auto& c : comparisons)
             std::printf("Modeled comparison N=%d K=%d: AIC %.3f us/row vs AIV %.3f us/decode (%s).\n",
                         c.n, c.k, c.aic, c.aiv, c.aic < c.aiv ? "AIC amortized model lower" : "AIV lower");

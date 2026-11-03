@@ -1,0 +1,26 @@
+"core","pipe","events","first_ts_ns","last_end_ns"
+"core0.cubecore0","CUBE",72,2397,3733
+"core0.cubecore0","FIXP",4,2843,3763
+"core0.cubecore0","FLOWCTRL",2,3219,3774
+"core0.cubecore0","MTE1",27,427,3663
+"core0.cubecore0","MTE2",37,427,3591
+"core0.cubecore0","SCALAR",355,399,3933
+"core0.veccore0","FLOWCTRL",5,769,15468
+"core0.veccore0","MTE2",4,684,1563
+"core0.veccore0","MTE3",4,683,15305
+"core0.veccore0","PUSHQ",444,664,14817
+"core0.veccore0","RVECEX",6180,1195,14806
+"core0.veccore0","RVECLD",7370,1234,14813
+"core0.veccore0","RVECST",6016,1198,14814
+"core0.veccore0","RVECSU",325,1234,14800
+"core0.veccore0","SCALAR",3269,387,15468
+"core0.veccore1","FLOWCTRL",4,1753,4073
+"core0.veccore1","MTE2",2,666,1497
+"core0.veccore1","MTE3",17,666,1745
+"core0.veccore1","PUSHQ",4,639,1550
+"core0.veccore1","RVECEX",64,1513,1537
+"core0.veccore1","RVECLD",33,1512,1546
+"core0.veccore1","RVECST",33,1519,1547
+"core0.veccore1","RVECSU",1,1529,1530
+"core0.veccore1","SCALAR",320,392,4073
+PASS: Perfetto imported native CAModel timestamps, cores and pipe lanes.

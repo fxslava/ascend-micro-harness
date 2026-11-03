@@ -328,8 +328,16 @@ struct Session {
     Session()
     {
         check(aclInit(nullptr), "aclInit");
-        check(aclrtSetDevice(0), "aclrtSetDevice");
-        check(aclrtCreateStream(&stream), "aclrtCreateStream");
+        bool device_set = false;
+        try {
+            check(aclrtSetDevice(0), "aclrtSetDevice");
+            device_set = true;
+            check(aclrtCreateStream(&stream), "aclrtCreateStream");
+        } catch (...) {
+            if (device_set) aclrtResetDevice(0);
+            aclFinalize();
+            throw;
+        }
     }
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
@@ -348,7 +356,11 @@ struct Buffer {
     {
         require(n != 0 && n % 32 == 0, "NPU buffer size must be 32-byte aligned");
         check(aclrtMalloc(&ptr, bytes, ACL_MEM_MALLOC_NORMAL_ONLY), "aclrtMalloc");
-        require(reinterpret_cast<std::uintptr_t>(ptr) % 32 == 0, "NPU allocation is unaligned");
+        if (reinterpret_cast<std::uintptr_t>(ptr) % 32 != 0) {
+            aclrtFree(ptr);
+            ptr = nullptr;
+            throw std::runtime_error("NPU allocation is unaligned");
+        }
     }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;

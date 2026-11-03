@@ -1,0 +1,3 @@
+|         128 |          2 |      2 |           NA |          NA |          NA |           100.000 |                  6.250 |        160.000 |           NA |               NA |       2.000 |
+|         128 |          2 |      2 |           NA |          NA |          NA |                NA |                     NA |             NA |           NA |               NA |          NA |
+PASS: validation ordering/count, synchronized single-shot, zero timing, AIC baseline, context buffer lifetime, constructor cleanup.
