@@ -36,6 +36,46 @@ inline float TailCanary() { return FloatFromBits(0x7FC0BEEFu); }
 //   kNaN    the quiet NaN 0x7FC0BEEF, the loud canary.
 enum class TailFill { kZero, kDirty, kNaN };
 
+// How a request's logical pages map onto its distinct physical pages.
+//
+//   kReverse    logical page p lands at physical pages-1-p. The original and
+//               the default. Already non-identity, which is what catches a
+//               kernel that ignores the block table -- but MONOTONE, so a
+//               kernel that walks its pages backwards, or negates its page
+//               index somewhere, reads a correct-looking sequence out of it.
+//   kScattered  monotone in neither direction, so the only way to read it
+//               correctly is to consult the table per page. This is the
+//               mapping the multi-page L1 reuse rungs want: the hazard they
+//               cover is a kernel confusing one page's staging buffer for
+//               another's, and a scattered table makes that confusion land on
+//               unrelated data rather than on the neighbouring page.
+enum class PageMap { kReverse, kScattered };
+
+// The permutation of [0, pages) for one request, as a plain vector so the
+// caller can assert its shape. Deterministic across runs and platforms: the
+// point is a mapping a reader cannot predict from the page index, not
+// randomness, and a fixture whose data placement moved between runs would make
+// a failure unreproducible.
+inline std::vector<int> PagePermutation(PageMap map, int pages, int request)
+{
+    std::vector<int> order(static_cast<std::size_t>(pages > 0 ? pages : 0));
+    for (int page = 0; page < pages; ++page)
+        order[static_cast<std::size_t>(page)] = pages - 1 - page;
+    if (map == PageMap::kReverse) return order;
+    // Fisher-Yates over a fixed LCG, seeded by the request so two requests do
+    // not share a mapping.
+    std::uint32_t state = 0x9E3779B9u ^
+                          (static_cast<std::uint32_t>(request) * 0x85EBCA6Bu + 1u);
+    for (int i = pages - 1; i > 0; --i) {
+        state = state * 1664525u + 1013904223u;
+        const int j = static_cast<int>((state >> 8) %
+                                       static_cast<std::uint32_t>(i + 1));
+        std::swap(order[static_cast<std::size_t>(i)],
+                  order[static_cast<std::size_t>(j)]);
+    }
+    return order;
+}
+
 // The FP32 scale planes. Cycles large positive, large negative, a very large
 // value, and the two bit patterns -- which as floats are about -2.9e-16 and
 // +1.5e16, so the cycle spans sixteen orders of magnitude in both directions.
@@ -82,6 +122,7 @@ struct Fixture {
     // in generative decoding is almost all of them.
     int tokens, seq_len, pages, requests, heads, rows, page_tokens;
     TailFill tail_fill;
+    PageMap page_map;
     std::vector<std::uint16_t> q;
     std::vector<std::uint8_t> key, value;
     std::vector<float> scales, gate, signs;
@@ -97,14 +138,19 @@ struct Fixture {
     // An ALIGNED fixture has no dead slot, so `fill` cannot affect it at all.
     // That is what makes changing the default safe for every caller that does
     // not pass `live`.
+    //
+    // `map` is last for the same reason `live` and `fill` are where they are:
+    // every caller from before it existed keeps the reverse permutation and so
+    // keeps a byte-identical fixture.
     Fixture(int n, int batch, int head_count = kHeads, int row_count = kRows,
             int page_size = kPageTokens, int live = -1,
-            TailFill fill = TailFill::kDirty)
+            TailFill fill = TailFill::kDirty,
+            PageMap map = PageMap::kReverse)
         : tokens(((n + page_size - 1) / page_size) * page_size),
           seq_len(live < 0 ? n : live),
           pages((n + page_size - 1) / page_size), requests(batch),
           heads(head_count), rows(row_count), page_tokens(page_size),
-          tail_fill(fill),
+          tail_fill(fill), page_map(map),
           q(batch * heads * rows * kChannels),
           key(static_cast<std::size_t>(batch) * pages * heads * page_tokens * 128),
           value(key.size()), scales(static_cast<std::size_t>(batch) * pages *
@@ -114,9 +160,17 @@ struct Fixture {
         for (int c = 0; c < kChannels; ++c)
             signs[c] = static_cast<float>(single_token_decode::PiSign(c));
         for (int request = 0; request < batch; ++request) {
-            // Reverse permutation over this request's distinct physical pages.
+            // A permutation over this request's distinct physical pages. The
+            // table entry and the data offsets below both come from
+            // `physical`, so any permutation is self-consistent: it moves
+            // WHERE a logical token is stored without changing WHAT it holds,
+            // because the content is keyed by `global_strip`, which is derived
+            // from the LOGICAL page. That is what makes the oracle's output
+            // independent of the mapping -- and a kernel that ignores the
+            // table read a different logical token.
+            const std::vector<int> order = PagePermutation(map, pages, request);
             for (int page = 0; page < pages; ++page) {
-                const int physical = request * pages + pages - 1 - page;
+                const int physical = request * pages + order[static_cast<std::size_t>(page)];
                 table[request * pages + page] = physical;
                 for (int head = 0; head < heads; ++head) {
                     for (int strip = 0; strip < page_tokens / 16; ++strip) {

@@ -20,11 +20,46 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
 
 namespace tq_splitk_rig {
+
+// One ULP of `value`, and the distance from `got` to `ref` measured in them.
+// Same convention as tests/camodel/test_camodel_fused_attention.cpp, so a
+// budget quoted in one place means the same thing in the other: the spacing is
+// taken at the REFERENCE, which is what makes a stray canary word in a zero
+// channel read as an enormous ULP count rather than as a pass.
+inline float UlpOf(float value)
+{
+    const float magnitude = std::abs(value);
+    if (magnitude == 0.0f) return std::nextafter(0.0f, 1.0f);
+    return std::nextafter(magnitude, std::numeric_limits<float>::infinity()) - magnitude;
+}
+
+inline double UlpDistance(float got, float ref)
+{
+    if (got == ref) return 0.0;
+    if (!std::isfinite(got) || !std::isfinite(ref))
+        return std::numeric_limits<double>::infinity();
+    return std::abs(static_cast<double>(got) - static_cast<double>(ref)) /
+           static_cast<double>(UlpOf(ref));
+}
+
+// The float the 0xAA canary fill spells, so "never written" stays a separate
+// diagnosis from "written wrong". -3.0316488e-13: finite, so std::isfinite
+// does not catch it, and small, so neither does an additive tolerance floor.
+inline float CanaryFloat()
+{
+    std::uint32_t raw = 0;
+    for (int byte = 0; byte < 4; ++byte)
+        raw |= static_cast<std::uint32_t>(tq_npu::kCanaryByte) << (8 * byte);
+    float out = 0;
+    std::memcpy(&out, &raw, sizeof out);
+    return out;
+}
 
 using tq_npu::Buffer;
 using tq_npu::check;
@@ -295,8 +330,49 @@ struct AicRig {
         int m_over = 0, l_over = 0;
         double acc_signed_sum = 0, acc_abs_sum = 0;
         int acc_checked = 0;
+        // The same deviations in ULP, which is the reading a relative bound
+        // cannot give near zero. `state_ulp` is the worst over m and l
+        // together, because they share one budget.
+        double state_ulp = 0, acc_ulp = 0;
+        int state_ulp_row = 0, acc_ulp_row = 0, acc_ulp_channel = 0;
+        double acc_ulp_got = 0, acc_ulp_ref = 0;
+        const char* state_ulp_which = "-";
+        // `acc_ulp` above is the deviation in ULP OF THE CHANNEL's own value,
+        // which for an accumulator is a magnitude artifact rather than an
+        // error measure: a row of 256 channels is a sum with cancellation, so
+        // whichever channel lands nearest zero has the finest ULP and so the
+        // largest ULP distance, for the same absolute deviation. Measured on
+        // CAModel (reports/decode_splitk_aic_npu_multipage.md section 5) the
+        // absolute deviations stayed flat at 4.5e-08 .. 1.8e-07 across 4, 8
+        // and 32 strips while this number went 48 -> 98 -> 247, purely because
+        // the unluckiest of 4096 channels got smaller. It is unbounded for a
+        // bit-correct kernel, so it is REPORTED and not capped.
+        //
+        // `acc_scaled_ulp` takes the spacing at the row's accumulation scale
+        // (max |ref| over the row) instead, which is the magnitude the
+        // arithmetic actually worked at. That one is bounded by the summation
+        // error, and is what a budget can be held against.
+        double acc_scaled_ulp = 0;
+        int acc_scaled_ulp_row = 0, acc_scaled_ulp_channel = 0;
+        double acc_scaled_ulp_got = 0, acc_scaled_ulp_ref = 0;
+        double acc_scaled_ulp_scale = 0;
+        // The smallest |ref| any checked channel had, which is what makes the
+        // raw ULP number as large as it is.
+        double acc_ref_min = 0;
+        // Words still holding the 0xAA fill in a partition a worker was
+        // supposed to write, and nonfinite words anywhere in one.
+        int canary_words = 0, nonfinite_words = 0;
     };
     Margins margins;
+
+    // Opt-in ULP budgets. Zero means "report, do not enforce", which is what
+    // the page-count ladder and the benchmark want -- their margin fractions
+    // are quoted against the relative bounds, and holding them to a ULP cap
+    // they were never written for would be a change of gate, not an addition.
+    // A rung that sets these is held to them.
+    // `acc_ulp_cap` caps the raw per-channel number; see Margins for why no
+    // rung sets it. `acc_scaled_ulp_cap` caps the scale-referenced one.
+    double state_ulp_cap = 0, acc_ulp_cap = 0, acc_scaled_ulp_cap = 0;
 
     AivRig::Census Validate(int)
     {
@@ -314,6 +390,26 @@ struct AicRig {
                 const auto acc_base = item * splitk_decode_test::kAicAccFloats + row * kChannels;
                 const float m = w[record], l = w[record + contract::kStateLanes];
                 require(std::isfinite(m) && std::isfinite(l), "nonfinite AIC partial state");
+                // The whole record, not just m and l: a worker that wrote its
+                // state and skipped part of its accumulator leaves the fill
+                // behind exactly there.
+                for (unsigned lane = 0; lane < contract::kRecordFloats; ++lane) {
+                    const float word = w[record + lane];
+                    margins.canary_words += word == CanaryFloat();
+                    margins.nonfinite_words += !std::isfinite(word);
+                }
+                const double m_ulp = UlpDistance(m, static_cast<float>(ref.m[row]));
+                if (m_ulp > margins.state_ulp) {
+                    margins.state_ulp = m_ulp;
+                    margins.state_ulp_row = row;
+                    margins.state_ulp_which = "m";
+                }
+                const double l_ulp = UlpDistance(l, static_cast<float>(ref.l[row]));
+                if (l_ulp > margins.state_ulp) {
+                    margins.state_ulp = l_ulp;
+                    margins.state_ulp_row = row;
+                    margins.state_ulp_which = "l";
+                }
                 const double m_tol = 2e-6 * std::max(1.0, std::abs(ref.m[row]));
                 const double l_tol = 1e-4 * std::max(1.0, ref.l[row]);
                 margins.m = std::max(margins.m, std::abs(m - ref.m[row]) / m_tol);
@@ -329,6 +425,8 @@ struct AicRig {
                 for (int c = 0; c < kChannels; ++c)
                     scale = std::max(scale, std::abs(ref.acc[row * kChannels + c]));
                 const double acc_tol = 2e-4 * scale + 1e-5 * ref.l[row] + 1e-6;
+                // Spacing at the row's accumulation scale, for acc_scaled_ulp.
+                const double scale_ulp = UlpOf(static_cast<float>(scale));
                 int over_in_row = 0;
                 for (int c = 0; c < kChannels; ++c) {
                     const float got = w[acc_at + c];
@@ -347,6 +445,32 @@ struct AicRig {
                     margins.acc_checked++;
                     margins.acc_signed_sum += got - ref.acc[row * kChannels + c];
                     margins.acc_abs_sum += deviation;
+                    const double ulps =
+                        UlpDistance(got, static_cast<float>(ref.acc[row * kChannels + c]));
+                    if (ulps > margins.acc_ulp) {
+                        margins.acc_ulp = ulps;
+                        margins.acc_ulp_row = row;
+                        margins.acc_ulp_channel = c;
+                        margins.acc_ulp_got = got;
+                        margins.acc_ulp_ref = ref.acc[row * kChannels + c];
+                    }
+                    const double ref_abs = std::abs(ref.acc[row * kChannels + c]);
+                    if (margins.acc_checked == 1 || ref_abs < margins.acc_ref_min)
+                        margins.acc_ref_min = ref_abs;
+                    const double scaled_ulps =
+                        scale_ulp > 0 && std::isfinite(got) ? deviation / scale_ulp
+                                                            : 0.0;
+                    if (!std::isfinite(got) || scaled_ulps > margins.acc_scaled_ulp) {
+                        margins.acc_scaled_ulp =
+                            std::isfinite(got)
+                                ? scaled_ulps
+                                : std::numeric_limits<double>::infinity();
+                        margins.acc_scaled_ulp_row = row;
+                        margins.acc_scaled_ulp_channel = c;
+                        margins.acc_scaled_ulp_got = got;
+                        margins.acc_scaled_ulp_ref = ref.acc[row * kChannels + c];
+                        margins.acc_scaled_ulp_scale = scale;
+                    }
                     if (!std::isfinite(got) || deviation > acc_tol) {
                         if (margins.acc_over < 8)
                             std::fprintf(stderr, "AIC partial mismatch item=%zu row=%d c=%d "
@@ -381,6 +505,53 @@ struct AicRig {
                     margins.l_over, margins.state_torn, margins.qrot_wrong,
                     margins.acc_checked ? margins.acc_signed_sum / margins.acc_checked : 0.0,
                     margins.acc_checked ? margins.acc_abs_sum / margins.acc_checked : 0.0);
+        std::printf("AIC partial ULP: worst_state_ulp=%.2f (%s, row %d) "
+                    "worst_acc_ulp=%.2f (row %d, c %d, got=%.9g ref=%.9g); "
+                    "canary words %d, nonfinite words %d; budgets %s\n",
+                    margins.state_ulp, margins.state_ulp_which, margins.state_ulp_row,
+                    margins.acc_ulp, margins.acc_ulp_row, margins.acc_ulp_channel,
+                    margins.acc_ulp_got, margins.acc_ulp_ref,
+                    margins.canary_words, margins.nonfinite_words,
+                    (state_ulp_cap > 0 || acc_ulp_cap > 0 ||
+                     acc_scaled_ulp_cap > 0) ? "enforced" : "reported only");
+        // The scale-referenced number, with the two magnitudes that explain
+        // the raw one: the row scale the budget is taken at, and the smallest
+        // |ref| in the launch, which is what inflates the raw ULP.
+        std::printf("AIC partial scaled ULP: worst_acc_scaled_ulp=%.2f of %.0f "
+                    "(row %d, c %d, got=%.9g ref=%.9g, row scale=%.9g); "
+                    "min |ref| over %d channels = %.9g\n",
+                    margins.acc_scaled_ulp, acc_scaled_ulp_cap,
+                    margins.acc_scaled_ulp_row, margins.acc_scaled_ulp_channel,
+                    margins.acc_scaled_ulp_got, margins.acc_scaled_ulp_ref,
+                    margins.acc_scaled_ulp_scale, margins.acc_checked,
+                    margins.acc_ref_min);
+        require(margins.canary_words == 0,
+                "a published partition still holds the 0xAA canary fill: a worker "
+                "left part of its record unwritten");
+        require(margins.nonfinite_words == 0,
+                "nonfinite word in a published partition");
+        if (state_ulp_cap > 0 && margins.state_ulp > state_ulp_cap) {
+            std::fprintf(stderr, "worst_state_ulp %.2f exceeds the %.0f ULP budget "
+                         "(%s, row %d)\n", margins.state_ulp, state_ulp_cap,
+                         margins.state_ulp_which, margins.state_ulp_row);
+            throw std::runtime_error("AIC partial state outside its ULP budget");
+        }
+        if (acc_ulp_cap > 0 && margins.acc_ulp > acc_ulp_cap) {
+            std::fprintf(stderr, "worst_acc_ulp %.2f exceeds the %.0f ULP budget "
+                         "(row %d, c %d, got=%.9g ref=%.9g)\n", margins.acc_ulp,
+                         acc_ulp_cap, margins.acc_ulp_row, margins.acc_ulp_channel,
+                         margins.acc_ulp_got, margins.acc_ulp_ref);
+            throw std::runtime_error("AIC accumulator outside its ULP budget");
+        }
+        if (acc_scaled_ulp_cap > 0 && margins.acc_scaled_ulp > acc_scaled_ulp_cap) {
+            std::fprintf(stderr, "worst_acc_scaled_ulp %.2f exceeds the %.0f ULP "
+                         "budget (row %d, c %d, got=%.9g ref=%.9g, row scale=%.9g)\n",
+                         margins.acc_scaled_ulp, acc_scaled_ulp_cap,
+                         margins.acc_scaled_ulp_row, margins.acc_scaled_ulp_channel,
+                         margins.acc_scaled_ulp_got, margins.acc_scaled_ulp_ref,
+                         margins.acc_scaled_ulp_scale);
+            throw std::runtime_error("AIC accumulator outside its scaled ULP budget");
+        }
         require(margins.qrot_wrong == 0, "AIC query rotation differs from BF16 reference");
         require(margins.state_torn == 0, "AIC replicated state torn");
         require(margins.m_over == 0, "AIC partial maximum differs from CPU reference");
