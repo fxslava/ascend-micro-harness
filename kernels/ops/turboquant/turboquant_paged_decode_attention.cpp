@@ -181,9 +181,13 @@ constexpr std::uint32_t kUbLaneIndex    = NextSlot(kUbRotated,      kTokens * kH
 constexpr std::uint32_t kUbMaskedFill   = NextSlot(kUbLaneIndex,    kReadPadBytes);
 constexpr std::uint32_t kUbZeroFill     = NextSlot(kUbMaskedFill,   kReadPadBytes);
 constexpr std::uint32_t kUbTailSel      = NextSlot(kUbZeroFill,     kReadPadBytes);
-constexpr std::uint32_t kArenaEnd       = kUbTailSel + kBlock;
+// The value contraction's DataBlock partials: two per channel. Appended at the
+// tail so that no existing operand's offset moves.
+constexpr std::uint32_t kPairPartials   = 2u * kHeadSize;
+constexpr std::uint32_t kUbPairPartials = NextSlot(kUbTailSel,     kReadPadBytes);
+constexpr std::uint32_t kArenaEnd       = kUbPairPartials + kPairPartials * kF32;
 
-static_assert(kUbScoreRing     % kBlock == 0 && kUbPackedKRing   % kBlock == 0 && kUbPackedVRing   % kBlock == 0 && kUbKeyRing       % kBlock == 0 && kUbValueRing     % kBlock == 0 && kUbScaleRing     % kBlock == 0 && kUbDqSigned     % kBlock == 0 && kUbMPrev        % kBlock == 0 && kUbLPrev        % kBlock == 0 && kUbAcc          % kBlock == 0 && kUbWeighted     % kBlock == 0 && kUbWeightedSum  % kBlock == 0 && kUbAccScaled    % kBlock == 0 && kUbScoreArchive % kBlock == 0 && kUbEgressA      % kBlock == 0 && kUbEgressB      % kBlock == 0 && kUbPermuted     % kBlock == 0 && kUbSignedTmp    % kBlock == 0 && kUbDenominator  % kBlock == 0 && kUbGateRow      % kBlock == 0 && kUbPiSign       % kBlock == 0 && kUbGatherOffsets% kBlock == 0 && kUbGatherSigns  % kBlock == 0 && kUbContext      % kBlock == 0 && kUbRotated      % kBlock == 0, "every UB operand base must be 32-byte aligned");
+static_assert(kUbScoreRing     % kBlock == 0 && kUbPackedKRing   % kBlock == 0 && kUbPackedVRing   % kBlock == 0 && kUbKeyRing       % kBlock == 0 && kUbValueRing     % kBlock == 0 && kUbScaleRing     % kBlock == 0 && kUbDqSigned     % kBlock == 0 && kUbMPrev        % kBlock == 0 && kUbLPrev        % kBlock == 0 && kUbAcc          % kBlock == 0 && kUbWeighted     % kBlock == 0 && kUbWeightedSum  % kBlock == 0 && kUbAccScaled    % kBlock == 0 && kUbScoreArchive % kBlock == 0 && kUbEgressA      % kBlock == 0 && kUbEgressB      % kBlock == 0 && kUbPermuted     % kBlock == 0 && kUbSignedTmp    % kBlock == 0 && kUbDenominator  % kBlock == 0 && kUbGateRow      % kBlock == 0 && kUbPiSign       % kBlock == 0 && kUbGatherOffsets% kBlock == 0 && kUbGatherSigns  % kBlock == 0 && kUbContext      % kBlock == 0 && kUbRotated      % kBlock == 0 && kUbPairPartials % kBlock == 0, "every UB operand base must be 32-byte aligned");
 static_assert(kRingScore       % kBlock == 0 && kRingPacked      % kBlock == 0 && kRingKey         % kBlock == 0 && kRingValue       % kBlock == 0 && kRingScale       % kBlock == 0, "every ring slot stride must be a whole number of DataBlocks");
 static_assert(kRingScore       % 256u   != 0u && kRingPacked     % 256u   != 0u && kRingKey        % 256u   != 0u && kRingValue      % 256u   != 0u && kRingScale      % 256u   != 0u, "a 256-byte ring stride puts every slot on one bank phase");
 static_assert(kArenaEnd + kReadPadBytes <= kUbWindow, "UB arena leaves no VECTOR_REG_WIDTH read pad behind the state");
@@ -561,6 +565,7 @@ __aicore__ inline void FillRecurEngine(ascend_micro::NativeDecodeRecurrenceEngin
     recur_engine.alpha_bc     = {kUb, kUbAlphaBc,                         kBcLanes};
     recur_engine.weighted     = {kUb, kUbWeighted,                        kPanel};
     recur_engine.weighted_sum = {kUb, kUbWeightedSum,                     kHeadSize};
+    recur_engine.pair_partials= {kUb, kUbPairPartials,                    kPairPartials};
     recur_engine.acc_scaled   = {kUb, kUbAccScaled,                       kHeadSize};
     recur_engine.lane_index   = {kUb, kUbLaneIndex,                       kTokens};
     recur_engine.masked_fill  = {kUb, kUbMaskedFill,                      kTokens};

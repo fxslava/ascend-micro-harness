@@ -203,7 +203,11 @@ constexpr std::uint32_t kUbTailSel = NextSlot(kUbZeroFill, kVecReg);
 // ---- the launch probe ----
 constexpr std::uint32_t kProbeLanes = 32;
 constexpr std::uint32_t kUbProbe = NextSlot(kUbTailSel, kBlock);
-constexpr std::uint32_t kArenaEnd = kUbProbe + kProbeLanes * 4u;
+// The value contraction's DataBlock partials: two per channel. Appended at the
+// tail so that no existing operand's offset moves.
+constexpr std::uint32_t kPairPartials = 2u * kHeadSize;
+constexpr std::uint32_t kUbPairPartials = NextSlot(kUbProbe, kProbeLanes * 4u);
+constexpr std::uint32_t kArenaEnd = kUbPairPartials + kPairPartials * 4u;
 
 static_assert(kUbPackedKey[1] % kBlock == 0u && kUbPackedVal[1] % kBlock == 0u &&
                   kUbNib16 % kBlock == 0u && kUbKeyPage[1] % kBlock == 0u &&
@@ -572,6 +576,7 @@ __aicore__ inline void ProcessItem(const AscendC::GlobalTensor<bfloat16_t>& q_ro
     rec.alpha_bc = View<float>(kUbAlphaBc, kVecLanes);
     rec.weighted = View<float>(kUbWeighted, kPanelElems);
     rec.weighted_sum = View<float>(kUbWeightedSum, kHeadSize);
+    rec.pair_partials = View<float>(kUbPairPartials, kPairPartials);
     rec.acc_scaled = View<float>(kUbAccScaled, kHeadSize);
     rec.panel_base = kUbPanel[0];
     rec.m_base = kUbMPrev;

@@ -121,6 +121,9 @@ struct NativeDecodeRecurrenceEngine {
     AscendC::LocalTensor<float> alpha_bc;      // kDecodeBcLanes
     AscendC::LocalTensor<float> weighted;      // kDecodeChannels * kDecodeKeys
     AscendC::LocalTensor<float> weighted_sum;  // kDecodeChannels
+    // The contraction's intermediate: one partial per DataBlock of `weighted`,
+    // so two per channel. See contract_values.
+    AscendC::LocalTensor<float> pair_partials;  // 2 * kDecodeChannels
     AscendC::LocalTensor<float> acc_scaled;    // kDecodeChannels
 
     // ---- tail-mask scratch, for a partial strip --------------------------
@@ -384,16 +387,31 @@ struct NativeDecodeRecurrenceEngine {
                                                kDecodeVecLanes),
                      AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 0));
         AscendC::PipeBarrier<PIPE_V>();
-        // One FP32 result per channel, from 16 contiguous lanes. 256 repeats
-        // exceeds the repeatTime bound of 255, so this runs as two halves.
-        AscendC::ReduceRepeat<AscendC::ReduceType::SUM, float>(
-            weighted_sum, weighted, kKeyLanes,
-            static_cast<std::int32_t>(kDecodeReduceHalf), 1, 1, kKeyBlocks,
-            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-        AscendC::ReduceRepeat<AscendC::ReduceType::SUM, float>(
-            weighted_sum[kDecodeReduceHalf], weighted[kDecodeReduceHalf * kDecodeKeys],
-            kKeyLanes, static_cast<std::int32_t>(kDecodeReduceHalf), 1, 1, kKeyBlocks,
-            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        // One FP32 result per channel, from 16 contiguous lanes, as a
+        // two-stage DataBlock tree.
+        //
+        // The obvious form -- ReduceRepeat over 16 lanes, 256 times -- spends
+        // one cross-lane add per CHANNEL on a unit that reduces eight
+        // DataBlocks per instruction, so seven eighths of each one is idle. It
+        // measured as 256 RV_VCADD per query row, three PCs hit 16,384 times
+        // each at four strips, 49,152 of AIV0's 83,835 vector instructions.
+        //
+        // Stage 1: every DataBlock of `weighted` to one partial, eight blocks
+        // per iteration. `weighted` is channel-major with 16 lanes per channel
+        // = 2 DataBlocks, so this leaves pair_partials[2c] and [2c + 1] as the
+        // low and high halves of channel c, contiguous. 64 iterations.
+        AscendC::ReduceDataBlock<AscendC::ReduceType::SUM, float, float>(
+            pair_partials, weighted, kVecLanes,
+            static_cast<std::int32_t>(kDecodeChannels * kDecodeKeys /
+                                      kDecodeVecLanes),
+            1, 1, kDecodeVecLanes / kDecodeLanesPerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        // Stage 2: adjacent odd-even pairs, which is exactly
+        // pair_partials[2c] + pair_partials[2c + 1]. 8 iterations.
+        AscendC::ReducePairElem<AscendC::ReduceType::SUM, float, float>(
+            weighted_sum, pair_partials, kVecLanes,
+            static_cast<std::int32_t>(2u * kDecodeChannels / kDecodeVecLanes),
+            1, 1, kDecodeVecLanes / kDecodeLanesPerBlock);
         AscendC::Brcb(alpha_bc, alpha, 1, {1, 8});
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Mul(acc_scaled, acc_cur, alpha_bc, kVecLanes,
