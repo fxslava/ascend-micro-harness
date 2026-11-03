@@ -90,17 +90,22 @@ constexpr int kPageTokens = splitk_decode_test::kPageTokens;
 //        4                      48            1.78e-07         0.0577
 //        8                      98            4.54e-08         0.00624
 //       32                     247            1.15e-07         0.00397
+//       64                    1327            7.73e-08         0.000642
 //
 // The deviations do not grow. What grows is the ULP number, because the
 // unluckiest of 4096 channels keeps landing closer to zero -- a row is a sum
 // with cancellation, so some channel always nearly cancels, and there is no
 // lower bound on how nearly. That number is unbounded for a bit-correct
-// kernel, and at 32 strips it had already reached 247 of 256. So it is
-// reported (`AicRig::margins.acc_ulp`) and NOT capped.
+// kernel. At 32 strips it had already reached 247 of 256, and at 64 strips a
+// CORRECT kernel measured 1327 -- so a 256 per-channel cap would have failed
+// the largest rung by 5.2x. It is reported (`AicRig::margins.acc_ulp`) and
+// NOT capped.
 //
 // The 256 is held against `acc_scaled_ulp`, the same deviation over the
 // spacing at the ROW's accumulation scale -- the magnitude the arithmetic
-// actually worked at, which is what the summation error is bounded by.
+// actually worked at, which is what the summation error is bounded by. On the
+// same four rungs that reads 1.77, 2.67, 4.86 and 5.04, so the budget keeps
+// about fifty times headroom while the defect's own ~8600 still trips it.
 //
 // NOTE these are budgets for PHYSICAL HARDWARE, and no hardware run has
 // exercised them: there is no NPU on the host this was written on. If a device
@@ -352,27 +357,44 @@ int run(const Sections& sections)
                 sections.l1_reuse ? "yes" : "NO",
                 (sections.ladder && sections.tail && sections.l1_reuse)
                     ? "" : "  -- NARROWED, this is not the full gate");
-    std::printf("PASS AIC split-K decode validation: %d launches over page counts "
-                "1/3/4/5/7/8 x K=1/2/4/8, %d of them windowed, %d empty temporal "
-                "splits reaching the neutral element; M=%d rows, d=%d, %d requests "
-                "x %d heads, all against the FP64 partial oracle\n",
-                rungs, windowed, empty_splits, kAicRows,
-                splitk_decode_test::kChannels, kRequests, kHeads);
-    std::printf("PASS AIC multi-page L1 reuse regression: %d launches at "
-                "requests=1 heads=1 K=1 -- one core carrying every page -- over "
-                "block_size 128 and 16 at 4 and 8 carried pages, each through a "
-                "scattered block table; worst_state_ulp %.2f of a %.0f budget, "
-                "worst_acc_scaled_ulp %.2f of a %.0f budget, zero canary words "
-                "and zero nonfinite words in any published partition "
-                "(worst per-channel acc ULP %.2f, reported not capped)\n",
-                race_rungs, worst_state_ulp, kStateUlpBudget,
-                worst_acc_scaled_ulp, kAccScaledUlpBudget, worst_acc_ulp);
-    std::printf("PASS AIC split-K decode at unaligned context lengths: %d launches "
-                "over %zu rungs, %d of which end on a partial strip, and %d split "
-                "ranges with pages to walk but no live token in any of them -- "
-                "every strip skipped, every cross-core flag still exchanged, and "
-                "the exact neutral element published\n",
-                tail_rungs, tails.size(), partial_strips, dead_splits);
+    // A section that ran nothing says SKIPPED. Printing "PASS ... 0 launches"
+    // is exactly the silent coverage loss this ladder exists to prevent: a CI
+    // job that passed `--only` would otherwise read as a green full gate.
+    if (!sections.ladder) {
+        std::puts("SKIPPED AIC split-K decode validation: not selected, 0 launches");
+    } else {
+        std::printf("PASS AIC split-K decode validation: %d launches over page counts "
+                    "1/3/4/5/7/8 x K=1/2/4/8, %d of them windowed, %d empty temporal "
+                    "splits reaching the neutral element; M=%d rows, d=%d, %d requests "
+                    "x %d heads, all against the FP64 partial oracle\n",
+                    rungs, windowed, empty_splits, kAicRows,
+                    splitk_decode_test::kChannels, kRequests, kHeads);
+    }
+    if (!sections.l1_reuse) {
+        std::puts("SKIPPED AIC multi-page L1 reuse regression: not selected, "
+                  "0 launches");
+    } else {
+        std::printf("PASS AIC multi-page L1 reuse regression: %d launches at "
+                    "requests=1 heads=1 K=1 -- one core carrying every page -- over "
+                    "block_size 128 and 16 at 4 and 8 carried pages, each through a "
+                    "scattered block table; worst_state_ulp %.2f of a %.0f budget, "
+                    "worst_acc_scaled_ulp %.2f of a %.0f budget, zero canary words "
+                    "and zero nonfinite words in any published partition "
+                    "(worst per-channel acc ULP %.2f, reported not capped)\n",
+                    race_rungs, worst_state_ulp, kStateUlpBudget,
+                    worst_acc_scaled_ulp, kAccScaledUlpBudget, worst_acc_ulp);
+    }
+    if (!sections.tail) {
+        std::puts("SKIPPED AIC split-K decode at unaligned context lengths: "
+                  "not selected, 0 launches");
+    } else {
+        std::printf("PASS AIC split-K decode at unaligned context lengths: %d launches "
+                    "over %zu rungs, %d of which end on a partial strip, and %d split "
+                    "ranges with pages to walk but no live token in any of them -- "
+                    "every strip skipped, every cross-core flag still exchanged, and "
+                    "the exact neutral element published\n",
+                    tail_rungs, tails.size(), partial_strips, dead_splits);
+    }
     return 0;
 }
 

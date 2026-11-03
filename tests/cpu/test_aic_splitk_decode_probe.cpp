@@ -144,11 +144,12 @@ int main()
         //   block=128 pages=8     scale 3.03663   min 0.000642073  4096x
         //
         // Those amplifications are what the CAModel run actually produced as
-        // worst per-channel ULP (48, 98, 247 for the first three rungs, on
-        // absolute deviations that did NOT grow); the 0.00397417 channel above
-        // is the very one the device reported. The fourth rung amplifies 4096x,
-        // so a bit-correct kernel there lands near 1700 ULP -- which is why a
-        // per-channel budget of 256 could not be kept.
+        // worst per-channel ULP -- 48, 98, 247 and 1327 -- on absolute
+        // deviations that did NOT grow, and the min |acc| channel named on
+        // each line is the very one the device reported. The fourth rung's
+        // 1327 is why a per-channel budget of 256 could not be kept: it would
+        // have failed a CORRECT kernel by 5.2x. Scaled against the row's
+        // accumulation scale the same four rungs read 1.77, 2.67, 4.86, 5.04.
         //
         // The assertion is that the amplification stays LARGE. If a future
         // fixture change made these accumulators well conditioned, the raw

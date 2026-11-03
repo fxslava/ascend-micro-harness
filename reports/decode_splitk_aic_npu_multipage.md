@@ -99,14 +99,17 @@ value**. Running the rungs produced:
 | --- | ---: | ---: | ---: | ---: |
 | one strip per page, four carried | 4 | 48 | 1.78e-07 | 0.0577 |
 | one strip per page, eight carried | 8 | 98 | 4.54e-08 | 0.00624 |
-| full pages, four carried | 32 | **247** | 1.15e-07 | 0.00397 |
+| full pages, four carried | 32 | 247 | 1.15e-07 | 0.00397 |
+| full pages, eight carried | 64 | **1327** | 7.73e-08 | 0.000642 |
 
-The deviations do not grow — 1.78e-07, 4.54e-08, 1.15e-07, all around the
-4.35e-08…6.21e-08 the table above predicts. What grows is the ULP *number*,
+The deviations do not grow — 1.78e-07, 4.54e-08, 1.15e-07, 7.73e-08, all around
+the 4.35e-08…6.21e-08 the table above predicts. What grows is the ULP *number*,
 because the unluckiest of 4096 channels keeps landing closer to zero. A row is
 a 256-channel sum **with cancellation**, so some channel always nearly cancels,
 and nothing bounds how nearly. The metric was measuring channel magnitude, not
-kernel error, and at 32 strips it had already reached 247 of its 256 budget.
+kernel error: at 32 strips it had already reached 247 of its 256 budget, and at
+64 strips a **correct** kernel measured 1327, which would have failed that
+budget by 5.2x.
 
 The host oracle confirms this directly and without a device. For each rung,
 the row accumulation scale against the smallest \|acc\| any channel reaches,
@@ -119,14 +122,14 @@ deviation:
 | block=16 pages=4 | 1.1496 | 0.0586743 | 32x | 48 |
 | block=16 pages=8 | 1.20752 | 0.0286948 | 64x | 98 |
 | block=128 pages=4 | 1.03564 | 0.00397417 | 256x | 247 |
-| block=128 pages=8 | 3.03663 | 0.000642073 | **4096x** | **never run** |
+| block=128 pages=8 | 3.03663 | 0.000642073 | **4096x** | **1327** |
 
-The amplification column tracks the measured ULP, and the 0.00397417 channel in
-row three **is the very channel** the device named (`ref=-0.00397416547`). So
-the fourth rung, the one the timeout cut off, amplifies 4096x: a bit-correct
-kernel there lands near 1700 ULP and **would have failed the requested 256
-budget by about 7x.** The rung that never executed is the rung that would have
-exposed this.
+The amplification column tracks the measured ULP, and on each line the
+`min |acc|` channel the host oracle names **is the very channel** the device
+reported: `ref=-0.00397416547` for row three, `ref=0.000642073414` for row
+four. The host measurement was made before the fourth rung had ever executed
+and predicted it at 4096x; it then measured 1327, failing the requested 256
+budget by 5.2x **while computing correctly.**
 
 So the raw per-channel number is reported (`margins.acc_ulp`, printed on every
 launch) and **not capped** — it is unbounded above for a bit-correct kernel, so
@@ -137,7 +140,10 @@ what the summation error is bounded by.
 
 This keeps the gate's sensitivity to the defect intact. The defect's
 1.022830e-03 against a scale of order 1 is still about 8600 scaled ULP, so it
-trips a 256 budget by ~34x. What changed is only the false-failure mode.
+trips a 256 budget by ~34x. Measured, the four rungs read 1.77, 2.67, 4.86 and
+5.04 scaled ULP, so the budget holds about fifty times headroom over a correct
+kernel and still fires an order of magnitude below the defect. What changed is
+only the false-failure mode.
 
 That the amplification *stays* large is now itself a host assertion, so the
 rationale cannot go stale silently — see section 4.
@@ -173,8 +179,7 @@ decision, not a detail.
 | host probe `test_aic_splitk_decode_probe`, existing claims | **PASS** — unchanged by the fixture edit |
 | host probe, new page-map section | **PASS** — section 4 |
 | host probe, new ULP-amplification section | **PASS** — section 4 |
-| CAModel twin, `--only l1-reuse`, rungs 1–3 | **PASS** — section 5 |
-| CAModel twin, rung 4 (`block_size=128`, 8 pages) | **NOT RUN** — section 5 |
+| CAModel twin, `--only l1-reuse`, all four rungs | **PASS** — section 5 |
 | **the ladder on physical hardware** | **NOT RUN — no NPU on this host** |
 | full `test_npu_decode_splitk_aic` ladder on CAModel | **NOT RUN** — about ninety launches on the model; the `--only` selector exists because of that |
 
@@ -257,21 +262,58 @@ What this establishes, for the three rungs that ran:
 It did **not** establish the fourth rung, and it is the run that showed
 `worst_acc_ulp` to be the wrong thing to cap.
 
-### Run 2 — scale-referenced metric
+### Run 2 — scale-referenced metric, all four rungs
 
-Re-run after the 2b correction, to record `worst_acc_scaled_ulp` against its
-256 budget on the same rungs, with a 21600 s timeout so the fourth rung has
-room. **In flight when this report was written; its numbers are not in here.**
-Expected from the host measurement: scaled ULP of order 1, since the absolute
-deviations are ~1e-07 and `ulp(scale)` is 1.19e-07 at a scale of 1.
+Re-run after the 2b correction with a 21600 s timeout. Started 2026-11-03
+09:42:26, finished 11:52:43, 7816 s. **All four rungs completed**, and the
+exception dumps are again all zero-length.
 
-Until it lands, the accumulator claim for these rungs rests on the pre-existing
-relative bound (`acc over tolerance 0`, which did run and did pass, with
-`margins.acc` at 0.00011x–0.00025x of tolerance), not on the scaled ULP cap.
+```text
+AIC partial ULP: worst_state_ulp=1.00 (l, row 1) worst_acc_ulp=48.00 (row 15, c 4, got=-0.0577439666 ref=-0.0577441446); canary words 0, nonfinite words 0; budgets enforced
+AIC partial scaled ULP: worst_acc_scaled_ulp=1.77 of 256 (row 3, c 11, got=0.630742371 ref=0.63074216, row scale=1.14729651); min |ref| over 4096 channels = 0.0481908891
+  ok  L1 reuse: block_size=16  strips=1 pages=4 K=1 table=[1,0,3,2]           one strip per page, four carried
+AIC partial ULP: worst_state_ulp=2.00 (l, row 0) worst_acc_ulp=98.00 (row 8, c 8, got=-0.00624020398 ref=-0.0062402494); canary words 0, nonfinite words 0; budgets enforced
+AIC partial scaled ULP: worst_acc_scaled_ulp=2.67 of 256 (row 1, c 2, got=0.101167709 ref=0.101167868, row scale=0.808601838); min |ref| over 4096 channels = 0.0062402494
+  ok  L1 reuse: block_size=16  strips=1 pages=8 K=1 table=[3,5,2,7,1,0,4,6]   one strip per page, eight carried
+AIC partial ULP: worst_state_ulp=2.00 (l, row 6) worst_acc_ulp=247.00 (row 3, c 8, got=-0.00397405028 ref=-0.00397416547); canary words 0, nonfinite words 0; budgets enforced
+AIC partial scaled ULP: worst_acc_scaled_ulp=4.86 of 256 (row 8, c 10, got=-0.0119167864 ref=-0.0119166415, row scale=0.385875697); min |ref| over 4096 channels = 0.00397416547
+  ok  L1 reuse: block_size=128 strips=8 pages=4 K=1 table=[1,0,3,2]           full pages, four carried
+AIC partial ULP: worst_state_ulp=5.00 (l, row 7) worst_acc_ulp=1327.00 (row 6, c 7, got=0.00064215064 ref=0.000642073414); canary words 0, nonfinite words 0; budgets enforced
+AIC partial scaled ULP: worst_acc_scaled_ulp=5.04 of 256 (row 1, c 6, got=1.90900445 ref=1.90900505, row scale=1.90900505); min |ref| over 4096 channels = 0.000642073414
+  ok  L1 reuse: block_size=128 strips=8 pages=8 K=1 table=[3,5,2,7,1,0,4,6]   full pages, eight carried
+SECTIONS RUN: ladder=NO tail=NO l1-reuse=yes  -- NARROWED, this is not the full gate
+PASS AIC multi-page L1 reuse regression: 4 launches at requests=1 heads=1 K=1 -- one core carrying every page -- over block_size 128 and 16 at 4 and 8 carried pages, each through a scattered block table; worst_state_ulp 5.00 of a 64 budget, worst_acc_scaled_ulp 5.04 of a 256 budget, zero canary words and zero nonfinite words in any published partition (worst per-channel acc ULP 1327.00, reported not capped)
+```
+
+So, over all four rungs, on the model:
+
+| quantity | worst over the four rungs | budget |
+| --- | ---: | ---: |
+| `worst_state_ulp` | 5.00 | 64 |
+| `worst_acc_scaled_ulp` | 5.04 | 256 |
+| `worst_acc_ulp` (reported, uncapped) | 1327 | — |
+| canary words | 0 | 0 |
+| nonfinite words | 0 | 0 |
+| `acc over tolerance` | 0 of 4096 | 0 |
+| `m over` / `l over` / replicas torn / qrot wrong | 0 | 0 |
+
+Rung 4 is the confirmation that mattered: at 1327 per-channel ULP it would have
+failed the originally requested 256 cap, and at 5.04 scaled ULP it passes with
+fifty times headroom. Both numbers come from the same launch of the same
+correct kernel.
+
+### A wart this run exposed, now fixed
+
+The narrowed run printed `PASS AIC split-K decode validation: 0 launches …` and
+the same for the tail ladder — a PASS line over a section that did not run,
+which is the silent coverage loss gap 5 exists to prevent. A section that ran
+nothing now prints `SKIPPED … not selected, 0 launches` instead. The output
+above predates that fix, which is why those two PASS lines are not quoted.
 
 ### What no run here establishes
 
-Rung 4 has never executed on any leg, and nothing has executed on hardware.
+Nothing has executed on hardware. CAModel is a cycle-accurate model of a 950PR,
+not a 950PR.
 
 ## 6. Commands
 
@@ -352,19 +394,13 @@ bash scripts/run_splitk_workspace_build.sh
 * **The full ladder has never run on CAModel either**, on this or any earlier
   revision — about ninety launches on the model. `reports/decode_splitk_validation.md`
   records which rungs have been executed on which leg.
-* **Rung 4 of the new section (`block_size = 128`, 8 pages, 64 strips) has
-  never executed.** It is the largest rung, the one the timeout cut off twice,
-  and by the 2b measurement the one whose accumulator is worst conditioned
-  (4096x amplification). It is also the rung closest to the geometry the defect
-  was found at. It wants either a device or a patient CAModel run.
-* The `--only` selector narrows by section, not by rung, so re-running the
-  fourth rung means paying for the first three again. A `--only l1-reuse:N`
-  form, or ordering by descending cost, would make the expensive rung
-  reachable on its own.
-* The `--only` selector narrows a gate. It prints `SECTIONS RUN: ... NARROWED`
-  when it does, but nothing prevents a CI job from passing a narrowing flag and
-  reporting a pass. If this ladder is ever wired into CI, the job should assert
-  the unnarrowed form.
+* The `--only` selector narrows by section, not by rung, so re-running one rung
+  means paying for the others again — the full four-rung section is about
+  2 h 10 min on the model. A `--only l1-reuse:N` form would make the expensive
+  rung reachable on its own.
+* A narrowed run now prints `SKIPPED` rather than `PASS` for the sections it
+  did not run, but nothing yet *prevents* a CI job from narrowing. If this
+  ladder is wired into CI, the job should assert the unnarrowed form.
 * `ASCEND_MICRO_DECODE_SPLITK_SIM` is defined for both simulator twins by
   `cmake/SimTargets.cmake` and read by nothing. It predates `--only` and now has
   no job; worth removing or wiring up.
