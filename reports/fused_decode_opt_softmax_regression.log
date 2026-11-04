@@ -1,0 +1,2 @@
+PASS online softmax: 4 streaming tiles x 16 channels, bit-identical host recurrence, 64-byte canaries intact
+host probe: 88.573 us total (includes oracle/checks)

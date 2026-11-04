@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/mnt/c/Ascend/ascend-micro-harness/scripts/analyze_fused_decode_opt_trace.py", line 83, in <module>
+    print(json.dumps(audit(Path(sys.argv[1])), indent=2))
+  File "/mnt/c/Ascend/ascend-micro-harness/scripts/analyze_fused_decode_opt_trace.py", line 49, in audit
+    retired = places(completed, lambda r: (r['tick'], r['id']))
+  File "/mnt/c/Ascend/ascend-micro-harness/scripts/analyze_fused_decode_opt_trace.py", line 28, in places
+    if marking[key]: raise ValueError(f'double SET {key} at ID {row["id"]}')
+ValueError: double SET ('MTE1', 'CUBE', 0) at ID 18207

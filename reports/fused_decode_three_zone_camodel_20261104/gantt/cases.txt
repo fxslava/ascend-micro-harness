@@ -1,0 +1,6 @@
+PASS short-n3             tiles=3   ticks=32762    gantt: /home/dmin/work/three-zone-gantt-validate/short-n3/gantt.json (38311 spans, 3 active cores)
+PASS deep-noperiod-n4     tiles=4   ticks=41248    gantt: /home/dmin/work/three-zone-gantt-validate/deep-noperiod-n4/gantt.json (48130 spans, 3 active cores)
+PASS deep-exact-n9        tiles=9   ticks=71329    gantt: /home/dmin/work/three-zone-gantt-validate/deep-exact-n9/gantt.json (97260 spans, 3 active cores)
+PASS deep-ragged-n12      tiles=12  ticks=95671    gantt: /home/dmin/work/three-zone-gantt-validate/deep-ragged-n12/gantt.json (127017 spans, 3 active cores)
+PASS deep-twoperiod-n16   tiles=16  ticks=120461   gantt: /home/dmin/work/three-zone-gantt-validate/deep-twoperiod-n16/gantt.json (166351 spans, 3 active cores)
+native msprof capture: SKIPPED (set MSPROF_BENCH_ROOT to enable)

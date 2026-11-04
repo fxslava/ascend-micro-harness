@@ -123,6 +123,21 @@ AIV, and the two-tier verification methodology — are in
 [`MICROROUTINE_DESIGN_GUIDELINES.md`](MICROROUTINE_DESIGN_GUIDELINES.md).
 Read it before adding a routine.
 
+The imported 64-token KV4/FP8 modulo decode is a separate operator in
+[`kernels/ops/turboquant/turboquant_fused_decode_opt.cpp`](kernels/ops/turboquant/turboquant_fused_decode_opt.cpp).
+It reuses the signed dequant and online-softmax microroutines and adds a
+Cube-backed Vector recurrence leaf. Its cache format differs from the
+16-token BF16 decode. The standalone launch contract and supported geometry
+are in [`include/turboquant_fused_decode_opt.hpp`](include/turboquant_fused_decode_opt.hpp).
+Build both simulator and NPU libraries with
+`bash scripts/run_fused_decode_opt_camodel.sh build`; run the canary/depth/wrap
+ladder with `bash scripts/run_fused_decode_opt_camodel.sh ladder`.
+Verification status is recorded in [`reports/fused_decode_opt.md`](reports/fused_decode_opt.md).
+The existing Split-K benchmark selects this leg with `--impl fused-opt` (or
+`--impl all`). It has its own KV4/FP8 fixture and timing/CSV columns; `--rows`
+means GQA query heads per KV head, and its supported split counts are 1..8.
+Build both benchmark binaries with `bash scripts/build_fused_decode_opt_bench.sh`.
+
 [`SKELETON_KERNEL_WORKFLOW.md`](SKELETON_KERNEL_WORKFLOW.md) is the procedure
 that enforces those rules: where a new kernel goes, how to wire its build and
 launch ABI, and the five verification stages with the gate each one must pass

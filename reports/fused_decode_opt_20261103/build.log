@@ -1,0 +1,1 @@
+scripts/run_fused_decode_opt_camodel.sh: line 24: _opt_npu: command not found

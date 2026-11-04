@@ -1,0 +1,32 @@
+CAModel functional run: event times/speedups are unavailable; completion deltas are model ticks.
+AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.
+AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.
+OPT: KV4/FP8, FP32 pre-rotated GQA queries, FP16 rotated-basis output; complete in-launch Split-K combine.
+OPT GQA query heads per KV head=16; OPT Grid is the actual dispatch (capped at 32 blocks).
+OPT speedup uses its own K=1 baseline; cache GB/s excludes fragmented canary pages. Worker timestamps: unavailable.
+Single samples replace p50; tail/export show maxima. No implicit K=1 launch.
+impl=three-zone requests=1 heads=1 AIV_rows=16 AIC_rows=16 page_tokens=64 warmup=0 iters=1
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+
+| Context (N) | Splits (K) |   Grid |     AIV (us) | AIV Speedup | AIV KV GB/s | AIC Batch Raw(us) |      AIC Model(us/req) | AIC Model GB/s | Tail (ticks) |   Export (ticks) | OPT Grid | OPT Fused(us) | OPT Speedup | OPT KV GB/s |
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+
+
+================================================================================
+================================================================================
+|         576 |          1 |      1 |           NA |          NA |          NA |                NA |                     NA |             NA |           NA |               NA |        1 |            NA |          NA |          NA |
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+
+
+Three-zone decomposition per Split-K worker. Host restatement of the kernel's own
+selection (kSlots=3, kPhases=6, steady_limit=numTiles-3, deep at numTiles>=4);
+it says which zones a row MUST have used, not that the kernel took them -- only
+the CAModel trace audit shows that. Tiles are 64 tokens (kCubeTileRows).
++-------------+------------+--------+-------+-------+---------+---------+-------+----------------+
+| Context (N) | Splits (K) | Worker | Tiles |  Deep | Periods | Residue | Drain |     Zone class |
++-------------+------------+--------+-------+-------+---------+---------+-------+----------------+
+|         576 |          1 |      0 |     9 |   yes |       1 |       0 |     3 |     deep-exact |
++-------------+------------+--------+-------+-------+---------+---------+-------+----------------+
+Zone-class coverage across this sweep:
+  deep-exact     workers=1
+NOTE: zone class short not covered by this sweep.
+NOTE: zone class deep-ragged not covered by this sweep.
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=0 OPT=1.
+Model RUN TIME: 247660 ms

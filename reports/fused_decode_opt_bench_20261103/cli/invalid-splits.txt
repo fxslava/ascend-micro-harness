@@ -1,0 +1,3 @@
+FAIL: splitk must be 1..8 for fused-opt, otherwise 1..16
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589

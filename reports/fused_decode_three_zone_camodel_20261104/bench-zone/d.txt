@@ -1,0 +1,18 @@
+CAModel functional run: event times/speedups are unavailable; completion deltas are model ticks.
+AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.
+AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.
+OPT: KV4/FP8, FP32 pre-rotated GQA queries, FP16 rotated-basis output; complete in-launch Split-K combine.
+OPT GQA query heads per KV head=16; OPT Grid is the actual dispatch (capped at 32 blocks).
+OPT speedup uses its own K=1 baseline; cache GB/s excludes fragmented canary pages. Worker timestamps: unavailable.
+Single samples replace p50; tail/export show maxima. No implicit K=1 launch.
+impl=fused-opt requests=1 heads=1 AIV_rows=16 AIC_rows=16 page_tokens=128 warmup=0 iters=1
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+
+| Context (N) | Splits (K) |   Grid |     AIV (us) | AIV Speedup | AIV KV GB/s | AIC Batch Raw(us) |      AIC Model(us/req) | AIC Model GB/s | Tail (ticks) |   Export (ticks) | OPT Grid | OPT Fused(us) | OPT Speedup | OPT KV GB/s |
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+
+
+================================================================================
+================================================================================
+|         128 |          1 |      1 |           NA |          NA |          NA |                NA |                     NA |             NA |           NA |               NA |        1 |            NA |          NA |          NA |
++-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+
+PASS: CPU references matched. Kernel launches: AIV=0 AIC=0 OPT=1.
+Model RUN TIME: 84375.5 ms

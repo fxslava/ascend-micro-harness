@@ -1,0 +1,1 @@
+/tmp/ascend-fused-opt-json.AAvwdu/profile/OPPROF_20261104024330_WHGCVDMOSSDTNXTQ/simulator/trace.json

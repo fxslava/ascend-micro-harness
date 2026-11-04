@@ -5,6 +5,7 @@
 #include "../../common/aic_splitk_decode_fixture.hpp"
 #include "../../../include/turboquant_splitk_contract.hpp"
 #include "../turboquant_splitk_rigs.hpp"
+#include "../turboquant_fused_decode_opt_rig.hpp"
 
 #include <charconv>
 #include <cmath>
@@ -40,11 +41,80 @@ struct Options {
     bool single = false;
     std::string impl = "aiv", csv_out;
     int page_begin = 0, page_count = -1;
-    // Live tokens, as distinct from the allocated capacity `contexts` gives.
-    // -1 means "every allocated token is live", which is what every rung meant
-    // before this flag existed, so omitting it changes nothing.
-    int seq_len = -1;
+    bool zone_report = false;
+    bool Aiv() const { return impl == "aiv" || impl == "both" || impl == "all"; }
+    bool Aic() const { return impl == "aic" || impl == "both" || impl == "all"; }
+    // `three-zone` is an alias, not a second kernel: the three-zone schedule
+    // IS the production fused-opt kernel after the schedule refactor, so both
+    // spellings dispatch the same symbol. The alias exists so a sweep can ask
+    // for the zone report without also opting into the legacy baselines.
+    bool Opt() const { return impl == "fused-opt" || impl == "three-zone" || impl == "all"; }
+    bool OptOnly() const { return impl == "fused-opt" || impl == "three-zone"; }
 };
+
+// ---------------------------------------------------------------------------
+// Zone decomposition of the fused-opt schedule.
+//
+// This mirrors the kernel's own selection in
+// kernels/ops/turboquant/turboquant_fused_decode_opt.cpp: kSlots = 3 L1 ring
+// slots, kPhases = 6 unrolled steady phases, steady_limit = numTiles - kSlots,
+// the deep path taken at numTiles >= kSlots + 1 and a bounded three-step drain.
+// It is a host-side restatement for reporting, so a bench row can say whether
+// it actually entered the steady loop. It is not evidence that the kernel took
+// that path -- the CAModel trace audit is.
+// ---------------------------------------------------------------------------
+constexpr int kZoneSlots = 3, kZonePhases = 6, kZoneTileRows = 64;
+
+struct ZoneShape {
+    int tiles = 0;      // per-worker numTiles
+    bool deep = false;  // the unconditional three-zone path, not the short one
+    int periods = 0;    // complete unrolled Period-6 bodies
+    int residue = 0;    // ragged steady phases following them
+    int drain = 0;      // bounded drain steps
+    bool Empty() const { return tiles == 0; }
+    // Zone class, for coverage accounting.
+    std::string Kind() const
+    {
+        if (Empty()) return "empty";
+        if (!deep) return "short";
+        if (periods == 0) return "deep-noperiod";
+        return residue ? "deep-ragged" : "deep-exact";
+    }
+};
+
+ZoneShape zone_shape(int tiles)
+{
+    ZoneShape z;
+    z.tiles = tiles;
+    if (tiles <= 0) return z;
+    if (tiles < kZoneSlots + 1) return z;  // bounded short/compatibility path
+    z.deep = true;
+    const int steady = tiles - kZoneSlots;
+    z.periods = steady / kZonePhases;
+    z.residue = steady % kZonePhases;
+    z.drain = kZoneSlots;
+    return z;
+}
+
+// Per-worker tile counts. Mirrors the kernel's block slicing: a worker owns
+// [split * blocksPerSplit, min(start + blocksPerSplit, seqBlocks)). Valid for
+// the fused-opt fixture specifically, whose block table maps EVERY logical
+// page; CountTiles skips negative entries, so a fixture with holes would need
+// the table itself rather than this arithmetic.
+std::vector<ZoneShape> worker_zones(int context, int page_tokens, int k)
+{
+    const int seq_blocks = context / page_tokens;
+    const int tiles_per_block = page_tokens / kZoneTileRows;
+    const int workers = k <= 1 ? 1 : k;
+    const int per_split = (seq_blocks + workers - 1) / workers;
+    std::vector<ZoneShape> out;
+    for (int split = 0; split < workers; ++split) {
+        const int start = split * per_split;
+        const int end = std::min(start + per_split, seq_blocks);
+        out.push_back(zone_shape(std::max(0, end - start) * tiles_per_block));
+    }
+    return out;
+}
 
 int number(std::string_view s)
 {
@@ -72,22 +142,33 @@ std::vector<int> list(std::string_view s)
 Options parse(int argc, char** argv)
 {
     Options o;
+    bool explicit_splits = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--help") {
             std::puts("--context N[,N...] --splitk K[,K...] --warmup N --iters N "
                       "--requests N --heads N --rows N --page-tokens N\n"
-                      "--impl aiv|aic|both --single --csv-out PATH --page-begin P --page-count P\n"
-                      "--seq-len S   live tokens, <= the context; default: the whole context\n"
+                      "--impl aiv|aic|both|fused-opt|three-zone|all --single --csv-out PATH --page-begin P --page-count P\n"
+                      "--zone-report: per-worker three-zone decomposition and zone-class coverage.\n"
+                      "three-zone is an alias for fused-opt: one kernel, the refactored schedule.\n"
                       "Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8,12,16.\n"
+                      "fused-opt: separate KV4/FP8 fixture; --rows is GQA query heads per KV head; K 1..8.\n"
+                      "Its default K sweep is 1,2,4,8. --impl all leaves opt columns NA at K>8.\n"
+                      "fused-opt accepts --rows 1..16; legacy/all accepts --rows 1..8.\n"
+                      "KNOWN FAILING: fused-opt --rows 1 fails its own CPU attention oracle\n"
+                      "(measured on CAModel 2026-11-04, context 128/192, page-tokens 64 and 128,\n"
+                      "and with --impl fused-opt as well, so it predates the three-zone work).\n"
+                      "--rows 16 passes. The range is left as-is so the failure stays reproducible.\n"
+                      "fused-opt page-tokens: 64 or 128; other implementations: 16 or 128.\n"
                       "Use --page-tokens 16 --heads 1 --context 48 for a short CAModel run.");
             std::exit(0);
         }
         if (arg == "--single") { o.single = true; continue; }
+        if (arg == "--zone-report") { o.zone_report = true; continue; }
         require(i + 1 < argc, "option requires a value");
         const std::string_view value(argv[++i]);
         if (arg == "--context") o.contexts = list(value);
-        else if (arg == "--splitk") o.splits = list(value);
+        else if (arg == "--splitk") { o.splits = list(value); explicit_splits = true; }
         else if (arg == "--warmup") o.warmup = number(value);
         else if (arg == "--iters") o.iters = number(value);
         else if (arg == "--requests") o.requests = number(value);
@@ -98,24 +179,21 @@ Options parse(int argc, char** argv)
         else if (arg == "--csv-out") o.csv_out = value;
         else if (arg == "--page-begin") o.page_begin = number(value);
         else if (arg == "--page-count") o.page_count = number(value);
-        else if (arg == "--seq-len") o.seq_len = number(value);
         else throw std::runtime_error("unknown option: " + std::string(arg));
     }
     if (o.single) { o.warmup = 0; o.iters = 1; }
-    require(o.impl == "aiv" || o.impl == "aic" || o.impl == "both", "impl must be aiv, aic or both");
+    require(o.Aiv() || o.Aic() || o.Opt(),
+            "impl must be aiv, aic, both, fused-opt, three-zone or all");
+    require(!o.zone_report || o.Opt(), "--zone-report needs fused-opt, three-zone or all");
+    if (o.OptOnly() && !explicit_splits) o.splits = {1, 2, 4, 8};
     require(o.page_begin >= 0 && o.page_count >= -1, "invalid AIC page window");
-    require(o.page_tokens == 16 || o.page_tokens == 128, "page-tokens must be 16 or 128");
-    require(o.seq_len == -1 || o.seq_len > 0, "seq-len must be positive");
-    if (o.seq_len > 0) {
-        // One context only: the live count is relative to it, and silently
-        // applying the same S to a sweep of capacities would mean something
-        // different at each rung.
-        require(o.contexts.size() == 1,
-                "--seq-len applies to a single --context, not a sweep");
-        require(o.seq_len <= o.contexts.front(),
-                "seq-len must not exceed the context it is live within");
-    }
-    require(o.heads > 0 && o.heads <= 4 && o.rows > 0 && o.rows <= 8, "heads must be 1..4 and rows 1..8");
+    require(o.Opt() ? (o.page_tokens == 64 || o.page_tokens == 128) :
+            (o.page_tokens == 16 || o.page_tokens == 128), "unsupported page-tokens for implementation");
+    if (o.Aiv() || o.Aic()) require(o.page_tokens != 64,
+            "64-token pages require --impl fused-opt or three-zone");
+    require(o.heads > 0 && o.heads <= 4 && o.rows > 0 &&
+            o.rows <= (o.OptOnly() ? 16 : 8),
+            "heads must be 1..4; rows 1..16 for fused-opt, otherwise 1..8");
     for (int n : o.contexts) {
         require(n > 0 && n <= 16384 && n % o.page_tokens == 0,
                 "context must be a multiple of page-tokens, at most 16384");
@@ -125,7 +203,8 @@ Options parse(int argc, char** argv)
         if (o.impl != "aic") require(o.page_begin == 0 && (o.page_count == -1 || o.page_count == pages),
                 "partial page windows require --impl aic; both compares full contexts");
     }
-    for (int k : o.splits) require(k >= 1 && k <= 16, "splitk must be 1..16");
+    for (int k : o.splits) require(k >= 1 && k <= (o.OptOnly() ? 8 : 16),
+                                 "splitk must be 1..8 for fused-opt, otherwise 1..16");
     require(o.iters > 0 && o.warmup >= 0 && o.requests > 0 && o.requests <= 16,
             "invalid iteration or batch bound");
     return o;
@@ -165,12 +244,7 @@ struct Events {
     {
 #if !defined(ASCEND_MICRO_BENCH_SIM)
         check(aclrtCreateEvent(&start), "aclrtCreateEvent start");
-        try {
-            check(aclrtCreateEvent(&end), "aclrtCreateEvent end");
-        } catch (...) {
-            aclrtDestroyEvent(start);
-            throw;
-        }
+        check(aclrtCreateEvent(&end), "aclrtCreateEvent end");
 #endif
     }
     Events(const Events&) = delete;
@@ -210,9 +284,9 @@ Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& e
         d.Launch(stream, k);
         check(aclrtSynchronizeStream(stream), "warmup post-launch synchronize");
         ++result.launches;
+        d.Validate(k);
     }
-    std::vector<double> times;
-    times.reserve(o.iters);
+    std::vector<double> times, tails, exports;
     bool valid_events = true;
     for (int i = 0; i < o.iters; ++i) {
         d.Reset();
@@ -234,22 +308,23 @@ Measurement measure(D& d, const Options& o, int k, aclrtStream stream, Events& e
         ++result.launches;
         require(std::isfinite(ms) && ms >= 0, "invalid event duration");
         valid_events = valid_events && ms > 0;
-        times.push_back(ms * 1000.0);
-    }
-    // Exactly one download/oracle pass, after the final launch has completed.
-    // In particular, no validation traffic or CPU oracle work separates samples.
-    // Worker counters describe the final launch, not all latency samples.
-    const auto census = d.Validate(k);
-    if (o.single) {
-        result.us = times.front();
-        result.tail = census.tail_ticks.empty() ? 0 : *std::max_element(census.tail_ticks.begin(), census.tail_ticks.end());
-        result.export_region = census.export_ticks.empty() ? 0 : *std::max_element(census.export_ticks.begin(), census.export_ticks.end());
+        const auto census = d.Validate(k);
+        if (o.single) {
+            // No percentile sorting or multi-sample accumulation in profiling mode.
+            result.us = ms * 1000.0;
+            result.tail = census.tail_ticks.empty() ? 0 : *std::max_element(census.tail_ticks.begin(), census.tail_ticks.end());
+            result.export_region = census.export_ticks.empty() ? 0 : *std::max_element(census.export_ticks.begin(), census.export_ticks.end());
+        } else {
+            times.push_back(ms * 1000.0);
+            tails.insert(tails.end(), census.tail_ticks.begin(), census.tail_ticks.end());
+            exports.insert(exports.end(), census.export_ticks.begin(), census.export_ticks.end());
+        }
     }
     if (!o.single) {
         const auto latency = summarize(times);
         result.us = latency.p50; result.p95 = latency.p95;
-        if (!census.tail_ticks.empty()) result.tail = summarize(census.tail_ticks).p50;
-        if (!census.export_ticks.empty()) result.export_region = summarize(census.export_ticks).p50;
+        if (!tails.empty()) result.tail = summarize(tails).p50;
+        if (!exports.empty()) result.export_region = summarize(exports).p50;
     }
     result.timed = valid_events;
 #if defined(ASCEND_MICRO_BENCH_SIM)
@@ -267,29 +342,33 @@ std::string field(double value, bool available, int precision = 3)
 }
 
 void row(int n, int k, int grid, const Measurement& aiv, const Measurement& aic,
-         double aiv_baseline, double aic_baseline, double aiv_bytes, double aic_bytes,
-         std::ofstream& csv)
+         const Measurement& opt, int opt_grid, double baseline, double opt_baseline,
+         double aiv_bytes, double aic_bytes, double opt_bytes, std::ofstream& csv)
 {
-    const bool aiv_timed = aiv.timed && std::isfinite(aiv.us) && aiv.us > 0;
-    const bool aic_timed = aic.timed && std::isfinite(aic.us) && aic.us > 0;
-    const auto av = field(aiv.us, aiv_timed);
-    const auto speed = field(aiv_timed ? aiv_baseline / aiv.us : 0, aiv_timed && aiv_baseline > 0);
-    const auto aic_speed = field(aic_timed ? aic_baseline / aic.us : 0, aic_timed && aic_baseline > 0);
-    const auto abw = field(aiv_timed ? aiv_bytes / aiv.us / 1000 : 0, aiv_timed);
-    const auto cr = field(aic.us, aic_timed);
-    const auto cn = field(aic.us / 16.0, aic_timed);
-    const auto cbw = field(aic_timed ? aic_bytes * 16 / aic.us / 1000 : 0, aic_timed);
+    const auto av = field(aiv.us, aiv.timed);
+    const auto speed = field(aiv.timed ? baseline / aiv.us : 0, aiv.timed && baseline > 0);
+    const auto abw = field(aiv.timed ? aiv_bytes / aiv.us / 1000 : 0, aiv.timed);
+    const auto cr = field(aic.us, aic.timed);
+    const auto cn = field(aic.us / 16.0, aic.timed);
+    const auto cbw = field(aic.timed ? aic_bytes * 16 / aic.us / 1000 : 0, aic.timed);
     const auto tail = field(aiv.tail, aiv.present, 0);
     const auto exported = field(aiv.export_region, aiv.present, 0);
-    std::printf("| %11d | %10d | %6d | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %11s |\n",
+    const auto opt_time = field(opt.us, opt.timed);
+    const auto opt_speed = field(opt.timed && opt.us > 0 ? opt_baseline / opt.us : 0,
+                                 opt.timed && opt_baseline > 0);
+    const auto opt_bw = field(opt.timed ? opt_bytes / opt.us / 1000 : 0, opt.timed);
+    const auto opt_blocks = opt.present ? std::to_string(opt_grid) : "NA";
+    std::printf("| %11d | %10d | %6d | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %8s | %13s | %11s | %11s |\n",
                 n, k, grid, av.c_str(), speed.c_str(), abw.c_str(), cr.c_str(), cn.c_str(),
-                cbw.c_str(), tail.c_str(), exported.c_str(), aic_speed.c_str());
+                cbw.c_str(), tail.c_str(), exported.c_str(), opt_blocks.c_str(),
+                opt_time.c_str(), opt_speed.c_str(), opt_bw.c_str());
     if (csv.is_open()) {
         csv << n << ',' << k << ',' << grid << ',' << av << ',' << speed << ',' << abw << ','
             << cr << ',' << cn << ',' << cbw << ','
-            << field(aic_timed ? aic_bytes / aic.us / 1000 : 0, aic_timed) << ','
+            << field(aic.timed ? aic_bytes / aic.us / 1000 : 0, aic.timed) << ','
             << tail << ',' << exported << ','
-            << aiv.launches << ',' << aic.launches << ',' << aic_speed << '\n';
+            << aiv.launches << ',' << aic.launches << ',' << opt_blocks << ','
+            << opt_time << ',' << opt_speed << ',' << opt_bw << ',' << opt.launches << '\n';
         csv.flush();
         require(static_cast<bool>(csv), "CSV write failed");
     }
@@ -311,44 +390,56 @@ int main(int argc, char** argv)
         if (!o.csv_out.empty()) {
             csv.open(o.csv_out, std::ios::out | std::ios::trunc);
             require(csv.is_open(), "cannot open --csv-out path");
-            csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,export_ticks,aiv_launches,aic_launches,aic_speedup\n";
+            csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,export_ticks,aiv_launches,aic_launches,opt_grid,opt_us,opt_speedup,opt_kv_cache_gbs,opt_launches\n";
         }
         if (o.single) std::puts("[PROFILING MODE] Single launch mode active for msprof op.");
         std::puts("AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.");
         std::puts("AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.");
+        if (o.Opt()) {
+            std::puts("OPT: KV4/FP8, FP32 pre-rotated GQA queries, FP16 rotated-basis output; complete in-launch Split-K combine.");
+            std::printf("OPT GQA query heads per KV head=%d; OPT Grid is the actual dispatch (capped at 32 blocks).\n", o.rows);
+            std::puts("OPT speedup uses its own K=1 baseline; cache GB/s excludes fragmented canary pages. Worker timestamps: unavailable.");
+            if (o.impl == "all") std::puts("OPT columns are NA for unsupported K>8. Fixtures/precision differ; no cross-implementation speedup is inferred.");
+        }
         if (o.single) std::puts("Single samples replace p50; tail/export show maxima. No implicit K=1 launch.");
-        std::puts("Each implementation uses its own K=1 baseline. Validation runs once after sampling; tail/export describe the final launch.");
         std::printf("impl=%s requests=%d heads=%d AIV_rows=%d AIC_rows=16 page_tokens=%d warmup=%d iters=%d\n",
                     o.impl.c_str(), o.requests, o.heads, o.rows, o.page_tokens, o.warmup, o.iters);
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+-------------+");
-        std::printf("| %11s | %10s | %6s | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %11s |\n",
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
+        std::printf("| %11s | %10s | %6s | %12s | %11s | %11s | %17s | %22s | %14s | %12s | %16s | %8s | %13s | %11s | %11s |\n",
                     "Context (N)", "Splits (K)", "Grid", o.single ? "AIV (us)" : "AIV p50(us)",
                     "AIV Speedup", "AIV KV GB/s", "AIC Batch Raw(us)",
                     o.single ? "AIC Model(us/req)" : "AIC Model p50(us/req)", "AIC Model GB/s",
-                    "Tail (ticks)", o.single ? "Export (ticks)" : "Export p50(ticks)", "AIC Speedup");
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+-------------+");
+                    "Tail (ticks)", o.single ? "Export (ticks)" : "Export p50(ticks)",
+                    "OPT Grid", o.single ? "OPT Fused(us)" : "OPT p50(us)", "OPT Speedup", "OPT KV GB/s");
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
         tq_npu::Session session;
         Events events;
         struct Comparison { int n, k; double aiv, aic; };
         std::vector<Comparison> comparisons;
-        std::uint64_t aiv_launches = 0, aic_launches = 0;
+        struct ZoneRow { int n, k; std::vector<ZoneShape> workers; };
+        std::vector<ZoneRow> zone_rows;
+        std::map<std::string, int> zone_classes;
+        std::uint64_t aiv_launches = 0, aic_launches = 0, opt_launches = 0;
         for (int n : o.contexts) {
             std::unique_ptr<Fixture> av, ac;
-            if (o.impl != "aic") av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens, o.seq_len));
-            if (o.impl != "aiv") ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens, o.seq_len));
+            std::unique_ptr<fused_decode_opt_test::Fixture> opt_fixture;
+            if (o.Aiv()) av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
+            if (o.Aic()) ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens));
+            if (o.Opt()) opt_fixture.reset(new fused_decode_opt_test::Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
             std::vector<int> sweep;
-            if (!o.single) sweep.push_back(1);
+            if (!o.single && (av || opt_fixture)) sweep.push_back(1);
             for (int k : o.splits)
                 if (std::find(sweep.begin(), sweep.end(), k) == sweep.end()) sweep.push_back(k);
-            double aiv_baseline = 0, aic_baseline = 0;
+            double baseline = 0, opt_baseline = 0;
             for (int k : sweep) {
-                Measurement aiv, aic;
-                double aiv_bytes = 0, aic_bytes = 0;
+                Measurement aiv, aic, opt;
+                double aiv_bytes = 0, aic_bytes = 0, opt_bytes = 0;
+                int opt_grid = 0;
                 if (av) {
                     Device d(*av, k);
                     aiv = measure(d, o, k, session.stream, events);
                     aiv_launches += aiv.launches;
-                    if (k == 1 && aiv.timed) aiv_baseline = aiv.us;
+                    if (k == 1 && aiv.timed) baseline = aiv.us;
                     aiv_bytes = static_cast<double>(av->key.size() + av->value.size() + av->scales.size() * 4);
                 }
                 if (ac) {
@@ -356,16 +447,68 @@ int main(int argc, char** argv)
                     AicDevice d(*ac, k, o.page_begin, pages);
                     aic = measure(d, o, k, session.stream, events);
                     aic_launches += aic.launches;
-                    if (k == 1 && aic.timed) aic_baseline = aic.us;
                     aic_bytes = static_cast<double>(ac->key.size() + ac->value.size() + ac->scales.size() * 4) * pages / ac->pages;
                 }
-                row(n, k, o.requests * o.heads * k, aiv, aic, aiv_baseline, aic_baseline,
-                    aiv_bytes, aic_bytes, csv);
+                if (opt_fixture && k <= 8) {
+                    tq_splitk_rig::FusedOptRig d(*opt_fixture, k);
+                    opt = measure(d, o, k, session.stream, events);
+                    opt_launches += opt.launches; opt_grid = d.config.grid;
+                    if (k == 1 && opt.timed) opt_baseline = opt.us;
+                    opt_bytes = opt_fixture->cache_bytes();
+                    // The rig's Validate() already compared every launch of
+                    // this configuration against the fixture's independent
+                    // FP64 attention oracle, and K=1 and K>1 are held to the
+                    // SAME oracle, so a Split-K merge that lost or double
+                    // counted a worker's partial cannot pass. Record the zone
+                    // shape the schedule must have taken for that result.
+                    if (o.zone_report) {
+                        const auto shapes = worker_zones(n, o.page_tokens, k);
+                        for (const auto& z : shapes) ++zone_classes[z.Kind()];
+                        zone_rows.push_back({n, k, shapes});
+                    }
+                }
+                row(n, k, o.requests * o.heads * k, aiv, aic, opt, opt_grid,
+                    baseline, opt_baseline, aiv_bytes, aic_bytes, opt_bytes, csv);
                 if (aiv.timed && aic.timed)
                     comparisons.push_back({n, k, aiv.us, aic.us / 16});
             }
         }
-        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+-------------+");
+        std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
+        if (o.zone_report) {
+            std::puts("");
+            std::puts("Three-zone decomposition per Split-K worker. Host restatement of the kernel's own");
+            std::puts("selection (kSlots=3, kPhases=6, steady_limit=numTiles-3, deep at numTiles>=4);");
+            std::puts("it says which zones a row MUST have used, not that the kernel took them -- only");
+            std::puts("the CAModel trace audit shows that. Tiles are 64 tokens (kCubeTileRows).");
+            std::puts("+-------------+------------+--------+-------+-------+---------+---------+-------+----------------+");
+            std::printf("| %11s | %10s | %6s | %5s | %5s | %7s | %7s | %5s | %14s |\n",
+                        "Context (N)", "Splits (K)", "Worker", "Tiles", "Deep", "Periods",
+                        "Residue", "Drain", "Zone class");
+            std::puts("+-------------+------------+--------+-------+-------+---------+---------+-------+----------------+");
+            for (const auto& r : zone_rows)
+                for (std::size_t w = 0; w < r.workers.size(); ++w) {
+                    const auto& z = r.workers[w];
+                    std::printf("| %11d | %10d | %6zu | %5d | %5s | %7d | %7d | %5d | %14s |\n",
+                                r.n, r.k, w, z.tiles, z.Empty() ? "NA" : (z.deep ? "yes" : "no"),
+                                z.periods, z.residue, z.drain, z.Kind().c_str());
+                }
+            std::puts("+-------------+------------+--------+-------+-------+---------+---------+-------+----------------+");
+            std::puts("Zone-class coverage across this sweep:");
+            for (const auto& entry : zone_classes)
+                std::printf("  %-14s workers=%d\n", entry.first.c_str(), entry.second);
+            // Coverage is reported, and the one class this benchmark exists to
+            // exercise is required. A sweep that never left the short bounded
+            // path would otherwise report PASS while testing none of the
+            // steady loop this refactor introduced.
+            const std::size_t deep_classes =
+                zone_classes.count("deep-exact") + zone_classes.count("deep-ragged") +
+                zone_classes.count("deep-noperiod");
+            require(deep_classes > 0, "--zone-report swept no deep three-zone worker: raise --context "
+                              "(a worker needs >=4 tiles, i.e. >=256 tokens of its own slice)");
+            for (const char* kind : {"short", "deep-exact", "deep-ragged"})
+                if (!zone_classes.count(kind))
+                    std::printf("NOTE: zone class %s not covered by this sweep.\n", kind);
+        }
         for (const auto& c : comparisons)
             std::printf("Modeled comparison N=%d K=%d: AIC %.3f us/row vs AIV %.3f us/decode (%s).\n",
                         c.n, c.k, c.aic, c.aiv, c.aic < c.aiv ? "AIC amortized model lower" : "AIV lower");
@@ -380,10 +523,11 @@ int main(int argc, char** argv)
                             entry.first, entry.second);
             else std::printf("Modeled crossover K=%d: not observed in the tested contexts.\n", entry.first);
         }
-        if (o.impl == "both" && comparisons.empty())
+        if (o.Aiv() && o.Aic() && comparisons.empty())
             std::puts("Modeled crossover unavailable: device event timing is unavailable.");
-        std::printf("PASS: CPU references matched. Kernel launches: AIV=%llu AIC=%llu.\n",
-                    static_cast<unsigned long long>(aiv_launches), static_cast<unsigned long long>(aic_launches));
+        std::printf("PASS: CPU references matched. Kernel launches: AIV=%llu AIC=%llu OPT=%llu.\n",
+                    static_cast<unsigned long long>(aiv_launches), static_cast<unsigned long long>(aic_launches),
+                    static_cast<unsigned long long>(opt_launches));
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

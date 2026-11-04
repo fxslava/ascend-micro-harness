@@ -1,0 +1,15 @@
+# Run-time ladder result with the auditor as committed in 6b38819 (pre-fix).
+# tail-rows-n16 FAIL below is the auditor id-7 gap, not a kernel failure:
+# the kernel reported comparison=exact. See reaudit-summary.txt for the
+# post-fix audit status of the same stored traces.
+PASS  iso-page0                61s  --canary 0
+PASS  iso-page-mid             54s  --canary 4
+PASS  iso-page-last            56s  --canary 7
+PASS  iso-page-last-strip      59s  --canary 7 --tile 1
+PASS  fulldepth-n12           301s  --tiles 12
+PASS  depth-n3                100s  --tiles 3
+PASS  deep-first-n4           134s  --tiles 4
+PASS  wrap-n6                 188s  --tiles 6
+PASS  odd-n7                  224s  --tiles 7
+PASS  period-exact-n9         239s  --tiles 9
+FAIL  tail-rows-n16           403s  --tiles 16 --tail-rows 17
