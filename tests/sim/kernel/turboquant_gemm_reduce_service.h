@@ -34,6 +34,7 @@ using vllm_ascend::turboquant::SyncMte1ToMatrix;
 using vllm_ascend::turboquant::kGatherSrcBase;
 using vllm_ascend::turboquant::SyncMte2ToVector;
 using vllm_ascend::turboquant::SyncScalarToVector;
+using vllm_ascend::turboquant::SyncVectorToMte2;
 using vllm_ascend::turboquant::SyncVectorToMte3;
 using vllm_ascend::turboquant::WriteHeads;
 
@@ -158,43 +159,62 @@ public:
     }
 
 private:
-    // One UB arena for the statistics, in 8-float blocks. Every vector destination below is a
-    // whole-block base: a vector store to a 4-byte-aligned address raises
-    // vec_err_instr_misalign on this core, which is how the single-element lane packing this
-    // first carried was found. The lane gather is an AscendC::Gather instead.
+    // One UB arena for the statistics, in 8-float DataBlocks. Two rules shape it, and both
+    // were learned the hard way on CAModel rather than read off first:
     //
-    //   0   gathered m_s, padding lanes kVectorNegInf
-    //   1   gathered l_s, padding lanes zero
-    //   2   the weight row w_s, the 32 bytes MTE3 stores into L1
-    //   3   m* broadcast over 8 lanes
-    //   4   w_s * l_s
-    //   5-6 ReduceMax / ReduceSum work
-    //   8-9 l*, one block per slot: produced by Stats(r) and read by Finish(r) two tasks later,
-    //       so a single shared block would be overwritten before its read
-    //   10  NormalizeHeads' sums
-    //   11  NormalizeHeads' invs
-    //   12  Gather byte offsets of the maxima
-    //   13  Gather byte offsets of the masses
-    //   16+ the 64-byte landing of each split's statistics tail, kMaxSplits of them
+    //   * Every vector destination is a whole-block base. A vector store to a 4-byte-aligned
+    //     address raises vec_err_instr_misalign_t0.
+    //   * A Brcb destination is EIGHT DataBlocks, not one. "Eight elements are read from src
+    //     in each iteration" and they are filled into eight contiguous DataBlocks, so one
+    //     repeat writes 64 floats. Giving the broadcast of m* a single block silently
+    //     overwrote the seven blocks behind it, which at one reduction task is invisible --
+    //     the clobber happens after the only read -- and at two tasks zeroed the first task's
+    //     l*, so 1/(l* + eps) came out 1e20 and every channel of task 0 exported inf. Both
+    //     Brcb destinations below therefore own eight blocks, with nothing live behind them.
+    //
+    //   0      gathered m_s, padding lanes kVectorNegInf
+    //   1      gathered l_s, padding lanes zero
+    //   2      the weight row w_s, the 32 bytes MTE3 stores into L1
+    //   3      w_s * l_s
+    //   4-5    ReduceMax / ReduceSum work
+    //   6-7    l*, one block per slot: produced by Stats(r) and read by Finish(r) two tasks
+    //          later, so a single shared block would be overwritten before its read
+    //   8-15   m* broadcast -- a Brcb destination, eight blocks
+    //   16-23  NormalizeHeads' sums -- also a Brcb destination, eight blocks
+    //   24-31  NormalizeHeads' invs
+    //   32     Gather byte offsets of the maxima
+    //   33     Gather byte offsets of the masses
+    //   34+    the 64-byte landing of each split's statistics tail, kMaxSplits of them
+    static constexpr uint32_t kBrcbDstBlocks = 8;
     static constexpr uint32_t kLaneMax = 0 * kFp32PerBlock;
     static constexpr uint32_t kLaneSum = 1 * kFp32PerBlock;
     static constexpr uint32_t kLaneWeight = 2 * kFp32PerBlock;
-    static constexpr uint32_t kLaneStar = 3 * kFp32PerBlock;
-    static constexpr uint32_t kLaneWeighted = 4 * kFp32PerBlock;
-    static constexpr uint32_t kLaneScratch = 5 * kFp32PerBlock;
-    static constexpr uint32_t kLaneTotal = 8 * kFp32PerBlock;  // + slot
-    static constexpr uint32_t kLaneSums = 10 * kFp32PerBlock;
-    static constexpr uint32_t kLaneInvs = 11 * kFp32PerBlock;
-    static constexpr uint32_t kLaneMaxOffsets = 12 * kFp32PerBlock;
-    static constexpr uint32_t kLaneSumOffsets = 13 * kFp32PerBlock;
-    static constexpr uint32_t kLaneTail = 16 * kFp32PerBlock;
+    static constexpr uint32_t kLaneWeighted = 3 * kFp32PerBlock;
+    static constexpr uint32_t kLaneScratch = 4 * kFp32PerBlock;
+    static constexpr uint32_t kLaneTotal = 6 * kFp32PerBlock;  // + slot
+    static constexpr uint32_t kLaneStar = 8 * kFp32PerBlock;
+    static constexpr uint32_t kLaneSums = 16 * kFp32PerBlock;
+    static constexpr uint32_t kLaneInvs = 24 * kFp32PerBlock;
+    static constexpr uint32_t kLaneMaxOffsets = 32 * kFp32PerBlock;
+    static constexpr uint32_t kLaneSumOffsets = 33 * kFp32PerBlock;
+    static constexpr uint32_t kLaneTail = 34 * kFp32PerBlock;
     // Each split's tail gets its own 64-byte landing before anything reads it, so an unmasked
-    // register read of one split's block cannot touch another split's DMA landing (section 2).
+    // register read of one split's block cannot touch another split's DMA landing.
     static constexpr uint32_t kTailBlocksPerSplit = 2;
     static constexpr uint32_t kStatsUbFloats =
         kLaneTail + kMaxSplits * kTailBlocksPerSplit * kFp32PerBlock;
     static constexpr uint32_t kStatsUbBytes = kStatsUbFloats * sizeof(float);
-    static_assert(kLaneTotal + kReduceSlots * kFp32PerBlock <= kLaneSums, "l* blocks overlap");
+    // The two Brcb destinations each own their eight blocks outright.
+    static_assert(kLaneStar + kBrcbDstBlocks * kFp32PerBlock <= kLaneSums,
+                  "the m* broadcast must not reach the next allocation");
+    static_assert(kLaneSums + kBrcbDstBlocks * kFp32PerBlock <= kLaneInvs,
+                  "NormalizeHeads' broadcast must not reach its own reciprocals");
+    static_assert(kLaneInvs + kBrcbDstBlocks * kFp32PerBlock <= kLaneMaxOffsets,
+                  "the reciprocals must not reach the Gather tables");
+    static_assert(kLaneSumOffsets + kFp32PerBlock <= kLaneTail,
+                  "the Gather tables must not reach the DMA landings");
+    static_assert(kLaneTotal + kReduceSlots * kFp32PerBlock <= kLaneStar,
+                  "the per-slot l* blocks must not be inside a broadcast destination");
     static_assert(kStatsUbBytes % 32 == 0, "every UB allocation is a whole 32-byte block");
     static_assert(kStatsUbBytes >= kReduceStatsUbBytes, "the contract's stats budget is a floor");
     // The byte stride between two splits' tail landings, which is what the Gather tables step.
@@ -332,6 +352,13 @@ private:
         AscendC::Duplicate(maxes, kVectorNegInf, kFp32PerBlock);
         AscendC::Duplicate(sums, 0.0f, kFp32PerBlock);
 
+        // The landings are shared across tasks, and the previous task's Gather, Sub and Exp
+        // may still be reading them: this task's MTE2 burst has to land BEHIND that vector
+        // work. Without this fence the two-task case already returns inf, because task r+1's
+        // statistics overwrite task r's while they are being reduced. The shipping
+        // TurboQuantPartialReducer carries the same SyncVectorToMte2 before each of its GM
+        // reads. This is a WAR hazard across two pipes, not a reordering the compiler sees.
+        SyncVectorToMte2();
         for (uint32_t split = 0; split < numSplits_; ++split) {
             const uint64_t row = PartialRow(taskIds_[r], split) + headSize_;
             // One 64-byte burst per split carries both lanes: the max sits at kPartialMaxLane
@@ -427,10 +454,13 @@ private:
         AscendC::MmadParams mmad;
         mmad.m = 1;
         mmad.n = static_cast<uint16_t>(headSize_);
-        // The hardware aligns float K to ceil(K/8)*8 regardless, so passing the aligned
-        // extent states what it will do. The lanes beyond numSplits_ are zero in both
-        // operands, by the weight row and by DN2NZ's own zero fill.
-        mmad.k = static_cast<uint16_t>(alignedSplits_);
+        // The LOGICAL depth, numSplits_, and not the aligned one. kAlignedSplits describes the
+        // OPERAND LAYOUT -- a float K block is 8 elements, so every legal split count occupies
+        // one C0 block and needs no K tiling -- and passing it here instead told the Cube to
+        // accumulate eight products, which at splits < 8 multiplied the L1 rows DN2NZ had not
+        // written and returned inf. With k at the real depth those rows are not reached; the
+        // zeroed weight lanes remain the second guard for any lane the hardware reads anyway.
+        mmad.k = static_cast<uint16_t>(numSplits_);
         // cmatrixInitVal, not the doc's ccubeInitVal: this toolkit's MmadParams names it the
         // former. true zeroes C, which is what a single-Mmad GEMV wants.
         mmad.cmatrixInitVal = true;

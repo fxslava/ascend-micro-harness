@@ -301,6 +301,15 @@ int run(const Options &o)
 
     double worst_abs = 0.0, worst_rel = 0.0;
     std::uint32_t worst_ulp = 0, checked = 0, skipped = 0;
+    // The first few disagreements, with the ring slot they landed in: "which task" and "which
+    // slot" is the difference between an arithmetic bug and a buffer-lifetime one.
+    struct Bad {
+        std::uint32_t task, token, head, channel;
+        float got;
+        double want;
+        std::uint16_t bits;
+    };
+    std::vector<Bad> bad;
     for (std::uint32_t t = 0; t < o.tokens; ++t) {
         for (std::uint32_t h = 0; h < o.heads; ++h) {
             const std::size_t base =
@@ -367,11 +376,22 @@ int run(const Options &o)
                     static_cast<std::int32_t>(ideal_half & 0x7FFF);
                 worst_ulp = std::max(worst_ulp, static_cast<std::uint32_t>(std::abs(ulp)));
                 static_cast<void>(nearest);
+                if (std::abs(ulp) > 2 && bad.size() < 8) {
+                    bad.push_back(Bad{t * o.heads + h, t, h, c, got, expect, out[base + c]});
+                }
                 ++checked;
             }
         }
     }
 
+    if (!bad.empty()) {
+        std::printf("first disagreeing channels (slot = task mod 2):\n");
+        for (const Bad &b : bad) {
+            std::printf("  task=%u token=%u head=%u slot=%u channel=%u got=%g want=%g bits=%04x\n",
+                        b.task, b.token, b.head, b.task % 2u, b.channel,
+                        static_cast<double>(b.got), b.want, static_cast<unsigned>(b.bits));
+        }
+    }
     std::printf("leg=%s fixture=%s splits=%u tokens=%u heads=%u grid=%u per_block=%u "
                 "checked=%u skipped_heads=%u\n",
                 leg_name(o.leg), o.exact ? "exact" : "varied", o.splits, o.tokens, o.heads,
