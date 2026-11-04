@@ -66,7 +66,7 @@ function(add_ascend_micro_sim_targets)
   # camodel_paged_decode_attention_kernel, so the duplicate was the one
   # translation unit of this operator compiled without it.
   function(add_micro_camodel_runner name kernel_target)
-    if(name STREQUAL "fused_decode_opt")
+    if(name STREQUAL "fused_decode_opt" OR name STREQUAL "gemm_reduce")
       add_executable(test_camodel_${name} tests/sim/kernel/test_camodel_${name}.cpp)
     else()
       add_executable(test_camodel_${name} tests/camodel/test_camodel_${name}.cpp)
@@ -119,6 +119,27 @@ function(add_ascend_micro_sim_targets)
   add_executable(test_fused_decode_opt_fixture tests/cpu/test_fused_decode_opt_fixture.cpp)
   target_compile_options(test_fused_decode_opt_fixture PRIVATE -Wall -Wextra -Werror)
   ascendc_compile_options(camodel_fused_decode_opt_kernel PRIVATE
+      -std=c++17 -Wall -Werror ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  # The Split-K final reduction as a Cube GEMV. PROTOTYPE: its kernel source and
+  # its service header both live under tests/, so nothing in kernels/ can reach
+  # them and the variant cannot link into the operator. It emits three entry
+  # points over one workspace -- the GEMV stage, the same stage with Mmad's GEMV
+  # mode left on, and the shipping TurboQuantPartialReducer as the numerical
+  # reference -- so the comparison is against production arithmetic compiled in
+  # the same build rather than against a host reimplementation of it.
+  add_micro_camodel_probe(gemm_reduce
+      tests/sim/kernel/gemm_reduce_kernel.cpp)
+  add_executable(test_gemm_reduce_geometry tests/cpu/test_gemm_reduce_geometry.cpp)
+  target_compile_options(test_gemm_reduce_geometry PRIVATE -Wall -Wextra -Werror)
+  # -Wall -Werror, the same strictness the operator's own device leg is built at, and NOT
+  # -Wextra: this variant includes the production vector service, and -Wextra fails there on a
+  # pre-existing unused parameter in TurboQuantModeName
+  # (kernels/ops/turboquant/fused_decode/common/turboquant_mode.h:297), which is not this
+  # prototype's to fix. The -Wall -Wextra -Werror compile §6.1 asks for is the host gate over
+  # the shared contract header, test_gemm_reduce_geometry above.
+  ascendc_compile_options(camodel_gemm_reduce_kernel PRIVATE
       -std=c++17 -Wall -Werror ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS}
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
 

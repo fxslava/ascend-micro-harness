@@ -55,6 +55,16 @@
 
 #include <cstdint>
 
+// The helpers below are compiled into BOTH the kernel and the host gate, which is the whole
+// point of §6.1: the two share this declaration instead of each carrying a copy. BiSheng treats
+// a plain function as __host__ only, so a device caller needs the attribute, and the host gate
+// must not see it.
+#if defined(__CCE_AICORE__)
+#define ASCEND_MICRO_REDUCE_FN __aicore__ inline constexpr
+#else
+#define ASCEND_MICRO_REDUCE_FN constexpr
+#endif
+
 namespace ascend_micro::gemm_reduce {
 
 // ---------------------------------------------------------------------------------------------
@@ -83,7 +93,7 @@ constexpr std::uint32_t kPartialStride = kHeadSize + kPartialTail;  // 272 float
 // Mmad's K direction for float aligns to ceil(K/8)*8 on Ascend 950PR -- kDirectionAlign
 // supports only `false` there, which is that rule. So a split count below kC0Floats leaves
 // K lanes S..7 live in the hardware's eyes.
-constexpr std::uint32_t kAlignedSplits(std::uint32_t splits)
+ASCEND_MICRO_REDUCE_FN std::uint32_t kAlignedSplits(std::uint32_t splits)
 {
     return (splits + kC0Floats - 1) / kC0Floats * kC0Floats;
 }
@@ -133,6 +143,8 @@ static_assert(kPartialL1Bytes == kMaxSplits * kHeadSize * kFloatBytes);
 // Dn2NzParams for one (token, head): dValue is the C0 axis (the splits), nValue the N axis,
 // srcDValue the source row stride, which is kPartialStride and not kHeadSize because the
 // statistics tail shares the row.
+// This toolkit's Dn2NzParams names the per-matrix strides srcDnMatrixStride and
+// dstNzMatrixStride, not the API reference's ...CubeStride; both are 0 for a single matrix.
 constexpr std::uint32_t kDn2NzDnNum = 1;
 constexpr std::uint32_t kDn2NzNValue = kHeadSize;
 constexpr std::uint32_t kDn2NzSrcDValue = kPartialStride;
@@ -224,8 +236,16 @@ constexpr std::uint32_t kReduceL0bBytes = kPartialL1Bytes;
 constexpr std::uint32_t kReduceL0cBytes = kProductL0cBytes;
 // Per slot: the product landing the Fixpipe writes. Plus one shared statistics arena holding
 // the S maxima, the S sums, the weight row and its reduction scratch.
-constexpr std::uint32_t kReduceProductUbBytes = kHeadSize * kFloatBytes;  // 1024
-constexpr std::uint32_t kReduceStatsUbBytes = 4 * kC0Bytes;               // 128
+constexpr std::uint32_t kReduceProductPayloadBytes = kHeadSize * kFloatBytes;  // 1024
+// AKA3003. The payload alone is exactly 32 UB blocks, so floor(offset/32) mod 16 repeats and
+// the two product slots would present the same bank to both ports: the slot the Fixpipe is
+// filling and the slot the vector unit is normalising. One block of skew per slot breaks it,
+// the same remedy kBankSkewBytes applies to the attention ring's ingest buffers. The skew is
+// an allocation tail, never payload.
+constexpr std::uint32_t kReduceBankSkewBytes = kC0Bytes;
+constexpr std::uint32_t kReduceProductUbBytes =
+    kReduceProductPayloadBytes + kReduceBankSkewBytes;  // 1056
+constexpr std::uint32_t kReduceStatsUbBytes = 4 * kC0Bytes;  // 128
 constexpr std::uint32_t kReduceUbBytes =
     kReduceSlots * kReduceProductUbBytes + kReduceStatsUbBytes;
 
@@ -240,18 +260,23 @@ static_assert(kReduceL0cBytes <= 128 * 1024, "L0C budget");
 static_assert(kReduceProductUbBytes % kC0Bytes == 0 && kReduceStatsUbBytes % kC0Bytes == 0);
 static_assert(kReduceProductUbBytes / kC0Bytes % 16 != 0,
               "paired product slots must not present the same bank");
+// The skew is checked against the payload it separates, which is what makes it a skew and not
+// a number: it is not a universal bank-conflict proof for every repeat/stride pattern.
+static_assert(kReduceProductUbBytes > kReduceProductPayloadBytes &&
+                  kReduceBankSkewBytes % kC0Bytes == 0,
+              "the skew is a whole block of tail past the payload");
 
 // ---------------------------------------------------------------------------------------------
 // The schedule, as arithmetic both roles compute identically
 // ---------------------------------------------------------------------------------------------
 
-constexpr std::uint32_t kReducePrologue(std::uint32_t tasks)
+ASCEND_MICRO_REDUCE_FN std::uint32_t kReducePrologue(std::uint32_t tasks)
 {
     return tasks < kReduceSlots ? tasks : kReduceSlots;
 }
-constexpr std::uint32_t kReduceSlotOf(std::uint32_t task) { return task % kReduceSlots; }
+ASCEND_MICRO_REDUCE_FN std::uint32_t kReduceSlotOf(std::uint32_t task) { return task % kReduceSlots; }
 // Number of (token, head) combines this block owns, clamped like production's Reduce().
-constexpr std::uint32_t kReduceTaskCount(std::uint32_t total, std::uint32_t block,
+ASCEND_MICRO_REDUCE_FN std::uint32_t kReduceTaskCount(std::uint32_t total, std::uint32_t block,
                                          std::uint32_t perBlock)
 {
     const std::uint64_t start = std::uint64_t{block} * perBlock;
@@ -265,19 +290,52 @@ static_assert(kReduceTaskCount(5, 0, 4) == 4 && kReduceTaskCount(5, 1, 4) == 1);
 // and is not a reason to skip the phase's join.
 static_assert(kReducePrologue(0) == 0 && kReducePrologue(1) == 1 && kReducePrologue(9) == 2);
 
-constexpr std::uint64_t kPartialRowOffset(std::uint32_t token, std::uint32_t head,
+ASCEND_MICRO_REDUCE_FN std::uint64_t kPartialRowOffset(std::uint32_t token, std::uint32_t head,
                                           std::uint32_t split, std::uint32_t numHeads,
                                           std::uint32_t numSplits)
 {
     return ((std::uint64_t{token} * numHeads + head) * numSplits + split) * kPartialStride;
 }
 
-constexpr bool kValidReduceGeometry(std::uint32_t headSize, std::uint32_t splits)
+ASCEND_MICRO_REDUCE_FN bool kValidReduceGeometry(std::uint32_t headSize, std::uint32_t splits)
 {
     return headSize == kHeadSize && splits >= 1 && splits <= kMaxSplits &&
            kAlignedSplits(splits) == kC0Floats;
 }
 static_assert(kValidReduceGeometry(kHeadSize, 1) && kValidReduceGeometry(kHeadSize, 8));
 static_assert(!kValidReduceGeometry(kHeadSize, 9) && !kValidReduceGeometry(128, 4));
+
+// ---------------------------------------------------------------------------------------------
+// The probe ABI
+// ---------------------------------------------------------------------------------------------
+
+// Three legs over one workspace. kGemm and kGemmGemvMode share a body and differ in nothing but
+// MmadParams::disableGemv, so a behavioural difference between them isolates that knob; kVector
+// is the shipping TurboQuantPartialReducer and is the numerical reference.
+enum class ReduceLeg : std::uint32_t {
+    kGemm = 0,
+    kGemmGemvMode = 1,
+    kVector = 2,
+};
+
+struct ReduceLaunch {
+    std::uint32_t grid = 1;
+    std::uint32_t tokens = 1;
+    std::uint32_t heads = 4;
+    std::uint32_t head_size = kHeadSize;
+    std::uint32_t splits = 8;
+    std::uint32_t per_block = 4;
+    // Diagnostic only: a negative limit combines every token, which is what the pure
+    // multi-split rungs want; a real limit drives the fused-vs-combined mix.
+    std::int32_t fused_limit = -1;
+    ReduceLeg leg = ReduceLeg::kGemm;
+};
+
+struct ReduceBuffers {
+    void *workspace = nullptr;
+    void *output = nullptr;
+    // Optional: when null every (token, head) is combined.
+    void *lengths = nullptr;
+};
 
 }  // namespace ascend_micro::gemm_reduce
