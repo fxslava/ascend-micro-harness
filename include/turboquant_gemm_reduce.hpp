@@ -2,7 +2,7 @@
 
 // The Split-K final reduction as a Cube GEMV: the layout, flag and budget contract.
 //
-// Dependency-free on purpose (§6.1). The device kernel and the host gate include THIS
+// Dependency-free on purpose (Âsection 6.1). The device kernel and the host gate include THIS
 // declaration rather than each carrying a copy, so the host compile of
 // tests/cpu/test_gemm_reduce_geometry.cpp is evidence about the kernel's arithmetic and
 // not about a transcription of it.
@@ -56,7 +56,7 @@
 #include <cstdint>
 
 // The helpers below are compiled into BOTH the kernel and the host gate, which is the whole
-// point of �6.1: the two share this declaration instead of each carrying a copy. BiSheng treats
+// point of section 6.1: the two share this declaration instead of each carrying a copy. BiSheng treats
 // a plain function as __host__ only, so a device caller needs the attribute, and the host gate
 // must not see it.
 #if defined(__CCE_AICORE__)
@@ -101,7 +101,7 @@ static_assert(kAlignedSplits(1) == 8 && kAlignedSplits(8) == 8);
 // Every legal split count is one C0 block: no K tiling, one Mmad.
 static_assert(kAlignedSplits(kMaxSplits) == kC0Floats);
 
-// Those padding lanes are a CORRECTNESS hazard and not merely waste, because §3 floods every
+// Those padding lanes are a CORRECTNESS hazard and not merely waste, because Âsection 3 floods every
 // GM payload with 0x7FC0BEEF (an fp32 quiet NaN) and 0 * NaN is NaN, not 0. Two independent
 // guards, both exercised by the S < 8 rungs of the ladder:
 //   * the weight row's lanes S..7 are zeroed, so a padding partial cannot reach the sum, and
@@ -197,7 +197,7 @@ constexpr std::uint32_t kReduceSlots = 2;
 //
 // The reuse cycle weights_ready[s] -> product_ready[s] -> weights_ready[s] is primed by the
 // prologue's unconditional sets for the first min(R, kReduceSlots) tasks, so it is marked
-// before it is ever waited on, and both places drain to zero (§1).
+// before it is ever waited on, and both places drain to zero (Âsection 1).
 constexpr std::uint32_t kReducePlacesPerSlot = 2;
 constexpr std::uint32_t kReduceFlagCount = kReduceSlots * kReducePlacesPerSlot;  // 4
 
@@ -208,7 +208,7 @@ constexpr std::uint32_t kReduceFlagCount = kReduceSlots * kReducePlacesPerSlot; 
 // kTaskJoinFlag is 10. There is NO free id. The reduction stage therefore RECYCLES ids, which
 // is legal here only because AscendC::SyncAll<false>() and the attention phase's own epilogue
 // stand between the two phases and every attention place is drained to zero before the first
-// reduction set -- and which drags in §6.6's precondition: on a recycled id, every
+// reduction set -- and which drags in Âsection 6.6's precondition: on a recycled id, every
 // announcement needs its SetFlag/WaitFlag<HardEvent::x_S> fence on the pipe whose work it
 // reports, a priming set excepted, and the audit that matters is tick order per id rather than
 // per-id counts, because an unfenced announcement balances every count and still releases a

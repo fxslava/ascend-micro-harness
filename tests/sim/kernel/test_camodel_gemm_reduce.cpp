@@ -274,7 +274,8 @@ int run(const Options &o)
     tq::ReduceBuffers buffers;
     buffers.workspace = workspace.payload();
     buffers.output = output.payload();
-    buffers.lengths = o.mixed ? lengths.payload() : nullptr;
+    // Always a real allocation: the leg is chosen by fused_limit, never by a null pointer.
+    buffers.lengths = lengths.payload();
 
     launch_gemm_reduce_sim(session.stream, &launch, &buffers);
     camodel::check(aclrtSynchronizeStream(session.stream), "synchronize reduce");

@@ -27,24 +27,23 @@ using vllm_ascend::turboquant::TurboQuantRotatedOutput;
 
 namespace {
 
-// Every (token, head) of the probe needs a combine: the probe's whole point is the multi-split
-// path, so there is no fused short-circuit to model. A worker whose share is empty is produced
-// by the task slicing, not by this predicate.
-struct CombineEverything {
-    __aicore__ inline bool NeedsCombine(const uint32_t token) const
-    {
-        static_cast<void>(token);
-        return true;
-    }
-};
-
-// A predicate driven by a GM length vector, so a real-vs-fused mix can be probed: token t is
-// combined when lengths[t] exceeds the fused limit, exactly as production's IsFused decides.
-struct CombineByLength {
+// Which (token, head) needs a combine. `always` is the pure multi-split case; otherwise the
+// decision is production's IsFused, read from the same length vector the operator reads.
+//
+// The length tensor ALWAYS points at a real allocation, even when `always` is set, and the leg
+// is selected by a flag rather than by a null pointer. Passing nullptr here is what the first
+// CAModel run of this probe did, and the Cube core raised su_ccu_mpu_err_t0 on a B32 scalar
+// load at address 4 -- a null-base GM access from the branch that was not taken. A kernel that
+// never receives a null GM address cannot have that failure mode at all.
+struct CombineTokens {
     AscendC::GlobalTensor<int32_t> lengths;
-    int32_t limit;
+    int32_t limit = -1;
+    bool always = true;
     __aicore__ inline bool NeedsCombine(const uint32_t token) const
     {
+        if (always) {
+            return true;
+        }
         return lengths.GetValue(token) > limit;
     }
 };
@@ -81,15 +80,11 @@ __aicore__ inline void RunGemmLeg(GM_ADDR workspace, GM_ADDR output, GM_ADDR len
     TurboQuantGemmReducer<half, GEMV_DISABLED> reducer(&pipe);
     reducer.Init(workspace, output, heads, ascend_micro::gemm_reduce::kHeadSize, splits);
     TurboQuantRotatedOutput finisher;
-    if (lengths == nullptr) {
-        CombineEverything select;
-        reducer.Reduce(tokens * heads, perBlock, select, finisher);
-    } else {
-        CombineByLength select;
-        select.lengths.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(lengths));
-        select.limit = fusedLimit;
-        reducer.Reduce(tokens * heads, perBlock, select, finisher);
-    }
+    CombineTokens select;
+    select.lengths.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(lengths));
+    select.limit = fusedLimit;
+    select.always = fusedLimit < 0;
+    reducer.Reduce(tokens * heads, perBlock, select, finisher);
     DrainReducePhase();
 }
 
