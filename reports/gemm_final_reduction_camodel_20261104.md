@@ -255,6 +255,35 @@ hazard unreachable and its negative control unrejectable. AIV0's MTE2 is now its
 `no_landing_fence` is a negative control that fails with *statistics landing overwritten before
 its reduction*. Recorded because the model is supposed to be the gate that runs first.
 
+## 7a. An incidental finding in production code (not fixed here)
+
+Fault 4 above sent me to check every other hand-sized `Brcb` destination in this operator, and
+the shipping `TurboQuantPartialReducer` appears to have the same shape of bug.
+`fused_decode/vector/turboquant_vector_service.h:232` allocates
+
+```
+blockBuf_ = (2 * kBrcbDstLanes + 2 * kFp32PerBlock) * sizeof(float)   // 2*64 + 2*8 = 144 floats
+```
+
+with `sums` at float 128 and `invs` at float 136. `NormalizeHeads` then calls
+`Brcb(sums[j * kFp32PerBlock], runSum[j * kFp32PerBlock], 1, {1, kFp32PerBlock})`, which writes
+**eight DataBlocks = 64 floats**, i.e. floats 128..192 — **48 floats (192 bytes) past the end of
+`blockBuf_`**, landing in `outBuf_`, the next `TPipe` allocation. The same arithmetic holds for
+the copy under `baseline/vector/`.
+
+In effect it is benign, and the evidence here says so: `WriteHeads` immediately `Cast`s the full
+`heads * headSize` output into `outBuf_` before its `DataCopy`, so the corrupted bytes are
+overwritten before anyone reads them, and the vector leg scored ULP 0 on every rung with empty
+exception dumps and a clean audit. But it is still an out-of-bounds UB write, and §2's
+"non-overlapping live allocations" does not hold for it — it is benign for the same reason my
+fault 4 was invisible at one task, which is not a property to rely on.
+
+Not fixed here: it is production code, outside this task's scope, and changing a shared buffer's
+size would need the operator's own §2 and §5 gates re-run rather than this prototype's. Flagged
+as a follow-up with the arithmetic above so it can be checked rather than taken on trust. The
+`NormalizeHeads` doc comment ("sums and invs need `heads * kFp32PerBlock` floats each") is what
+makes this easy to get wrong and is probably the thing to correct first.
+
 ## 8. Isolation
 
 The variant cannot link into production. Its kernel (`tests/sim/kernel/gemm_reduce_kernel.cpp`)
