@@ -58,13 +58,19 @@ from collections import deque
 SLOTS = 2
 SUBCORES = 2
 
-Q_AIV0, Q_MTE3, Q_AIC_MTE2, Q_AIC, Q_AIV1 = range(5)
-QUEUES = 5
+# AIV0's MTE2 is its own queue, not part of its vector stream. That distinction is the whole
+# content of the landing hazard: a burst issued into MTE2 completes independently of the vector
+# work, so modelling the two on one in-order queue makes the hazard unreachable and its
+# negative control unrejectable -- which is exactly what the first version of this model did,
+# and why the two-task CAModel run found the missing fence instead.
+Q_AIV0, Q_AIV0_MTE2, Q_MTE3, Q_AIC_MTE2, Q_AIC, Q_AIV1 = range(6)
+QUEUES = 6
 
 
 def schedule(workers, *, no_prologue=False, early_fetch=False, duplicate_ready=False,
              shared_slot_id=False, skip_drain=False, idle_subcore_silent=False,
-             idle_subcore_unpaced=False, free_unconditional=False):
+             idle_subcore_unpaced=False, free_unconditional=False,
+             no_landing_fence=False):
     """Each queue's program. Keyword flags are negative controls."""
     queues = [[] for _ in range(QUEUES)]
 
@@ -97,7 +103,18 @@ def schedule(workers, *, no_prologue=False, early_fetch=False, duplicate_ready=F
 
         def stats(r):
             s = r % SLOTS
-            emit(Q_AIV0, 'stats', s, gen(r))
+            # The statistics landing is ONE shared buffer, not a per-slot one: task r+1's MTE2
+            # burst into it has to land behind task r's vector reduction of it. On the device
+            # that fence is SyncVectorToMte2; here it is this place. Modelling stats as one
+            # atomic step is what hid the hazard, and the two-task CAModel run returned inf.
+            if not no_landing_fence:
+                emit(Q_AIV0_MTE2, 'wait', ('landing_free', 0))
+            emit(Q_AIV0_MTE2, 'fetch_stats', gen(r))
+            emit(Q_AIV0_MTE2, 'set', ('landing_ready', 0))
+            emit(Q_AIV0, 'wait', ('landing_ready', 0))
+            emit(Q_AIV0, 'reduce_stats', s, gen(r))
+            if not no_landing_fence:
+                emit(Q_AIV0, 'set', ('landing_free', 0))
             emit(Q_AIV0, 'set', ('weights_staged', s))
             emit(Q_MTE3, 'wait', ('weights_staged', s))
             emit(Q_MTE3, 'store_weights', s, gen(r))
@@ -135,6 +152,10 @@ def schedule(workers, *, no_prologue=False, early_fetch=False, duplicate_ready=F
         # Prologue: prime both feedback cycles for the first min(R, 2) tasks. These sets are
         # the only ones carrying no preceding wait, which is also the one fence exemption
         # §6.6 allows on a recycled id.
+        # The landing credit is primed once per worker and retired at its end: it is a
+        # feedback cycle like any other, and an unprimed one deadlocks.
+        if tasks and not no_landing_fence:
+            emit(Q_AIV0, 'set', ('landing_free', 0))
         prologue = 0 if no_prologue else min(tasks, SLOTS)
         for r in range(prologue):
             fetch(r)
@@ -157,6 +178,8 @@ def schedule(workers, *, no_prologue=False, early_fetch=False, duplicate_ready=F
         # because the Cube is the only core writing the vector cores' landings. An empty
         # worker drains too -- "this queue is empty" is exactly what the boundary needs
         # established.
+        if tasks and not no_landing_fence:
+            emit(Q_AIV0_MTE2, 'wait', ('landing_free', 0))
         if not skip_drain:
             for q in range(QUEUES):
                 if q == Q_AIV0:
@@ -175,8 +198,8 @@ def schedule(workers, *, no_prologue=False, early_fetch=False, duplicate_ready=F
 def explore(queues):
     keys = sorted({op[1] for q in queues for op in q if op[0] in ('set', 'wait')})
     index = {key: i for i, key in enumerate(keys)}
-    PARTIAL, WEIGHT, PRODUCT = 0, SLOTS, 2 * SLOTS
-    start = ((0,) * QUEUES, (0,) * len(keys), (-1,) * (3 * SLOTS), (-1,))
+    PARTIAL, WEIGHT, PRODUCT, LANDING = 0, SLOTS, 2 * SLOTS, 3 * SLOTS
+    start = ((0,) * QUEUES, (0,) * len(keys), (-1,) * (3 * SLOTS + 1), (-1,))
     seen, todo, terminals = {start}, deque([start]), 0
 
     while todo:
@@ -200,9 +223,15 @@ def explore(queues):
                 slot, generation = args
                 assert o[PARTIAL + slot] == -1, 'partial cube overwritten before its Mmad'
                 o[PARTIAL + slot] = generation
-            elif op == 'stats':
+            elif op == 'fetch_stats':
+                generation, = args
+                assert o[LANDING] == -1, 'statistics landing overwritten before its reduction'
+                o[LANDING] = generation
+            elif op == 'reduce_stats':
                 slot, generation = args
+                assert o[LANDING] == generation, 'wrong statistics generation reduced'
                 assert o[WEIGHT + slot] == -1, 'weight row overwritten before its Mmad'
+                o[LANDING] = -1
                 o[WEIGHT + slot] = generation
             elif op == 'store_weights':
                 slot, generation = args
@@ -278,6 +307,7 @@ def main():
         'idle_subcore_silent': 'the idle subcore never consumes its token',
         'idle_subcore_unpaced': 'the idle subcore drains but does not pace the Cube',
         'free_unconditional': 'a short worker leaves its cube credit set',
+        'no_landing_fence': 'the next task overwrites the landing being reduced',
     }
     for option, why in negatives.items():
         try:
