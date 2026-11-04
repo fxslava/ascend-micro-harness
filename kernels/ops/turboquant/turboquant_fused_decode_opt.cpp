@@ -320,6 +320,11 @@ public:
         GemmCombineSelect select{this};
         reducer.Reduce(numTokens_ * numHeads_, reduceTasksPerBlock, select, basis_);
     }
+
+    // The attention phase's transient UB, for the reducer to alias its panels onto. Handed out
+    // as a reference rather than an address so the reducer's own static_assert is what checks
+    // it is long enough.
+    __aicore__ inline auto &ReduceGemmSharedPool() { return vector_.TransientPool(); }
 #endif
 
 private:
@@ -749,27 +754,29 @@ private:
 //   * The reducer is constructed AFTER SyncAll<false>(), as before, but it is not free: see the
 //     UB deficit below.
 //
-// THE SWITCH IS OFF BY DEFAULT AND TURNING IT ON WILL NOT COMPILE. That is deliberate.
-// include/turboquant_gemm_reduce.hpp computes the arithmetic: the batched reducer claims 27264
-// UB bytes against the vector reducer's 3360, a net 23904, and this operator has 4256 bytes of
-// headroom under the 192 KB window -- a deficit of 19648. A wiring that merely compiled would
-// overflow UB silently, so the static_assert below fails with the number instead, and the three
-// ways out (a TPipe::InitBufPool overlay on a dead attention buffer, a band-wise panel, or a
-// smaller kGemmBatchRows -- only the first two can work) are documented where the numbers are.
+// THE SWITCH'S UB COMES FROM AN OVERLAY, NOT FROM HEADROOM. The reducer's panels do not fit
+// what this operator has left: it claims 27264 UB bytes against the vector reducer's 3360, a
+// net 23904, and only 4256 are free under the 192 KB window -- a 19648-byte deficit. So the
+// reducer allocates from a TBufPool aliased onto the attention phase's transient pool, which
+// SyncAll<false>() above has made dead. The alias costs zero bytes: InitBufPool's shared
+// overload sets the new pool's startAddr_ to the shared one's and does not advance the hardware
+// pool. include/turboquant_gemm_reduce.hpp carries the arithmetic and the static_assert that
+// the reducer fits inside that pool.
 #if defined(ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE) && ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE
 #include "fused_decode/cube/turboquant_gemm_reduce_service.h"
 
-static_assert(ascend_micro::gemm_reduce::kGemmReducerNetUbBytes <=
-                  ascend_micro::gemm_reduce::kOperatorUbHeadroomBytes,
-              "the Cube GEMM reduction does not fit this operator's UB headroom: it needs "
-              "23904 net bytes and 4256 are free, a 19648-byte deficit. Overlay its panels on "
-              "a dead attention buffer with TPipe::InitBufPool, or switch the panel to "
-              "band-wise normalise. See the budget in include/turboquant_gemm_reduce.hpp.");
+// The restatement check for the pool, the counterpart of the one in
+// include/turboquant_fused_decode_opt.hpp for kUbEnd: the contract header cannot include the
+// vector service, so it restates the pool's length, and this pins the two together.
+static_assert(ascend_micro::fused_decode_opt::kTransientPoolBytes ==
+                  ascend_micro::gemm_reduce::kGemmSharedPoolBytes,
+              "turboquant_gemm_reduce.hpp restates the transient pool's length; update "
+              "kGemmSharedPoolBytes there to match kTransientPoolBytes");
 
 #define ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE)                                                                    \
     do {                                                                                                             \
         ascend_micro::gemm_reduce::TurboQuantBatchedGemmReducer<TYPE> reducer(&pipe);                                 \
-        reducer.Init(workspace, output, numHeads, headSize, numSplits);                                               \
+        reducer.Init(workspace, output, numHeads, headSize, numSplits, op.ReduceGemmSharedPool());                    \
         op.ReduceGemm(reducer, reduceTasksPerBlock);                                                                  \
     } while (0)
 #else

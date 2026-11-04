@@ -414,6 +414,17 @@ public:
         }
     }
 
+    // The attention phase's transient UB, as a pool the reduction phase can alias onto. Handing
+    // out a reference rather than a size is what keeps the two in step: the reduction asks the
+    // pool how long it is, so shrinking the pool is a compile error at the reduction's own
+    // static_assert rather than an overlap nobody notices. See InitBuffers.
+    __aicore__ inline AscendC::TBufPool<AscendC::TPosition::VECCALC> &TransientPool()
+    {
+        return transientPool_;
+    }
+    static constexpr uint32_t kTransientPoolBytes =
+        ascend_micro::fused_decode_opt::kTransientPoolBytes;
+
     // The Cube's two Fixpipe destinations. The AIC names them by the offsets its own TPipe handed out, so
     // both halves of the launch have to allocate the same list in the same order -- see InitBuffers.
     __aicore__ inline AscendC::LocalTensor<float> Scores(const uint32_t window = 0)
@@ -789,9 +800,35 @@ private:
             pipe->InitBuffer(scaleTileBuf_[s], sizes[9 + 2 * s]);
             SkewBank(pipe, kIngestSlots + s);
         }
-        pipe->InitBuffer(nzOperandBuf_, sizes[15]);
-        pipe->InitBuffer(accBuf_, sizes[16]);
-        pipe->InitBuffer(queryWorkBuf_, sizes[17]);
+        // THE TRANSIENT POOL, and the third rule of this list.
+        //
+        // These three buffers come out of a TBufPool instead of straight off the pipe, so that
+        // the Cube GEMM reduction can alias its own pool onto the same bytes once the attention
+        // phase is over. TPipe::InitBufPool(pool, len, shareBuf) sets the new pool's startAddr_
+        // to shareBuf's and does NOT advance the hardware pool, so the reduction's panels cost
+        // nothing; without it they need 23904 bytes the operator does not have.
+        //
+        // Three properties make this safe, and all three are why it is these three buffers:
+        //
+        //   * They are dead by then. nzOperandBuf_ is the tile ingest's NZ staging operand,
+        //     queryWorkBuf_ the query staging, and accBuf_ the per-task online-softmax
+        //     accumulator whose result StageTaskOutput has already written to the GM workspace.
+        //     AscendC::SyncAll<false>() stands between Process() and the reduction, so nothing
+        //     reads any of them afterwards. TurboQuantQueryBasis's buffers are NOT in here on
+        //     purpose: the output-stage finisher runs during the reduction and reads the Pi
+        //     signs in signBuf_, which are content, not scratch.
+        //   * The pool is exactly as long as the three buffers it holds, so kUbEnd and every
+        //     later buffer's offset are unchanged. That matters for the first rule above: the
+        //     Cube's Fixpipe windows sit at UB offsets 0 and kScoreBytes and nothing here moves
+        //     them, and the reduction's own dual-destination panels land at the same offset on
+        //     every core because InitBuffers runs on all three.
+        //   * It is allocated on every role, like the rest of this list. A pool created on one
+        //     core and not another would put the reduction's panels at different addresses on
+        //     the AIC and the AIVs, which is the exact failure the first rule warns about.
+        pipe->InitBufPool(transientPool_, kTransientPoolBytes);
+        transientPool_.InitBuffer(nzOperandBuf_, sizes[15]);
+        transientPool_.InitBuffer(accBuf_, sizes[16]);
+        transientPool_.InitBuffer(queryWorkBuf_, sizes[17]);
         pipe->InitBuffer(queryInBuf_, sizes[18]);
         pipe->InitBuffer(queryOperandBuf_, sizes[19]);
         pipe->InitBuffer(probOperandBuf_, sizes[20]);
@@ -1138,6 +1175,9 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> nzOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> accBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryWorkBuf_;
+    // The three above live in this pool; the Cube GEMM reduction aliases onto it. See
+    // InitBuffers for why it is exactly these three and why its length is exactly their sum.
+    AscendC::TBufPool<AscendC::TPosition::VECCALC> transientPool_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryInBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scoreBuf_[kScoreWindows];

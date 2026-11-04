@@ -520,12 +520,18 @@ constexpr std::uint32_t kGemmReducerUbBytes = kBatchSlots * kGemmPanelUbBytes +
 static_assert(kGemmReducerUbBytes == 27264, "the batched reducer's UB claim, pinned");
 
 // =============================================================================================
-// THE INTEGRATION BUDGET, AND WHY THE SWITCH IS OFF BY DEFAULT
+// THE INTEGRATION BUDGET: THE OVERLAY, AND WHAT IT HAD TO BE MEASURED AGAINST
 // =============================================================================================
 //
-// This is an OBJECT and not a remark because the answer is negative: the batched form does not
-// fit the production operator's remaining UB, and a wiring that merely compiles would overflow
-// the window silently.
+// The batched form's panels do not fit the operator's LEFTOVER UB -- the arithmetic below says
+// by how much -- so they do not use leftover UB. They come from a TBufPool aliased onto the
+// attention phase's transient pool, which SyncAll<false>() has made dead by the time the
+// reduction runs. TPipe::InitBufPool(pool, len, shareBuf) sets the new pool's startAddr_ to
+// shareBuf's and does NOT advance the hardware pool, so the alias costs zero bytes.
+//
+// The deficit arithmetic is kept rather than deleted, because it is what makes the overlay a
+// decision instead of a habit: without it the reduction needs 23904 bytes the operator does
+// not have, and the next person to change a size here has to be able to see that.
 //
 // turboquant_fused_decode_opt.hpp asserts
 //     kUbEnd + kBasisUbBytes + kReducerUbBytes + 256 <= 192 * 1024
@@ -549,29 +555,56 @@ constexpr std::uint32_t kGemmReducerNetUbBytes =
 constexpr std::uint32_t kGemmReducerUbDeficitBytes =
     kGemmReducerNetUbBytes - kOperatorUbHeadroomBytes;  // 19648
 static_assert(kGemmReducerNetUbBytes > kOperatorUbHeadroomBytes,
-              "if this ever fails the deficit is gone and the switch can default on");
+              "the deficit is what the overlay below exists for; if this ever fails the "
+              "reducer fits the leftover headroom and the overlay can be dropped");
 static_assert(kGemmReducerUbDeficitBytes == 19648, "the deficit, pinned");
 
-// Three ways out, none of them taken here because each carries the OPERATOR's section 2 and
-// section 5 burden rather than this stage's, and the choice is not the stage's to make:
+// THE OVERLAY, which is the way out that was taken.
 //
-//   1. Overlay. TPipe::Reset() is a real allocator rewind -- ResetPool() sets maxAddr = 0 for
-//      every hardware pool -- and AscendC::SyncAll<false>() stands between the attention phase
-//      and the reduction, so every attention buffer is dead by then. What blocks a bare Reset()
-//      is the FINISHER: TurboQuantQueryBasis::FinishHeads reads pairBuf_/signBuf_/inBuf_/
-//      floatBuf_, and the Pi signs in signBuf_ are CONTENT, so a rewind invalidates them and
-//      they would have to be restaged. TPipe::InitBufPool(pool, len, shareBuf) is the narrower
-//      tool: alias the reduction's pool onto one named attention buffer instead of all of them.
-//   2. Band-wise normalise. The panel only has to hold the channels being normalised, so a
+// TurboQuantVectorDecodeService::InitBuffers allocates three of the attention phase's transient
+// buffers -- the tile ingest's NZ staging operand, the query staging and the per-task
+// online-softmax accumulator -- from a TBufPool of exactly their summed length, and the
+// reduction aliases its own pool onto it. Restated here, like the three terms above, because
+// this header is dependency-free; the vector service static_asserts the restatement against its
+// own kTransientPoolBytes, so a change on either side is a compile error.
+//
+// Why those three and not a bare TPipe::Reset(). Reset() is a real allocator rewind --
+// ResetPool() sets maxAddr = 0 for every hardware pool -- but it rewinds EVERYTHING, and
+// TurboQuantQueryBasis::FinishHeads runs during the reduction and reads the Pi signs in
+// signBuf_, which are content and not scratch. A rewind invalidates them. The pool is the
+// narrower tool: it names the bytes being reused instead of reusing all of them.
+//
+// Why the pool's length is exactly the sum of what it holds: kUbEnd and every buffer allocated
+// after it keep their offsets, so the Cube's dual-destination Fixpipe windows at UB offsets 0
+// and kScoreBytes do not move -- and neither do the reduction's own dual-destination panels,
+// which land at the same address on every core because InitBuffers runs on all three roles.
+constexpr std::uint32_t kGemmSharedPoolBytes = 16384 + 8192 + 8192;  // kUbSizes[15..17]
+static_assert(kGemmSharedPoolBytes == 32768, "the transient pool, pinned");
+static_assert(kGemmReducerUbBytes <= kGemmSharedPoolBytes,
+              "the Cube GEMM reduction allocates from the attention phase's transient pool, so "
+              "it must fit inside it. If this fails, either shrink the reducer (a band-wise "
+              "panel halves it) or widen the pool by moving another dead attention buffer into "
+              "it -- and widening it is NOT free: the pool must stay exactly as long as what it "
+              "holds, or kUbEnd moves and the dual-destination Fixpipe offsets move with it.");
+// Headroom the overlay leaves unspent, for the next thing that needs UB here.
+constexpr std::uint32_t kGemmSharedPoolSpareBytes =
+    kGemmSharedPoolBytes - kGemmReducerUbBytes;  // 5504
+static_assert(kGemmSharedPoolSpareBytes == 5504, "spare in the pool, pinned");
+
+// The two ways out that were NOT taken, kept because they are what to reach for if the reducer
+// ever outgrows the pool:
+//
+//   1. Band-wise normalise. The panel only has to hold the channels being normalised, so a
 //      64-channel band drops it from 8 KB to 2 KB a slot; NormalizeHeads is elementwise per
 //      row and WriteHeads becomes a strided GM burst. One panel slot then fits in 2880 bytes
-//      net, inside the headroom -- but a single slot removes the Cube/AIV panel overlap, which
-//      is most of what the form buys.
-//   3. A smaller kGemmBatchRows. This does NOT work: at 8 rows the net cost is still 11616
-//      bytes and at 4 rows 5472, both over the headroom, and M = 4 gives up the dense line.
+//      net, inside even the leftover headroom -- but a single slot removes the Cube/AIV panel
+//      overlap, which is most of what the form buys.
+//   2. A smaller kGemmBatchRows. This does NOT work as a way to fit the leftover headroom: at
+//      8 rows the net cost is still 11616 bytes and at 4 rows 5472, both over 4256, and M = 4
+//      gives up the dense line. It would shrink the pool requirement, though.
 constexpr std::uint32_t kGemmUbBytes = kGemmReducerUbBytes;
 static_assert(kGemmUbBytes + kUbReadPadBytes <= kUbWindowBytes,
-              "the reducer alone fits the window; it is the SUM with the operator that does not");
+              "the reducer alone fits the window; the overlay is what makes the SUM fit");
 
 // ---------------------------------------------------------------------------------------------
 // Batch formation

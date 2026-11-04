@@ -36,6 +36,19 @@ static_assert(aligned_allocations());
 static_assert((8192 + 32) / 32 % 16 != 0, "packed slots must use different banks");
 static_assert((2048 + 32) / 32 % 16 != 0, "scale slots must use different banks");
 constexpr std::uint32_t kUbEnd = ub_end();
+
+// The attention phase's transient pool: kUbSizes[15..17], which are the tile ingest's NZ
+// staging operand, the per-task online-softmax accumulator and the query staging. The vector
+// service allocates those three from a TBufPool of exactly this length so the Cube GEMM
+// reduction can alias its own pool onto the same bytes once SyncAll<false>() has made them
+// dead (turboquant_gemm_reduce.hpp carries that budget and restates this number).
+//
+// Exactly their sum, and that is load-bearing: a longer pool would move kUbEnd and every
+// buffer allocated after it, and the Cube's dual-destination Fixpipe windows at UB offsets 0
+// and kScoreBytes are addressed by offset on three cores with nothing in the toolchain checking
+// that they agree.
+constexpr std::uint32_t kTransientPoolBytes = kUbSizes[15] + kUbSizes[16] + kUbSizes[17];
+static_assert(kTransientPoolBytes == 32768, "the transient pool, pinned on both sides");
 constexpr std::uint32_t kBasisUbBytes = 8 * 256 * (2 + 4 + 2 + 4) + 256 * 4 +
     (7 * 256 + 2 * 256 + 16) * 4 + (2 * 256 + 256 + 64 + 8 + 8 * 256) * 4;
 constexpr std::uint32_t kReducerUbBytes = (2 * 256 + 16) * 4 + 5 * 8 * 4 +

@@ -595,8 +595,51 @@ class TurboQuantBatchedGemmReducer {
 public:
     __aicore__ inline explicit TurboQuantBatchedGemmReducer(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
+    // `sharedPool`, when given, is the attention phase's transient UB pool
+    // (TurboQuantVectorDecodeService::TransientPool()). Every UB buffer below is then allocated
+    // from a pool aliased onto it, which costs zero bytes -- InitBufPool's shared overload sets
+    // the new pool's startAddr_ to the shared one's and does not advance the hardware pool. The
+    // bytes are safe to reuse because AscendC::SyncAll<false>() stands between Process() and
+    // the reduction; see the budget in include/turboquant_gemm_reduce.hpp for why it is those
+    // three buffers and not a bare TPipe::Reset().
+    //
+    // Without a pool -- the standalone probe -- the buffers come straight off the pipe, which
+    // is what every CAModel rung of this reducer measures.
+    template <typename SharedPool>
+    __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *output, const uint32_t numHeads,
+                                const uint32_t headSize, const uint32_t numSplits,
+                                SharedPool &sharedPool)
+    {
+        pipe_->InitBufPool(ubPool_, kGemmReducerUbBytes, sharedPool);
+        pooled_ = true;
+        InitCommon(workspace, output, numHeads, headSize, numSplits);
+    }
+
     __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *output, const uint32_t numHeads,
                                 const uint32_t headSize, const uint32_t numSplits)
+    {
+        pooled_ = false;
+        InitCommon(workspace, output, numHeads, headSize, numSplits);
+    }
+
+private:
+    // Every UB allocation goes through here, so the pooled and unpooled legs cannot drift in
+    // the ORDER they allocate -- which matters more than it looks: the panels are a
+    // dual-destination Fixpipe destination, and the AIC names them by the offset its own TPipe
+    // handed out, so all three roles have to walk the same list.
+    template <typename Buf>
+    __aicore__ inline void AllocUb(Buf &buf, const uint32_t bytes)
+    {
+        if (pooled_) {
+            ubPool_.InitBuffer(buf, bytes);
+        } else {
+            pipe_->InitBuffer(buf, bytes);
+        }
+    }
+
+    __aicore__ inline void InitCommon(__gm__ void *workspace, __gm__ void *output,
+                                      const uint32_t numHeads, const uint32_t headSize,
+                                      const uint32_t numSplits)
     {
         numHeads_ = numHeads;
         headSize_ = headSize;
@@ -627,15 +670,16 @@ public:
         // makes the Cube target an unallocated tensor -- su_ccu_mpu_err_t0 on cubecore0 -- while
         // the arithmetic still comes out right.
         for (uint32_t slot = 0; slot < kBatchSlots; ++slot) {
-            pipe_->InitBuffer(panelUbBuf_[slot], kGemmPanelUbBytes);
+            AllocUb(panelUbBuf_[slot], kGemmPanelUbBytes);
         }
-        pipe_->InitBuffer(statsUbBuf_, kStatsUbBytes);
-        pipe_->InitBuffer(zeroUbBuf_, kSliceFractalFloats * sizeof(float));
-        pipe_->InitBuffer(outUbBuf_, kGemmPanelRows * headSize * sizeof(scalar_t));
+        AllocUb(statsUbBuf_, kStatsUbBytes);
+        AllocUb(zeroUbBuf_, kSliceFractalFloats * sizeof(float));
+        AllocUb(outUbBuf_, kGemmPanelRows * headSize * sizeof(scalar_t));
         AscendC::PipeBarrier<PIPE_ALL>();
         PrimeVectorState();
     }
 
+public:
     // `total` is numTokens * numHeads; `perBlock` the production tiling's reduceTasksPerBlock.
     template <typename Select, typename Finisher>
     __aicore__ inline void Reduce(const uint32_t total, const uint32_t perBlock, Select &select,
@@ -1236,6 +1280,10 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> statsUbBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> zeroUbBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> outUbBuf_;
+    // The overlay: when Init() was given the attention phase's transient pool, every UB buffer
+    // above comes out of this one, aliased onto those bytes at zero cost.
+    AscendC::TBufPool<AscendC::TPosition::VECCALC> ubPool_;
+    bool pooled_ = false;
     AscendC::GlobalTensor<float> workspaceGm_;
     AscendC::GlobalTensor<scalar_t> outputGm_;
     uint32_t batchTask_[kMaxGemmBatchesPerBlock] = {};

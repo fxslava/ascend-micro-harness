@@ -134,7 +134,7 @@ only because of §1's containment; the second is the MTE2 instruction count in �
 ## 5. Protocol gates
 
 `REFINEMENT_OF_COMBAT_KERNELS.md`, each gate recorded as met, failed, partial or unavailable.
-**Read §9 first: the full ladder was not re-run on the final tree**, so several gates below are
+**Read §10 first: the full ladder was not re-run on the final tree**, so several gates below are
 partial by scope rather than by outcome.
 
 | Gate | Status | Evidence |
@@ -153,7 +153,8 @@ partial by scope rather than by outcome.
 | §5 `m2:2` ordering defect | **FIXED, and measured** | §6. This is the gate the M = 1 form failed |
 | §5 instruction census | **MET** | §6, from each run's own `instr_popped_log.dump` |
 | §5 intersecting-interval overlap claim | **NOT MADE** | no Gantt export was run for this stage, so no overlap is claimed |
-| Integration into the operator | **WIRED, AND BLOCKED** | the switch compiles end to end and fails only on the UB deficit — §7.5 |
+| Integration into the operator | **WIRED, via a UB overlay** | `-DTQ_GEMM_REDUCE=ON` builds and runs; the reducer's 27264 UB bytes come from a `TBufPool` aliased onto the attention phase's dead 32768-byte transient pool, so the 19648-byte deficit is paid without spending headroom — §7.5 |
+| Integration regression, default path | **MET** | the pool change touches the DEFAULT path too (three attention buffers now come from a pool), so the operator's own CAModel ladder was re-run — §10 |
 | §6 inter-wave gates | **NOT APPLICABLE / UNAVAILABLE** | the probe runs grids of 1–2 blocks, far below the physical block count, so no second wave exists. A production-shaped grid brings §6 into scope and it has **not** been exercised |
 | Physical NPU | **UNAVAILABLE** | no NPU on this host |
 
@@ -238,46 +239,71 @@ faulting.** A run is not evidence until its exception dumps are empty and its ow
    read or written past its live tokens"* at `tokens = 8` and `16` and nowhere else, which is
    why the M = 1 ladder's rungs (1, 2, 5) never showed it. Sized `tokens + 1` now.
 
-### 7.5 The integration finding: the operator has 19648 bytes too little UB
+### 7.5 The integration: a `TBufPool` overlay, because the operator has 19648 bytes too little
 
-The wiring is complete, and the only thing blocking it is UB — now a compile-time fact rather
-than a claim. Enabling `-DTQ_GEMM_REDUCE=ON` produces **exactly two errors, both the same
-deliberate `static_assert`** (once per device leg), so the include, `ReduceGemm()`,
-`GemmCombineSelect`, the macro and the reducer instantiation all resolve against the operator's
-real types:
+The reducer's panels do not fit what the operator has left, and the arithmetic is kept as a
+compile-time object rather than deleted, because it is what makes the overlay a decision instead
+of a habit. The batched reducer claims 27264 UB bytes (two 8224-byte panel slots, a 6208-byte
+statistics arena, 4096 of fp16 staging, a 512-byte zero stage) and replaces the vector reducer's
+3360, a net 23904. The operator's own assert leaves
+`196608 − 142304 − 46432 − 3360 − 256 = 4256`. **Deficit 19648.**
 
+So the reducer does not spend leftover UB. It allocates from a `TBufPool` aliased onto the
+attention phase's transient pool:
+
+```cpp
+// TurboQuantVectorDecodeService::InitBuffers -- exactly kUbSizes[15..17] long
+pipe->InitBufPool(transientPool_, kTransientPoolBytes);   // 16384 + 8192 + 8192 = 32768
+transientPool_.InitBuffer(nzOperandBuf_, sizes[15]);
+transientPool_.InitBuffer(accBuf_,       sizes[16]);
+transientPool_.InitBuffer(queryWorkBuf_, sizes[17]);
+
+// TurboQuantBatchedGemmReducer::Init -- costs zero bytes
+pipe_->InitBufPool(ubPool_, kGemmReducerUbBytes, sharedPool);   // 27264 <= 32768
 ```
-turboquant_fused_decode_opt.cpp:762:1: error: static assertion failed due to requirement
-'kGemmReducerNetUbBytes <= kOperatorUbHeadroomBytes': the Cube GEMM reduction does not fit
-this operator's UB headroom: it needs 23904 net bytes and 4256 are free, a 19648-byte deficit.
-```
 
-The arithmetic: the batched reducer claims 27264 UB bytes (two 8224-byte panel slots, a
-6208-byte statistics arena, 4096 of fp16 staging, a 512-byte zero stage) and replaces the vector
-reducer's 3360, a net 23904. The operator's own assert leaves
-`196608 - 142304 - 46432 - 3360 - 256 = 4256`. Those three terms are restated in
-`include/turboquant_gemm_reduce.hpp` and pinned by a `static_assert` in
-`include/turboquant_fused_decode_opt.hpp`, so a change on either side is a compile error and not
-a drift in the number. `scripts/gemm_reduce_switch_gate.sh` is the negative control: it fails if
-the switch ever compiles, because that would mean the headroom changed or the assert was removed.
+`InitBufPool`'s shared overload sets `bufPool.startAddr_ = shareBuf.startAddr_` and **does not
+advance the hardware pool** — read off `kernel_tpipe_impl.h`, not the API reference. So the
+reduction's 27264 bytes land on top of 27264 of the attention phase's dead 32768, leaving 5504
+spare in the pool and the operator's 4256 of headroom untouched.
 
-Three ways out. None is taken here, because each carries the **operator's** §2 and §5 burden
-rather than this stage's, and the choice is not this stage's to make:
+**Why those three buffers.** `nzOperandBuf_` is the tile ingest's NZ staging operand,
+`queryWorkBuf_` the query staging, and `accBuf_` the per-task online-softmax accumulator whose
+result `StageTaskOutput` has already written to the GM workspace. `SyncAll<false>()` stands
+between `Process()` and the reduction, so nothing reads any of them afterwards.
 
-* **Overlay.** `TPipe::Reset()` is a real allocator rewind — `ResetPool()` sets `maxAddr = 0`
-  for every hardware pool — and `SyncAll<false>()` stands between the attention phase and the
-  reduction, so every attention buffer is dead by then. What blocks a bare `Reset()` is the
-  **finisher**: `TurboQuantQueryBasis::FinishHeads` reads `pairBuf_`/`signBuf_`/`inBuf_`/
-  `floatBuf_`, and the Pi signs in `signBuf_` are *content*, so a rewind invalidates them and
-  they would have to be restaged. `TPipe::InitBufPool(pool, len, shareBuf)` is the narrower
-  tool: alias the reduction's pool onto one named dead attention buffer instead of all of them.
+**Why not a bare `TPipe::Reset()`.** It is a real allocator rewind — `ResetPool()` sets
+`maxAddr = 0` for every hardware pool — but it rewinds *everything*, and
+`TurboQuantQueryBasis::FinishHeads` runs *during* the reduction and reads the Pi signs in
+`signBuf_`, which are content and not scratch. A rewind invalidates them. The pool names the
+bytes being reused instead of reusing all of them.
+
+**Why the pool's length is exactly the sum of what it holds.** `kUbEnd` and every buffer
+allocated after it keep their offsets. That matters because the Cube's dual-destination Fixpipe
+windows sit at UB offsets 0 and `kScoreBytes` and are addressed by offset on three cores with
+nothing in the toolchain checking they agree — and the reduction's *own* dual-destination panels
+have the same requirement, which is why `InitBuffers` and the reducer's `Init` both run on every
+role. The operator's host contract gate independently reports `UB=142304+256` after the change,
+unchanged.
+
+Two checks, because a build that succeeds does not say the overlay is why:
+
+| `scripts/gemm_reduce_switch_gate.sh` | result |
+| --- | --- |
+| `-DTQ_GEMM_REDUCE=ON` must build at `-Wall -Werror` | **PASS** |
+| negative control: pool length cut to 16384 must be rejected | **PASS** — `static assertion failed … 'kGemmReducerUbBytes <= kGemmSharedPoolBytes'` |
+
+The two ways out that were **not** taken, kept because they are what to reach for if the reducer
+ever outgrows the pool:
+
 * **Band-wise normalise.** The panel only has to hold the channels being normalised, so a
   64-channel band drops it from 8 KB to 2 KB a slot; `NormalizeHeads` is elementwise per row and
   `WriteHeads` becomes a strided GM burst. One panel slot then fits in 2880 bytes net, inside
-  the headroom — but a single slot removes the Cube/AIV panel overlap, which is most of what the
-  form buys.
-* **A smaller `kGemmBatchRows`.** This does **not** work: at 8 rows the net cost is still 11616
-  bytes and at 4 rows 5472, both over the headroom, and `M = 4` gives up the dense line.
+  even the leftover headroom — but a single slot removes the Cube/AIV panel overlap, which is
+  most of what the form buys.
+* **A smaller `kGemmBatchRows`.** This does **not** work as a way to fit the leftover headroom:
+  at 8 rows the net cost is still 11616 bytes and at 4 rows 5472, both over 4256, and `M = 4`
+  gives up the dense line. It would shrink the pool requirement, though.
 
 ## 8. Numerical result, on the final tree
 
@@ -301,25 +327,67 @@ What this does **not** establish: it bounds the batched form's fp32 accumulator 
 the vector recurrence to below half an fp16 ULP without measuring it. The GEMM sums `S` products
 inside one Cube accumulator while the recurrence rescales a running sum `S-1` times.
 
-## 9. What was and was not run on the final tree
+## 9. The overlay, running
+
+`scripts/gemm_reduce_overlay_camodel.sh` builds the operator with `-DTQ_GEMM_REDUCE=ON` and runs
+its own CAModel probe, so the Cube GEMM reduction reads and writes inside the attention phase's
+aliased UB. The split rungs are the ones that reach the reduction at all — `NeedsReduction()` is
+false at one split — and the single-split rungs are the control for whether moving three
+attention buffers into a `TBufPool` disturbed the attention phase itself.
+
+| rung | geometry | result |
+| --- | --- | --- |
+| `overlay-splits-4` | tiles=6, splits=4, grid=4, heads=16 | **PASS** — `comparison=exact inputs=unchanged guards=0x5A-intact` |
+| `overlay-splits-2` | tiles=6, splits=2, grid=2, heads=16 | **PASS** — same |
+| `overlay-canary-0` | page 0, splits=1 | **PASS** (control) |
+| `overlay-canary-7` | page 7, splits=1 | **PASS** (control) |
+| `overlay-tiles-7` | tiles=7, splits=1 | **PASS** (control) |
+
+Each rung's own exception dumps are empty and its own traces audit clean. `comparison=exact` is
+the operator's bitwise gate against its oracle, `inputs=unchanged` that it wrote nothing it
+should not have, and `guards=0x5A-intact` the exterior canaries on every buffer.
+
+This is the gate the switch gate cannot be. A pool aliased onto the *wrong* bytes compiles
+exactly as well as one aliased onto the right ones; what distinguishes them is a run in which
+the reduction's panels overlap live attention data and the context comes out wrong. It does not.
+
+## 10. What was and was not run on the final tree
 
 This matters more than usual here, because the tree changed after the wider ladder ran.
 
 **Run on the final tree:** the strict device build of the probe, the host gate and the
-production operator's default path; the host geometry gate; the switch gate; and the
-`S ∈ {1,4,5,8}` sweep with its canary, workspace-immutability and trace-audit checks.
+production operator's default path; the host geometry gate; the switch gate (both legs); the
+overlay CAModel rungs of §9; the `S ∈ {1,4,5,8}` sweep with its canary,
+workspace-immutability and trace-audit checks; and the operator's own default-path CAModel
+ladder, which the pool change touches whether or not the switch is on:
+
+| `scripts/run_fused_decode_opt_camodel.sh ladder`, switch OFF | result |
+| --- | --- |
+| `canary-0`, `canary-4`, `canary-7`, `canary-tail` | **PASS** — logical page 0, K/2, K-1 and the final strip in the final page |
+| `tiles-3`, `tiles-6`, `tiles-7` | **PASS** |
+| `repeat` (2 launches, 17 heads), `empty`, `split-empty` (6 tiles, 4 splits) | **PASS** |
+
+All ten rungs report `comparison=exact inputs=unchanged guards=0x5A-intact` with clean trace
+audits, and the host contract gate reports `UB=142304+256` — `kUbEnd` unchanged, which is the
+independent check that the transient pool is exactly as long as the three buffers it replaced
+and no later UB offset moved.
+
+**Not flipped:** `TQ_GEMM_REDUCE` still defaults OFF. It builds and runs, but the evidence
+behind it is two split rungs against the default path's ten plus years of use, and making the
+shipping operator's reduction a Cube GEMM is a decision with its own §4 and §5 burden at
+production shapes — §6's inter-wave gates among them. Turning it on is one CMake flag.
 
 **Run on an earlier build and NOT re-run:** the rest of the ladder — `live = 1,2,3,5,7,9,15`
 ragged batches, batch-ring depth and wrap at 16/32/44/64 tasks, two real Split-K workers, an
 empty worker, the `--mixed` fused-token rungs, the varied-fixture regressions and the GEMV-knob
 rungs. Every one of those passed, but on the build *before* the per-row weight-block fix
 (§7.3), so they are evidence about a schedule one change away from this one. The full ladder is
-one command (§11) and re-running it is the obvious next step.
+one command (§12) and re-running it is the obvious next step.
 
 **Not run at all:** the Python token model's last full pass is against the schedule before the
 per-worker ring fix (§7.4); physical hardware; any overlap measurement; §6's inter-wave gates.
 
-## 10. Isolation
+## 11. Isolation
 
 The variant cannot link into production. Its kernel
 (`tests/sim/kernel/gemm_reduce_kernel.cpp`) and its service header
@@ -331,7 +399,7 @@ transcription of it. The combine's close-out calls the production `NormalizeHead
 `WriteHeads` and output-stage finisher, and the dual-destination Fixpipe uses production's own
 `dualDstCtl`/`subBlockId` idiom; nothing is reimplemented but the packing and the schedule.
 
-## 11. Commands
+## 12. Commands
 
 ```bash
 # Container plumbing (the toolkit is in Docker on this host, not in WSL).
@@ -359,6 +427,21 @@ wsl -d Ubuntu-22.04 -- bash scripts/gemm_reduce_container.sh run scripts/gemm_re
 ```
 
 ```bash
+# The overlay: TQ_GEMM_REDUCE=ON must build, and a pool too short must be rejected.
+wsl -d Ubuntu-22.04 -- bash scripts/gemm_reduce_container.sh run scripts/gemm_reduce_switch_gate.sh
+```
+
+```bash
+# The operator itself, running the Cube GEMM reduction out of the aliased pool.
+wsl -d Ubuntu-22.04 -- bash scripts/gemm_reduce_container.sh run scripts/gemm_reduce_overlay_camodel.sh
+```
+
+```bash
+# The default path's own regression, which the pool change also touches.
+wsl -d Ubuntu-22.04 -- bash scripts/gemm_reduce_container.sh run scripts/run_fused_decode_opt_camodel.sh ladder
+```
+
+```bash
 # One rung, and the diagnosis path when it fails.
 wsl -d Ubuntu-22.04 -- bash scripts/gemm_reduce_container.sh run scripts/gemm_reduce_run.sh TAG -- --leg batched --splits 8 --tokens 4 --heads 4
 ```
@@ -367,13 +450,18 @@ wsl -d Ubuntu-22.04 -- bash scripts/gemm_reduce_container.sh run scripts/gemm_re
 wsl -d Ubuntu-22.04 -- bash scripts/gemm_reduce_container.sh run scripts/gemm_reduce_diagnose.sh TAG
 ```
 
-## 12. Limitations
+## 13. Limitations
 
 * CAModel only. No NPU on this host. No hardware claim is made anywhere above.
-* **The integration is wired but cannot be enabled**: §7.5's 19648-byte UB deficit, with the
-  three ways out and why none is taken here. The default reduction path is unchanged and builds
-  strict.
-* **The full ladder was not re-run on the final tree** — §9 lists exactly what was and was not.
+* **The integration is wired and runs, but is not the default.** §7.5's 19648-byte UB deficit is
+  paid by a `TBufPool` overlay on the attention phase's transient pool, verified at runtime in
+  §9; `TQ_GEMM_REDUCE` still defaults OFF for the reason in §10.
+* **The overlay's safety rests on a liveness argument, not a checker.** Nothing in the toolchain
+  verifies that `nzOperandBuf_`, `accBuf_` and `queryWorkBuf_` are dead when the reduction
+  reuses their bytes; `SyncAll<false>()` and reading the code are what establish it, and the
+  split rungs of §9 are what would have caught it being wrong at those geometries. A future
+  change that reads any of those three after the attention phase would break this silently.
+* **The full ladder was not re-run on the final tree** — §10 lists exactly what was and was not.
   Treat the depth, wrap, ragged, worker and mixed rungs as evidence about the previous build.
 * The token model's coverage bound is B = 0..1 two-worker and B = 2..4 one-worker, and its last
   full pass predates the per-worker ring fix. Exhaustive exploration is for bounded instances.
