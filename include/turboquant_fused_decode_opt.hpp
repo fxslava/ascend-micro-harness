@@ -42,6 +42,14 @@ constexpr std::uint32_t kReducerUbBytes = (2 * 256 + 16) * 4 + 5 * 8 * 4 +
     (2 * 64 + 2 * 8) * 4 + 256 * 2;
 static_assert(kUbEnd + kBasisUbBytes + kReducerUbBytes + 256 <= 192 * 1024,
     "reserve a final full-register read pad even with raw basis and reduction");
+// turboquant_gemm_reduce.hpp restates these three terms so it can compute the Cube GEMM
+// reduction's UB deficit without including this header -- it is dependency-free on purpose, and
+// the host gate that compiles it must not see production's -Wextra warnings. Pin the
+// restatement here so a change on either side is a compile error rather than a silent drift in
+// the number that decides whether that reduction can be enabled.
+static_assert(kUbEnd == 142304 && kBasisUbBytes == 46432 && kReducerUbBytes == 3360,
+    "turboquant_gemm_reduce.hpp restates these; update kOperatorUbEndBytes, "
+    "kOperatorBasisUbBytes and kVectorReducerUbBytes there to match");
 static_assert(16 * 256 + 16 * 64 + 2 * kSlots * 64 * 256 <= 512 * 1024);
 
 constexpr bool valid_launch(std::uint32_t grid, std::uint32_t tokens,

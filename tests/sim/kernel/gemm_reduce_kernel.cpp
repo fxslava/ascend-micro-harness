@@ -19,8 +19,9 @@
 #if defined(__CCE_AICORE__)
 #include "kernel_operator.h"
 
-#include "turboquant_gemm_reduce_service.h"
+#include "../../../kernels/ops/turboquant/fused_decode/cube/turboquant_gemm_reduce_service.h"
 
+using ascend_micro::gemm_reduce::TurboQuantBatchedGemmReducer;
 using ascend_micro::gemm_reduce::TurboQuantGemmReducer;
 using vllm_ascend::turboquant::TurboQuantPartialReducer;
 using vllm_ascend::turboquant::TurboQuantRotatedOutput;
@@ -88,6 +89,26 @@ __aicore__ inline void RunGemmLeg(GM_ADDR workspace, GM_ADDR output, GM_ADDR len
     DrainReducePhase();
 }
 
+// The dense batched form. Same shape of body as RunGemmLeg -- the probe's two forms differ in
+// the reducer they instantiate and in nothing else, so a behavioural difference between them
+// isolates the packing and not the harness.
+template <bool GEMV_DISABLED>
+__aicore__ inline void RunBatchedLeg(GM_ADDR workspace, GM_ADDR output, GM_ADDR lengths,
+                                     uint32_t tokens, uint32_t heads, uint32_t splits,
+                                     uint32_t perBlock, int32_t fusedLimit)
+{
+    AscendC::TPipe pipe;
+    TurboQuantBatchedGemmReducer<half, GEMV_DISABLED> reducer(&pipe);
+    reducer.Init(workspace, output, heads, ascend_micro::gemm_reduce::kHeadSize, splits);
+    TurboQuantRotatedOutput finisher;
+    CombineTokens select;
+    select.lengths.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(lengths));
+    select.limit = fusedLimit;
+    select.always = fusedLimit < 0;
+    reducer.Reduce(tokens * heads, perBlock, select, finisher);
+    DrainReducePhase();
+}
+
 }  // namespace
 
 extern "C" __global__ __aicore__ void turboquant_gemm_reduce_probe(
@@ -108,6 +129,30 @@ extern "C" __global__ __aicore__ void turboquant_gemm_reduce_gemv_probe(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     AscendC::InitSocState();
     RunGemmLeg<false>(workspace, output, lengths, tokens, heads, splits, perBlock, fusedLimit);
+}
+
+// The dense batched form: M = kGemmBatchRows packed query rows against 16-channel slices, both
+// vector subcores reducing half the batch each.
+extern "C" __global__ __aicore__ void turboquant_batched_reduce_probe(
+    GM_ADDR workspace, GM_ADDR output, GM_ADDR lengths, uint32_t tokens, uint32_t heads,
+    uint32_t splits, uint32_t perBlock, int32_t fusedLimit)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::InitSocState();
+    RunBatchedLeg<ascend_micro::gemm_reduce::kGemvDisabledDefault>(
+        workspace, output, lengths, tokens, heads, splits, perBlock, fusedLimit);
+}
+
+// Identical body, one knob. With M = 16 there is no GEMV case for disableGemv to affect, so
+// the two batched legs should be indistinguishable -- which is the measurement, because in the
+// M = 1 form they were not.
+extern "C" __global__ __aicore__ void turboquant_batched_reduce_gemv_probe(
+    GM_ADDR workspace, GM_ADDR output, GM_ADDR lengths, uint32_t tokens, uint32_t heads,
+    uint32_t splits, uint32_t perBlock, int32_t fusedLimit)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::InitSocState();
+    RunBatchedLeg<false>(workspace, output, lengths, tokens, heads, splits, perBlock, fusedLimit);
 }
 
 // The reference leg: the shipping vector reducer over the same workspace, so the numerical
@@ -167,14 +212,24 @@ extern "C" __global__ __aicore__ void turboquant_gemm_reduce_gemv_probe(
     GM_ADDR, GM_ADDR, GM_ADDR, uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
 extern "C" __global__ __aicore__ void turboquant_vector_reduce_probe(
     GM_ADDR, GM_ADDR, GM_ADDR, uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+extern "C" __global__ __aicore__ void turboquant_batched_reduce_probe(
+    GM_ADDR, GM_ADDR, GM_ADDR, uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+extern "C" __global__ __aicore__ void turboquant_batched_reduce_gemv_probe(
+    GM_ADDR, GM_ADDR, GM_ADDR, uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
 
 extern "C" void launch_gemm_reduce_sim(void *stream,
                                        const ascend_micro::gemm_reduce::ReduceLaunch *c,
                                        const ascend_micro::gemm_reduce::ReduceBuffers *b)
 {
     if (!c || !b) throw std::invalid_argument("null reduce descriptor");
-    if (!ascend_micro::gemm_reduce::kValidReduceGeometry(c->head_size, c->splits) ||
-        !c->grid || c->grid > 32 || !c->tokens || !c->heads || !c->per_block)
+    const bool batched = c->leg == ascend_micro::gemm_reduce::ReduceLeg::kBatched ||
+                         c->leg == ascend_micro::gemm_reduce::ReduceLeg::kBatchedGemvMode;
+    const bool geometry = batched
+                              ? ascend_micro::gemm_reduce::kValidBatchedGeometry(c->head_size,
+                                                                                c->splits)
+                              : ascend_micro::gemm_reduce::kValidReduceGeometry(c->head_size,
+                                                                               c->splits);
+    if (!geometry || !c->grid || c->grid > 32 || !c->tokens || !c->heads || !c->per_block)
         throw std::invalid_argument("unsupported gemm reduce probe geometry");
     switch (c->leg) {
         case ascend_micro::gemm_reduce::ReduceLeg::kGemm:
@@ -189,6 +244,16 @@ extern "C" void launch_gemm_reduce_sim(void *stream,
             return;
         case ascend_micro::gemm_reduce::ReduceLeg::kVector:
             turboquant_vector_reduce_probe<<<c->grid, nullptr, stream>>>(
+                b->workspace, b->output, b->lengths, c->tokens, c->heads, c->splits,
+                c->per_block, c->fused_limit);
+            return;
+        case ascend_micro::gemm_reduce::ReduceLeg::kBatched:
+            turboquant_batched_reduce_probe<<<c->grid, nullptr, stream>>>(
+                b->workspace, b->output, b->lengths, c->tokens, c->heads, c->splits,
+                c->per_block, c->fused_limit);
+            return;
+        case ascend_micro::gemm_reduce::ReduceLeg::kBatchedGemvMode:
+            turboquant_batched_reduce_gemv_probe<<<c->grid, nullptr, stream>>>(
                 b->workspace, b->output, b->lengths, c->tokens, c->heads, c->splits,
                 c->per_block, c->fused_limit);
             return;

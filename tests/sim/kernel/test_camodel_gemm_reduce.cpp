@@ -1,15 +1,17 @@
-// CAModel runner for the Cube GEMV Split-K reduction prototype.
+// CAModel runner for the Cube Split-K reduction, in both of its forms.
 //
-// Three legs over one workspace: the GEMV stage, the same stage with Mmad's GEMV mode left
-// enabled, and the shipping TurboQuantPartialReducer. Each run floods every GM payload, uploads
-// only the slices it means to assign, downloads after synchronisation and compares bitwise, so
-// a stray write is a canary failure and a wrong read is a numerical one.
+// Five legs over one workspace: the M = 1 GEMV stage, that stage with Mmad's GEMV mode left
+// enabled, the dense batched GEMM (M = kGemmBatchRows packed query rows against 16-channel
+// slices), the batched form with the same knob, and the shipping TurboQuantPartialReducer as
+// the numerical reference. Each run floods every GM payload, uploads only the slices it means
+// to assign, downloads after synchronisation and compares bitwise, so a stray write is a canary
+// failure and a wrong read is a numerical one.
 //
 //   --splits S        the split count, 1..8
 //   --tokens N        tokens
 //   --heads H         query heads per token
 //   --grid G          blocks; the per-block share is ceil(tokens*heads / G)
-//   --leg gemm|gemv|vector
+//   --leg gemm|gemv|vector|batched|batched-gemv
 //   --empty-worker    size the grid so the last block's share is empty
 //   --mixed           drive a lengths vector so some tokens are fused and skipped
 //   --fixture exact|varied
@@ -77,6 +79,8 @@ Options parse(int argc, char **argv)
             if (leg == "gemm") o.leg = tq::ReduceLeg::kGemm;
             else if (leg == "gemv") o.leg = tq::ReduceLeg::kGemmGemvMode;
             else if (leg == "vector") o.leg = tq::ReduceLeg::kVector;
+            else if (leg == "batched") o.leg = tq::ReduceLeg::kBatched;
+            else if (leg == "batched-gemv") o.leg = tq::ReduceLeg::kBatchedGemvMode;
             else die("unknown leg: " + leg);
         } else die("unknown option: " + a);
     }
@@ -189,6 +193,8 @@ const char *leg_name(tq::ReduceLeg leg)
         case tq::ReduceLeg::kGemm: return "gemm";
         case tq::ReduceLeg::kGemmGemvMode: return "gemv";
         case tq::ReduceLeg::kVector: return "vector";
+        case tq::ReduceLeg::kBatched: return "batched";
+        case tq::ReduceLeg::kBatchedGemvMode: return "batched-gemv";
     }
     return "?";
 }
@@ -208,7 +214,13 @@ int run(const Options &o)
     camodel::Session session;
     camodel::GuardedDeviceBuffer workspace(workspace_floats * sizeof(float));
     camodel::GuardedDeviceBuffer output(output_elems * kHalfBytes);
-    camodel::GuardedDeviceBuffer lengths(((o.tokens + 7) / 8) * 8 * sizeof(std::int32_t));
+    // tokens + 1, not tokens: the overrun check below reads the word just past the live tokens
+    // and requires it to still hold the flood, so that word has to be inside the PAYLOAD. At a
+    // token count that is an exact multiple of 8 the old rounding put it in the trailing guard,
+    // where it holds the canary instead -- a spurious "read or written past its live tokens"
+    // at tokens = 8 and 16 and nowhere else, which is why the GEMV ladder's rungs (1, 2, 5)
+    // never showed it.
+    camodel::GuardedDeviceBuffer lengths(((o.tokens + 1 + 7) / 8) * 8 * sizeof(std::int32_t));
 
     // Flood every payload before assigning only the slices this run means to write.
     std::fill(workspace.host.begin(), workspace.host.end(), kFlood);
@@ -385,10 +397,20 @@ int run(const Options &o)
     }
 
     if (!bad.empty()) {
-        std::printf("first disagreeing channels (slot = task mod 2):\n");
+        // Which task, which ring slot, and -- for the batched legs -- which packed row, which
+        // subcore and which 16-channel slice. That is the difference between an arithmetic bug,
+        // a buffer-lifetime one and a packing one, and guessing between them is expensive.
+        std::printf("first disagreeing channels:\n");
         for (const Bad &b : bad) {
-            std::printf("  task=%u token=%u head=%u slot=%u channel=%u got=%g want=%g bits=%04x\n",
-                        b.task, b.token, b.head, b.task % 2u, b.channel,
+            const std::uint32_t batch = b.task / tq::kGemmBatchRows;
+            const std::uint32_t inBatch = b.task % tq::kGemmBatchRows;
+            const std::uint32_t rows0 = tq::kGemmLiveRowsOf(tq::kGemmBatchRows, 0);
+            const std::uint32_t sub = inBatch >= rows0 ? 1u : 0u;
+            std::printf("  task=%u token=%u head=%u channel=%u | gemv_slot=%u | "
+                        "batch=%u batch_slot=%u row=%u subcore=%u slice=%u "
+                        "| got=%g want=%g bits=%04x\n",
+                        b.task, b.token, b.head, b.channel, b.task % tq::kReduceSlots, batch,
+                        batch % tq::kBatchSlots, inBatch, sub, b.channel / tq::kGemmSliceCols,
                         static_cast<double>(b.got), b.want, static_cast<unsigned>(b.bits));
         }
     }

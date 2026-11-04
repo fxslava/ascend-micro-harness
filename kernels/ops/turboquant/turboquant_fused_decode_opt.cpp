@@ -289,6 +289,39 @@ public:
         }
     }
 
+#if defined(ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE) && ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE
+    // The Cube GEMM reduction's entry. Three things differ from Reduce() above, and all three
+    // are why it needs its own method rather than a different reducer object:
+    //
+    //   * It is driven by BOTH roles, not `if ASCEND_IS_AIV`. The Cube does the contraction, so
+    //     the caller must not guard the call -- and both roles have to walk the same TPipe
+    //     allocation, because the Fixpipe's destination is an address in the vector cores' UB.
+    //   * It does its own task slicing. Reduce() hands one (token, head) at a time; the batched
+    //     form needs runs of consecutive live tasks, because dnNum walks one uniform source
+    //     stride and a fused token's id gap has to end a run. So it takes the whole share and
+    //     the predicate, and batches internally.
+    //   * The two vector subcores split each batch's rows rather than the share's tasks. The
+    //     ceil/floor halving here is the Fixpipe's, not this loop's.
+    //
+    // IsFused is read through the same contextLenGm_ Reduce() reads, so a token this skips is
+    // exactly a token that one skips.
+    struct GemmCombineSelect {
+        // Non-const: GlobalTensor::GetValue is not a const member in this toolkit.
+        TurboQuantFusedDecodeOpt *op;
+        __aicore__ inline bool NeedsCombine(const uint32_t token) const
+        {
+            return !op->IsFused(op->contextLenGm_.GetValue(token));
+        }
+    };
+
+    template <typename GemmReducer>
+    __aicore__ inline void ReduceGemm(GemmReducer &reducer, const uint32_t reduceTasksPerBlock)
+    {
+        GemmCombineSelect select{this};
+        reducer.Reduce(numTokens_ * numHeads_, reduceTasksPerBlock, select, basis_);
+    }
+#endif
+
 private:
     struct TileCursor {
         uint32_t block = 0;
@@ -694,6 +727,62 @@ private:
 
 }
 
+// ------------------------------------------------------------------------------------------------
+// The reduction phase, in one place for both launch macros
+// ------------------------------------------------------------------------------------------------
+//
+// Default: the shipping vector reducer, guarded by `if ASCEND_IS_AIV` because the Cube has no
+// part in it -- which is the idleness the Cube GEMM form spends.
+//
+// ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1 selects TurboQuantBatchedGemmReducer instead: M = 16
+// packed query rows against 16-channel slices of D, one dense Mmad per slice, the product split
+// between the two vector subcores by a dual-destination Fixpipe. Three differences are visible
+// right here and all three are load-bearing:
+//
+//   * NO `if ASCEND_IS_AIV`. The Cube does the contraction, and both roles have to walk the
+//     same TPipe allocation because the Fixpipe's destination is an address in the vector
+//     cores' UB. Guarding this is what made the first Cube run of the probe target an
+//     unallocated tensor -- su_ccu_mpu_err_t0 on cubecore0 -- while still printing the right
+//     numbers.
+//   * op.ReduceGemm() rather than op.Reduce(): the batched form slices its own share, because
+//     dnNum walks one uniform source stride and a fused token's task-id gap has to end a run.
+//   * The reducer is constructed AFTER SyncAll<false>(), as before, but it is not free: see the
+//     UB deficit below.
+//
+// THE SWITCH IS OFF BY DEFAULT AND TURNING IT ON WILL NOT COMPILE. That is deliberate.
+// include/turboquant_gemm_reduce.hpp computes the arithmetic: the batched reducer claims 27264
+// UB bytes against the vector reducer's 3360, a net 23904, and this operator has 4256 bytes of
+// headroom under the 192 KB window -- a deficit of 19648. A wiring that merely compiled would
+// overflow UB silently, so the static_assert below fails with the number instead, and the three
+// ways out (a TPipe::InitBufPool overlay on a dead attention buffer, a band-wise panel, or a
+// smaller kGemmBatchRows -- only the first two can work) are documented where the numbers are.
+#if defined(ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE) && ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE
+#include "fused_decode/cube/turboquant_gemm_reduce_service.h"
+
+static_assert(ascend_micro::gemm_reduce::kGemmReducerNetUbBytes <=
+                  ascend_micro::gemm_reduce::kOperatorUbHeadroomBytes,
+              "the Cube GEMM reduction does not fit this operator's UB headroom: it needs "
+              "23904 net bytes and 4256 are free, a 19648-byte deficit. Overlay its panels on "
+              "a dead attention buffer with TPipe::InitBufPool, or switch the panel to "
+              "band-wise normalise. See the budget in include/turboquant_gemm_reduce.hpp.");
+
+#define ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE)                                                                    \
+    do {                                                                                                             \
+        ascend_micro::gemm_reduce::TurboQuantBatchedGemmReducer<TYPE> reducer(&pipe);                                 \
+        reducer.Init(workspace, output, numHeads, headSize, numSplits);                                               \
+        op.ReduceGemm(reducer, reduceTasksPerBlock);                                                                  \
+    } while (0)
+#else
+#define ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE)                                                                    \
+    do {                                                                                                             \
+        if ASCEND_IS_AIV {                                                                                           \
+            TurboQuantPartialReducer<TYPE> reducer(&pipe);                                                           \
+            reducer.Init(workspace, output, numHeads, headSize, numSplits);                                          \
+            op.Reduce(reducer, reduceTasksPerBlock);                                                                 \
+        }                                                                                                            \
+    } while (0)
+#endif
+
 #define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(NAME, MODE, TYPE)                                                      \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
@@ -712,11 +801,7 @@ private:
         op.Process(tasksPerBlock);                                                                                    \
         if (op.NeedsReduction()) {                                                                                    \
             AscendC::SyncAll<false>();                                                                                \
-            if ASCEND_IS_AIV {                                                                                        \
-                TurboQuantPartialReducer<TYPE> reducer(&pipe);                                                         \
-                reducer.Init(workspace, output, numHeads, headSize, numSplits);                                        \
-                op.Reduce(reducer, reduceTasksPerBlock);                                                               \
-            }                                                                                                         \
+            ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE);                                                                 \
         }                                                                                                             \
         DrainFusedDecodeTask(); \
     }
@@ -745,12 +830,8 @@ private:
         op.RotateQuery(prologueVectorsPerBlock);                                                                       \
         op.Process(tasksPerBlock);                                                                                     \
         if (op.NeedsReduction()) {                                                                                     \
-            AscendC::SyncAll<false>();                                                                                 \
-            if ASCEND_IS_AIV {                                                                                         \
-                TurboQuantPartialReducer<TYPE> reducer(&pipe);                                                          \
-                reducer.Init(workspace, output, numHeads, headSize, numSplits);                                         \
-                op.Reduce(reducer, reduceTasksPerBlock);                                                                \
-            }                                                                                                          \
+            AscendC::SyncAll<false>();                                                                                  \
+            ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE);                                                                  \
         }                                                                                                              \
         DrainFusedDecodeTask(); \
     }

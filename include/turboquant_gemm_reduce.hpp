@@ -305,17 +305,374 @@ ASCEND_MICRO_REDUCE_FN bool kValidReduceGeometry(std::uint32_t headSize, std::ui
 static_assert(kValidReduceGeometry(kHeadSize, 1) && kValidReduceGeometry(kHeadSize, 8));
 static_assert(!kValidReduceGeometry(kHeadSize, 9) && !kValidReduceGeometry(128, 4));
 
+// =============================================================================================
+// THE DENSE BATCHED FORM: M = 16 packed query rows, N = 16-channel slices
+// =============================================================================================
+//
+// The M = 1 stage above leaves fifteen of the Cube's sixteen output rows padding, and it issues
+// one MTE2 burst per (token, head), which is where it serialised. This form packs up to
+// kGemmBatchRows query rows into M and sweeps N over kGemmSlices 16-channel slices of D, so the
+// Cube's 16 x 16 output line is full on both axes and the GM fetch is ONE batched DN2NZ burst
+// per slice instead of one per task.
+//
+// WHAT THE CONTRACTION ACTUALLY IS, AND WHY K IS NOT S
+//
+// The obvious reading of "[16, S] x [S, 16]" is a GEMM whose 16 output rows share one
+// [S, 16] partials operand. That is NOT this operator's algebra. Writing q for a packed query
+// row, the value wanted is
+//
+//     out_q[c] = sum_s w_q[s] * P_q[s, c]
+//
+// and the partials P_q are indexed BY q: split s of (token, head) lands at
+// kPartialRowOffset(token, head, s, ...), so every (token, head) owns its own [S, D] block.
+// Query heads inside one GQA group share the KV cache, not the Split-K partials -- each head
+// has its own attention probabilities and therefore its own o_s. A single GEMM Out = A x B
+// shares B across all M rows, so a dense [16, S] x [S, 16] with one shared B computes
+// sum_s w_q[s] * P[s, c] for a P that does not exist. It is a batched GEMV with 16 independent
+// (A, B) pairs, and no 2-D GEMM expresses that without either batching or padding.
+//
+// So the K axis carries the batch: K = kGemmBatchRows * kGemmKPerRow, A is the BLOCK-DIAGONAL
+// weight matrix
+//
+//     A[q, q' * 8 + s] = (q == q') ? w_q[s] : 0
+//
+// and B stacks the 16 rows' own channel slices, B[q' * 8 + s, c] = P_q'[s, c0 + c]. Then
+//
+//     Out[q, c] = sum_{q', s} A[q, q'*8+s] * B[q'*8+s, c] = sum_s w_q[s] * P_q[s, c0 + c]
+//
+// which is the wanted value. Everything the requested shape asks for survives: M = 16 and
+// N = 16 are both full, A is one cube loaded into L0A ONCE per batch and reused across all
+// kGemmSlices iterations, B is a 16-fractal slice streamed into L0B with a ping-pong, and the
+// sweep is kGemmSlices = D / 16 = 16 Mmads per batch. What changes is the honest accounting:
+// the zeros in A cost exactly what M = 1's padding cost, so this form does not reduce MAC
+// count. It reduces INSTRUCTION count on the engines that were serialising -- one DN2NZ per
+// slice instead of one per task, one L0A load per batch instead of one per task -- and it
+// gives the Fixpipe sixteen live rows to split between the two vector subcores, which is what
+// §5's idle-AIV1 defect needed.
+//
+// TWO PROPERTIES OF THE BLOCK-DIAGONAL A THAT ARE GATES, NOT REMARKS
+//
+//  * A dead row cannot contaminate a live one. Out[q, c] reads only K block q, so garbage in
+//    B's block q -- a ragged batch's padding row, whose L1 fractal still holds the 0x7FC0BEEF
+//    flood of §3 -- reaches output row q and nothing else. The M = 1 form had no such
+//    guarantee: there, one NaN lane in K poisoned every channel of the product.
+//  * The padding lane guards of the M = 1 form still apply WITHIN a row. For splits < 8 the
+//    weight row's lanes s..7 are zero and DN2NZ zero-fills the destination to the 32-byte
+//    boundary, which is the S < 8 case; both halves of that pair are kept.
+constexpr std::uint32_t kGemmBatchRows = 16;  // M: packed query rows per batch
+constexpr std::uint32_t kGemmSliceCols = 16;  // N: channels per slice, one fractal row
+constexpr std::uint32_t kGemmSlices = kHeadSize / kGemmSliceCols;  // 16 Mmads per batch
+// One C0 block of K per packed row, so a row's K block IS its fractal and the block-diagonal
+// structure lines up with the fractal grid exactly. kAlignedSplits(S) == kC0Floats for every
+// legal split count, which is what makes this exact rather than a rounding.
+constexpr std::uint32_t kGemmKPerRow = kC0Floats;  // 8
+constexpr std::uint32_t kGemmKMax = kGemmBatchRows * kGemmKPerRow;  // 128
+static_assert(kGemmSlices * kGemmSliceCols == kHeadSize);
+static_assert(kGemmSliceCols == kFractalRows, "a slice is one fractal row of the B operand");
+static_assert(kGemmKMax <= 65535, "MmadParams::k is uint16_t");
+static_assert(kAlignedSplits(kMaxSplits) == kGemmKPerRow,
+              "a packed row's K block is one C0 block at every legal split count");
+
+// The A operand's cube, in L1. kGemmBatchRows fractals of [16 M rows][8 K]; fractal q carries
+// row q's weights in ITS row q and zeros everywhere else. A[m, 8k + s] sits at float
+// k * kFractalRows * kC0Floats + m * kC0Floats + s, so row q's own 8 weights are at
+// q * (kFractalRows * kC0Floats) + q * kC0Floats -- a 32-byte-aligned base, which a vector
+// store needs (an unaligned vector destination raises vec_err_instr_misalign_t0).
+constexpr std::uint32_t kWeightCubeBytes = kGemmBatchRows * kFractalBytes;  // 8192
+ASCEND_MICRO_REDUCE_FN std::uint32_t kWeightRowOffsetFloats(std::uint32_t row)
+{
+    return row * kFractalRows * kC0Floats + row * kC0Floats;
+}
+static_assert(kWeightRowOffsetFloats(0) == 0 && kWeightRowOffsetFloats(1) == 136);
+static_assert(kWeightRowOffsetFloats(1) * kFloatBytes % kC0Bytes == 0,
+              "every weight row base is a whole 32-byte block");
+// The last row's block ends exactly at the cube's end: nothing to overrun into.
+static_assert(kWeightRowOffsetFloats(kGemmBatchRows - 1) * kFloatBytes + kC0Bytes ==
+                  kWeightCubeBytes,
+              "the block-diagonal cube is exactly kGemmBatchRows fractals");
+
+// The B operand's slice, in L1: kGemmBatchRows fractals, fractal q being row q's
+// [16 channels][8 splits]. The batched DN2NZ lands them contiguously, one matrix per packed
+// row, so Load2DV2 takes the whole slice as kGemmBatchRows consecutive fractals with no stride
+// arithmetic -- which is the reason the ingest is grouped BY SLICE and not by row.
+constexpr std::uint32_t kSliceL1Bytes = kGemmBatchRows * kFractalBytes;  // 8192
+constexpr std::uint32_t kSliceFractalFloats = kFractalRows * kC0Floats;  // 128
+static_assert(kSliceL1Bytes == kGemmBatchRows * kSliceFractalFloats * kFloatBytes);
+// Two inner slots: DN2NZ fetches slice j + 1 while the Mmad of slice j is in flight. That
+// overlap is the whole point of the change, so the inner ring carries real split credits
+// rather than a paired hand-off.
+constexpr std::uint32_t kSliceSlots = 2;
+
+// Dn2NzParams for the batched slice ingest. dnNum is the batch's live row count, so a ragged
+// batch fetches exactly its live rows and the padding fractals are never written -- which is
+// safe only because of the block-diagonal containment above.
+constexpr std::uint32_t kSliceDn2NzNValue = kGemmSliceCols;
+constexpr std::uint32_t kSliceDn2NzDstNzC0Stride = kGemmSliceCols;
+constexpr std::uint32_t kSliceDn2NzDstNzNStride = 1;
+constexpr std::uint32_t kSliceDn2NzDstMatrixStrideFloats = kSliceFractalFloats;
+static_assert(kSliceDn2NzNValue <= 16384 && kGemmBatchRows <= 65535,
+              "Dn2NzParams nValue and dnNum ranges");
+// The source stride between two packed rows is one (token, head)'s whole partial block, which
+// is why a batch must be a run of CONSECUTIVE live tasks: dnNum walks a uniform stride.
+ASCEND_MICRO_REDUCE_FN std::uint64_t kSliceSrcMatrixStrideFloats(std::uint32_t numSplits)
+{
+    return std::uint64_t{numSplits} * kPartialStride;
+}
+static_assert(kSliceSrcMatrixStrideFloats(8) == 8 * kPartialStride);
+
+// HOW THE TWO VECTOR SUBCORES SPLIT THE BATCH, AND WHY THE HALVES ARE STATIC
+//
+// A dual-destination Fixpipe (dualDstCtl = 1) divides mSize rows in half and lands each half at
+// the matching subcore's own UB base, so with mSize = kGemmBatchRows the split point is fixed
+// at kGemmPanelRows: rows 0..7 reach subcore 0 and rows 8..15 subcore 1, each as rows 0..7 of
+// its own panel. The LIVE rows are then distributed ceil/floor, subcore 0 taking rows
+// 0..a-1 and subcore 1 rows 8..8+b-1, so both have real work for every live >= 2. That is the
+// whole content of §B: the GEMV form's M = 1 left subcore 1 with nothing to reduce, and a
+// subcore that only consumes tokens is not paced by the channel that releases it.
+//
+// The halves are STATIC -- fractals 0..7 belong to subcore 0 and 8..15 to subcore 1 whatever
+// the live count -- and that is a correctness requirement, not a tidiness one. A fractal's
+// off-diagonal rows must be zero for ITS row's output to be right, they are written once at
+// Init, and they are never rewritten. If the half boundary moved with the live count, the core
+// that zero-fills fractal q at Init and the core that writes q's diagonal block in a later
+// batch could be different cores, and nothing orders a block's two vector subcores against
+// each other at Init -- so the zero-fill could land after the weight it is supposed to precede
+// and erase it. With static halves each core only ever touches its own eight fractals and the
+// race cannot be constructed.
+//
+// The cost of static halves is that mSize is always kGemmBatchRows and k always kGemmKMax, so
+// a ragged batch's dead fractals ARE read by the Mmad. That is safe only because of the
+// block-diagonal containment above: output row m reads K block m alone, so a dead fractal's
+// stale or flooded content reaches its own output row and no live one, and no vector
+// instruction ever reads a dead row (NormalizeHeads and WriteHeads are given the live count).
+// It is also why each core zeroes its dead rows' diagonal blocks per batch: a dead row's
+// garbage must not depend on which batch ran before it.
+constexpr std::uint32_t kGemmPanelRows = kGemmBatchRows / 2;  // 8, the Fixpipe's split point
+
+// Live rows subcore `sub` must normalise and write, and the batch row its first one occupies.
+ASCEND_MICRO_REDUCE_FN std::uint32_t kGemmLiveRowsOf(std::uint32_t live, std::uint32_t sub)
+{
+    const std::uint32_t first = (live + 1) / 2;  // ceil: subcore 0 takes the larger half
+    return sub == 0 ? first : live - first;
+}
+ASCEND_MICRO_REDUCE_FN std::uint32_t kGemmFirstRowOf(std::uint32_t sub)
+{
+    return sub == 0 ? 0 : kGemmPanelRows;
+}
+// The batch-local index of subcore `sub`'s first live task, which is what turns a panel row
+// back into a (token, head) and a GM output offset.
+ASCEND_MICRO_REDUCE_FN std::uint32_t kGemmFirstTaskOf(std::uint32_t live, std::uint32_t sub)
+{
+    return sub == 0 ? 0 : kGemmLiveRowsOf(live, 0);
+}
+static_assert(kGemmLiveRowsOf(16, 0) == 8 && kGemmLiveRowsOf(16, 1) == 8);
+static_assert(kGemmLiveRowsOf(5, 0) == 3 && kGemmLiveRowsOf(5, 1) == 2);
+static_assert(kGemmLiveRowsOf(2, 0) == 1 && kGemmLiveRowsOf(2, 1) == 1);
+// live = 1 is the one geometry with nothing for subcore 1 to reduce. It still waits, drains and
+// announces; that is §B's "even when an idle subcore has no active query rows".
+static_assert(kGemmLiveRowsOf(1, 0) == 1 && kGemmLiveRowsOf(1, 1) == 0);
+// Neither half ever overflows its eight panel rows, which is what bounds the panel.
+static_assert(kGemmLiveRowsOf(kGemmBatchRows, 0) == kGemmPanelRows &&
+              kGemmLiveRowsOf(kGemmBatchRows, 1) == kGemmPanelRows);
+static_assert(kGemmFirstTaskOf(5, 1) == 3 && kGemmFirstRowOf(1) == 8);
+
+// Budgets the batched form adds. Two batch slots (the AIV stages batch b + 1's weights while
+// the Cube multiplies b and normalises b - 1) and two inner slice slots.
+constexpr std::uint32_t kBatchSlots = kReduceSlots;
+constexpr std::uint32_t kGemmL1Bytes =
+    kBatchSlots * kWeightCubeBytes + kSliceSlots * kSliceL1Bytes;
+// ONE L0A region. The A cube is loaded once per batch and read by all kGemmSlices Mmads, so a
+// second region would buy at most one slice of MTE1 prefetch; the single region costs one
+// credit (l0a_free) instead of two places and halves the L0A claim.
+constexpr std::uint32_t kGemmL0aBytes = kWeightCubeBytes;
+constexpr std::uint32_t kGemmL0bBytes = kSliceSlots * kSliceL1Bytes;
+// One [16 M][16 N] fp32 cube per inner slot. M pads to kFractalRows, so a slot is one fractal
+// of C: 16 x 16 x 4 bytes.
+constexpr std::uint32_t kGemmL0cSlotBytes = kFractalRows * kGemmSliceCols * kFloatBytes;  // 1024
+constexpr std::uint32_t kGemmL0cBytes = kSliceSlots * kGemmL0cSlotBytes;
+static_assert(kAttentionL1Bytes + kGemmL1Bytes <= 512 * 1024, "L1 budget, batched form");
+static_assert(kGemmL0aBytes <= 64 * 1024 && kGemmL0bBytes <= 64 * 1024, "L0A/L0B budget");
+static_assert(kGemmL0cBytes <= 128 * 1024, "L0C budget");
+
+// The product panel each subcore receives: its own half of the batch, [8 rows][D] fp32 dense.
+// Dense matters -- NormalizeHeads' Mul walks rows with dstRepStride = headSize / kFp32PerBlock
+// blocks, so the rows must be exactly headSize floats apart and the AKA3003 skew goes at the
+// END of the slot, never between rows.
+constexpr std::uint32_t kGemmPanelPayloadBytes = kGemmPanelRows * kHeadSize * kFloatBytes;
+constexpr std::uint32_t kGemmPanelUbBytes = kGemmPanelPayloadBytes + kReduceBankSkewBytes;
+static_assert(kGemmPanelPayloadBytes == 8192);
+static_assert(kGemmPanelUbBytes % kC0Bytes == 0);
+static_assert(kGemmPanelUbBytes / kC0Bytes % 16 != 0,
+              "paired panel slots must not present the same UB bank");
+// The statistics arena, in 8-float DataBlocks. The header blocks are laid out in the service
+// header; the tail is one 64-byte landing per (panel row, split), filled by ONE strided burst.
+constexpr std::uint32_t kGemmStatsHeaderBlocks = 66;
+constexpr std::uint32_t kGemmStatsUbBytes =
+    (kGemmStatsHeaderBlocks + kGemmPanelRows * kMaxSplits * 2) * kC0Bytes;  // 6208
+constexpr std::uint32_t kGemmOutStageBytes = kGemmPanelRows * kHeadSize * 2;  // fp16 staging
+constexpr std::uint32_t kGemmZeroStageBytes = kSliceFractalFloats * kFloatBytes;  // 512
+
+// Every UB byte TurboQuantBatchedGemmReducer allocates. The service header static_asserts its
+// own InitBuffer sizes against these, so this is the claim and not an estimate of it.
+constexpr std::uint32_t kGemmReducerUbBytes = kBatchSlots * kGemmPanelUbBytes +
+                                              kGemmStatsUbBytes + kGemmZeroStageBytes +
+                                              kGemmOutStageBytes;
+static_assert(kGemmReducerUbBytes == 27264, "the batched reducer's UB claim, pinned");
+
+// =============================================================================================
+// THE INTEGRATION BUDGET, AND WHY THE SWITCH IS OFF BY DEFAULT
+// =============================================================================================
+//
+// This is an OBJECT and not a remark because the answer is negative: the batched form does not
+// fit the production operator's remaining UB, and a wiring that merely compiles would overflow
+// the window silently.
+//
+// turboquant_fused_decode_opt.hpp asserts
+//     kUbEnd + kBasisUbBytes + kReducerUbBytes + 256 <= 192 * 1024
+// and those three terms are restated here so the sum is checked rather than inferred; that
+// header static_asserts the restatement against its own constants, so a change on either side
+// is a compile error and not a drift.
+constexpr std::uint32_t kUbWindowBytes = 192 * 1024;              // 196608
+constexpr std::uint32_t kOperatorUbEndBytes = 142304;             // kUbEnd
+constexpr std::uint32_t kOperatorBasisUbBytes = 46432;            // kBasisUbBytes
+constexpr std::uint32_t kVectorReducerUbBytes = 3360;             // kReducerUbBytes
+constexpr std::uint32_t kUbReadPadBytes = 256;                    // never payload
+constexpr std::uint32_t kOperatorUbClaimBytes =
+    kOperatorUbEndBytes + kOperatorBasisUbBytes + kVectorReducerUbBytes + kUbReadPadBytes;
+static_assert(kOperatorUbClaimBytes <= kUbWindowBytes, "the operator's own UB assert, restated");
+// What is left once the attention phase, the basis and the read pad are paid for.
+constexpr std::uint32_t kOperatorUbHeadroomBytes = kUbWindowBytes - kOperatorUbClaimBytes;
+static_assert(kOperatorUbHeadroomBytes == 4256, "headroom, pinned so a change is visible");
+// The batched reducer REPLACES the vector reducer, so the net cost is the difference.
+constexpr std::uint32_t kGemmReducerNetUbBytes =
+    kGemmReducerUbBytes - kVectorReducerUbBytes;  // 23904
+constexpr std::uint32_t kGemmReducerUbDeficitBytes =
+    kGemmReducerNetUbBytes - kOperatorUbHeadroomBytes;  // 19648
+static_assert(kGemmReducerNetUbBytes > kOperatorUbHeadroomBytes,
+              "if this ever fails the deficit is gone and the switch can default on");
+static_assert(kGemmReducerUbDeficitBytes == 19648, "the deficit, pinned");
+
+// Three ways out, none of them taken here because each carries the OPERATOR's section 2 and
+// section 5 burden rather than this stage's, and the choice is not the stage's to make:
+//
+//   1. Overlay. TPipe::Reset() is a real allocator rewind -- ResetPool() sets maxAddr = 0 for
+//      every hardware pool -- and AscendC::SyncAll<false>() stands between the attention phase
+//      and the reduction, so every attention buffer is dead by then. What blocks a bare Reset()
+//      is the FINISHER: TurboQuantQueryBasis::FinishHeads reads pairBuf_/signBuf_/inBuf_/
+//      floatBuf_, and the Pi signs in signBuf_ are CONTENT, so a rewind invalidates them and
+//      they would have to be restaged. TPipe::InitBufPool(pool, len, shareBuf) is the narrower
+//      tool: alias the reduction's pool onto one named attention buffer instead of all of them.
+//   2. Band-wise normalise. The panel only has to hold the channels being normalised, so a
+//      64-channel band drops it from 8 KB to 2 KB a slot; NormalizeHeads is elementwise per
+//      row and WriteHeads becomes a strided GM burst. One panel slot then fits in 2880 bytes
+//      net, inside the headroom -- but a single slot removes the Cube/AIV panel overlap, which
+//      is most of what the form buys.
+//   3. A smaller kGemmBatchRows. This does NOT work: at 8 rows the net cost is still 11616
+//      bytes and at 4 rows 5472, both over the headroom, and M = 4 gives up the dense line.
+constexpr std::uint32_t kGemmUbBytes = kGemmReducerUbBytes;
+static_assert(kGemmUbBytes + kUbReadPadBytes <= kUbWindowBytes,
+              "the reducer alone fits the window; it is the SUM with the operator that does not");
+
+// ---------------------------------------------------------------------------------------------
+// Batch formation
+// ---------------------------------------------------------------------------------------------
+//
+// A batch is a run of CONSECUTIVE live task ids, at most kGemmBatchRows long. Consecutive is
+// not a convenience: dnNum walks one uniform source stride, so a gap in the task ids -- which a
+// fused token leaves, since production's Reduce() skips it -- has to end the batch. It also
+// makes the batch's outputs contiguous in GM, so one WriteHeads burst per subcore covers its
+// rows instead of one per row.
+ASCEND_MICRO_REDUCE_FN bool kGemmBatchBreaks(std::uint32_t previousTask, std::uint32_t task,
+                                             std::uint32_t rowsSoFar)
+{
+    return rowsSoFar >= kGemmBatchRows || task != previousTask + 1;
+}
+static_assert(kGemmBatchBreaks(3, 5, 1), "a task-id gap ends the batch");
+static_assert(!kGemmBatchBreaks(3, 4, 1), "a consecutive task extends it");
+static_assert(kGemmBatchBreaks(3, 4, kGemmBatchRows), "a full batch ends regardless");
+
+// Batches a dense run of `tasks` consecutive combines needs, which is what the depth and wrap
+// rungs are counted in: the ring is over BATCHES now, so N = kBatchSlots is depth and
+// N = 2 * kBatchSlots is wrap, in units of kGemmBatchRows tasks.
+ASCEND_MICRO_REDUCE_FN std::uint32_t kGemmDenseBatches(std::uint32_t tasks)
+{
+    return (tasks + kGemmBatchRows - 1) / kGemmBatchRows;
+}
+static_assert(kGemmDenseBatches(0) == 0 && kGemmDenseBatches(1) == 1 &&
+              kGemmDenseBatches(16) == 1 && kGemmDenseBatches(17) == 2 &&
+              kGemmDenseBatches(32) == 2 && kGemmDenseBatches(64) == 4);
+
+// The worst case is every live task isolated by a fused neighbour, which is one batch each.
+constexpr std::uint32_t kMaxGemmTasksPerBlock = 64;
+constexpr std::uint32_t kMaxGemmBatchesPerBlock = kMaxGemmTasksPerBlock;
+
+// Intra-core credit ids on the AIC. Routes are keyed by (source pipe, trigger pipe, id), so the
+// same id on two different routes is two different places; what must not collide is two places
+// on ONE route. The auditor additionally requires every user HardEvent id in 0..5.
+//
+//   slice_ready[ss]  MTE2 -> MTE1   ids 3..4   the DN2NZ burst landed in L1 slice slot ss
+//   slice_free[ss]   MTE1 -> MTE2   ids 3..4   Load2DV2 has drained that slot
+//   l0b_ready[ss]    MTE1 -> M      ids 3..4   the slice cube reached L0B
+//   l0b_free[ss]     M -> MTE1      ids 3..4   the Mmad has read it
+//   l0a_ready        MTE1 -> M      id   5     the A cube reached L0A
+//   l0a_free         M -> MTE1      id   5     the batch's last Mmad has read the A cube
+//   l0c_ready[ss]    M -> FIX       ids 3..4   the product cube is in L0C
+//   l0c_free[ss]     FIX -> M       ids 3..4   the Fixpipe has drained it
+//
+// WHY THESE START AT 3 AND NOT AT 0, WHICH IS A DEVICE FINDING AND NOT A STYLE CHOICE
+//
+// `M_MTE1` ids 0..2 are the RUNTIME's, not the kernel's. kernel_tpipe_impl.h says so in its own
+// words -- "for matmul macro, set flag M_MTE1 at the begining of operator, and also wait flag
+// at the end. matmul macro only use M_MTE1 event id 0 1 currently" -- and this toolkit primes
+// three of them: a trace of the first batched run shows SET_FLAG CUBE->MTE1 for ids 0, 1 and 2
+// at ticks 1421, 1426 and 1430, before a single instruction of the stage has issued. A kernel
+// that primes its own M_MTE1 ids 0..1 on top of that is a double SET on a one-bit flag, and the
+// simulator says so: `pem_ccu.cc:2270 execute_set_flag already has same set_flag`.
+//
+// It is worth being precise about what that fault costs, because the first run of this form had
+// it and still printed worst_fp16_ulp = 0 with every canary intact. A dropped MTE2->MTE1 credit
+// does not corrupt data here; it removes an ordering guarantee, so the fetch of slice j + 2
+// could overwrite the L1 slot the Mmad of slice j is still loading. It did not on that run and
+// it is not meant to be left to luck.
+//
+// Starting at 3 also keeps every explicit id clear of the ids `FetchEventID` hands out. That
+// allocator returns the first free bit of its occupancy mask, and an id set with a bare
+// SetFlag is never marked occupied, so every SyncEvent<> in the drain path picks id 0 -- which
+// on MTE1_M is an id this schedule would otherwise be using.
+constexpr std::uint16_t kGemmRuntimeOwnedEvents = 3;  // M_MTE1 ids 0..2, primed by TPipe
+constexpr std::uint16_t kGemmSliceEventFirst = kGemmRuntimeOwnedEvents;              // 3
+constexpr std::uint16_t kGemmL0aEvent = kGemmSliceEventFirst + kSliceSlots;          // 5
+constexpr std::uint16_t kGemmEventLast = kGemmL0aEvent;
+static_assert(kGemmEventLast <= 5,
+              "the trace auditor requires every user HardEvent id in 0..5");
+static_assert(kGemmSliceEventFirst >= kGemmRuntimeOwnedEvents,
+              "M_MTE1 ids below this are primed and drained by TPipe's matmul macro");
+// M -> MTE1 is the one route carrying two distinct place families, so its ids must be disjoint.
+static_assert(kGemmL0aEvent >= kGemmSliceEventFirst + kSliceSlots,
+              "l0a_free and l0b_free share the M -> MTE1 route and must not share an id");
+
+ASCEND_MICRO_REDUCE_FN bool kValidBatchedGeometry(std::uint32_t headSize, std::uint32_t splits)
+{
+    return kValidReduceGeometry(headSize, splits) && headSize % kGemmSliceCols == 0 &&
+           headSize / kGemmSliceCols == kGemmSlices;
+}
+static_assert(kValidBatchedGeometry(kHeadSize, 1) && kValidBatchedGeometry(kHeadSize, 8));
+static_assert(!kValidBatchedGeometry(kHeadSize, 9));
+
 // ---------------------------------------------------------------------------------------------
 // The probe ABI
 // ---------------------------------------------------------------------------------------------
 
-// Three legs over one workspace. kGemm and kGemmGemvMode share a body and differ in nothing but
+// Legs over one workspace. kGemm and kGemmGemvMode share a body and differ in nothing but
 // MmadParams::disableGemv, so a behavioural difference between them isolates that knob; kVector
-// is the shipping TurboQuantPartialReducer and is the numerical reference.
+// is the shipping TurboQuantPartialReducer and is the numerical reference. kBatched and
+// kBatchedGemvMode are the dense form above, and are likewise one body and one knob apart.
 enum class ReduceLeg : std::uint32_t {
     kGemm = 0,
     kGemmGemvMode = 1,
     kVector = 2,
+    kBatched = 3,
+    kBatchedGemvMode = 4,
 };
 
 struct ReduceLaunch {
