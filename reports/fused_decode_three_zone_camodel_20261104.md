@@ -439,6 +439,66 @@ the simulator runner's own fixture, so this is most likely a bench-fixture
 disagreement rather than a kernel defect — stated as a hypothesis, not a
 conclusion.
 
+## Measured CAModel timing: the three-zone schedule is SLOWER
+
+Commit `34b61d8` built a trace-based comparison of the BF16 AIC path against the
+FP8 fused path, with affine fits and context extrapolation. Every trace in it
+was captured at `git_commit=4a1f0cf` — **before** `6b38819` introduced the three
+zones — so its "FP8 fused" series is the *pre*-three-zone schedule.
+`scripts/compare_decode_camodel_traces.py` now takes an optional third series
+(`--zone-short/--zone-medium/--zone-long`), and three new msprof captures of the
+current schedule were added at the same three contexts.
+
+This is the one comparison in that directory attributable to scheduling, and it
+is a clean one. Verified before drawing any conclusion:
+
+- the only `kernels/`+`include/` change between `4a1f0cf` and the captured
+  `713425d` is `turboquant_fused_decode_opt.cpp` from `6b38819` itself;
+- `config.json` and `config_stars.json` are byte-identical between captures;
+- same toolkit (`cann-9.2.0-beta.2`), same `Ascend950PR_9599`, same msprof
+  invocation (`--aic-metrics=PipeUtilization --launch-count=1 --timeout=10`);
+- same bench arguments (`--impl fused-opt --single --page-tokens 128 --heads 1
+  --rows 16 --requests 1 --splitk 1`);
+- MMAD counts identical at every context (4, 12, 24), so the work is the same.
+
+| Context | Pre-three-zone (µs) | Three-zone (µs) | Δ (µs) | Ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 13.913 | 14.172 | −0.259 | 0.982× |
+| 384 | 25.156 | 31.228 | −6.072 | **0.806×** |
+| 768 | 44.444 | 52.795 | −8.351 | **0.842×** |
+| 16384 | 828.859 (extrap.) | 929.862 (extrap.) | −101.003 | 0.891× |
+
+Affine fits on N=384 and N=768:
+
+- pre-three-zone: `5.867 + 0.050231478 × N` µs → **3.215 µs per 64-token tile**
+- three-zone: `9.661 + 0.056164645 × N` µs → **3.594 µs per 64-token tile**
+
+So the refactor costs ~11.8% more per tile *and* ~3.79 µs more fixed overhead.
+Both coefficients moved the wrong way, so this is not explained by a heavier
+prologue alone. At the same geometry and identical GEMM count, the three-zone
+schedule produces a **19–24% longer CAModel span** in the deep range.
+
+This does not contradict anything claimed earlier: the previous sections, and
+`6b38819`'s own report, make no performance claim, and the correctness evidence
+above stands unchanged. But the refactor's stated motivation was removing
+schedule boundary branches, and on the only timing evidence available it is a
+regression, not a win.
+
+**What this is not.** CAModel is not a cycle-accurate silicon model, so this is
+not a measured hardware regression; it is one launch per point with no variance
+estimate (deterministic per build, but no repeats); and N=128 is 2 tiles, below
+the deep threshold of 4, so it runs the short bounded path — the holdout crosses
+a code-path boundary and its +2.678 µs residual is not a pure extrapolation
+error. The 384/768 fit describes the deep path only.
+
+Artifacts in `reports/decode_trace_comparison_threezone_20261104/`:
+`README.md`, `zone_comparison.csv`, `comparison.json`, `comparison.png/svg`
+(three series), and `schedule_context_128_overlay.json` — two lanes of the same
+kernel at the same context differing only in schedule. The tool stays backward
+compatible: re-running `34b61d8`'s original five-argument command reproduces its
+`comparison.csv` byte-for-byte, with `README.md` differing only where the label
+"FP8 fused" became "FP8 fused (pre-three-zone)".
+
 ## Limitations
 
 - No physical NPU on this host. Every device number here is CAModel over

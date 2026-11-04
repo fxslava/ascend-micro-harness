@@ -3,6 +3,14 @@
 Old endpoints export partials and include query rotation. New endpoints take
 rotated queries and emit normalized context. Report those boundaries explicitly;
 never label their raw span ratio a measured full-operator/hardware speedup.
+
+An optional THIRD series is the three-zone schedule of the same fused kernel
+(--zone-short/--zone-medium/--zone-long). It differs from the `new` series in
+the schedule ONLY: same kernel symbol, same fixture, same geometry, same
+rotated-query -> normalized-context boundary. That is why the zone-vs-new
+comparison is reported separately and is the one ratio here attributable to
+scheduling; the old-vs-new ratio is not, and says so. Without those arguments
+the tool behaves exactly as before.
 """
 import argparse
 import copy
@@ -64,7 +72,29 @@ def overlay(old, new, destination):
                        sources=[old, new])), separators=(',', ':')), encoding='utf-8')
 
 
-def make_plot(out, points, old_model, new_model):
+def overlay_schedules(prezone, threezone, destination):
+    """Both lanes are the same kernel at the same context; only the schedule differs."""
+    events = []
+    for number, (label, datum) in enumerate((('PRE-THREE-ZONE schedule', prezone),
+                                             ('THREE-ZONE schedule', threezone))):
+        document = json.loads(Path(datum['path']).read_bytes())
+        source = document if isinstance(document, list) else document['traceEvents']
+        for event in source:
+            e = copy.deepcopy(event)
+            if 'pid' in e: e['pid'] = f"{label} / {e['pid']}"
+            if 'ts' in e: e['ts'] -= datum['start_us']
+            if e.get('name') == 'process_sort_index':
+                e['args']['sort_index'] += number * 3
+            events.append(e)
+    destination.write_text(json.dumps(dict(traceEvents=events, displayTimeUnit='us',
+        otherData=dict(context=prezone['context'],
+                       alignment='Each independent launch shifted to its first traced instruction.',
+                       note='Same kernel symbol, fixture and geometry; the schedule differs. '
+                            'Not one concurrent execution. Durations are unchanged.',
+                       sources=[prezone, threezone])), separators=(',', ':')), encoding='utf-8')
+
+
+def make_plot(out, points, old_model, new_model, zone_points=(), zone_model=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -80,6 +110,15 @@ def make_plot(out, points, old_model, new_model):
             ax.plot([lo, hi], [predict(model, lo), predict(model, hi)], color=color, linewidth=2.5)
             ax.scatter([p['context'] for p in series], [p['span_us'] for p in series],
                        color=color, s=32, zorder=3)
+        if zone_model:
+            ns = [128 + (maximum-128)*i/200 for i in range(201)]
+            ax.plot(ns, [predict(zone_model, n) for n in ns], '--', color='#1a7f37',
+                    label='FP8 fused, three-zone schedule')
+            lo, hi = zone_model['fitted_contexts']
+            ax.plot([lo, hi], [predict(zone_model, lo), predict(zone_model, hi)],
+                    color='#1a7f37', linewidth=2.5)
+            ax.scatter([p['context'] for p in zone_points], [p['span_us'] for p in zone_points],
+                       color='#1a7f37', s=32, zorder=3, marker='D')
         ax.set_xlim(0, maximum)
         ax.set_ylim(bottom=0)
         ax.set_xlabel('Context tokens')
@@ -100,10 +139,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('old-short', 'old-long', 'new-short', 'new-medium', 'new-long', 'out'):
         parser.add_argument('--'+name, required=True, type=Path)
+    # The three-zone series is optional, and all three parts go together: a
+    # fit on 384/768 with 128 held out is the same treatment the new series
+    # gets, so a partial set would silently compare unlike things.
+    for name in ('zone-short', 'zone-medium', 'zone-long'):
+        parser.add_argument('--'+name, type=Path)
     args = parser.parse_args()
+    zone_args = (args.zone_short, args.zone_medium, args.zone_long)
+    if any(zone_args) and not all(zone_args):
+        parser.error('--zone-short, --zone-medium and --zone-long must be given together')
     points = [point(args.old_short, 16, True), point(args.old_long, 128, True),
               point(args.new_short, 128), point(args.new_medium, 384), point(args.new_long, 768)]
     old, new = fit(*points[:2]), fit(*points[3:])
+    # Same MMAD expectation as the new series: the three-zone refactor changed
+    # the schedule, not the GEMM count, so a mismatch here means the capture is
+    # not the operator this comparison thinks it is.
+    zone_points = [point(p, n) for p, n in zip(zone_args, (128, 384, 768))] if all(zone_args) else []
+    zone = fit(*zone_points[1:]) if zone_points else None
     prefix = max(p['pre_score_prefix_us'] for p in points[:2])
     rows = []
     for n in (128, 384, 768, 1024, 4096, 8192, 16384):
@@ -114,6 +166,20 @@ def main():
                          new_source='observed' if n in (128,384,768) else 'extrapolated',
                          span_ratio=o/f, new_missing_stage_budget_us=o-f,
                          new_with_old_prefix_proxy_us=f+prefix, proxy_ratio=o/(f+prefix)))
+    # Three-zone versus the pre-three-zone schedule of the SAME kernel. Both
+    # series share the kernel symbol, fixture, geometry and boundary, so unlike
+    # the old/new ratio this difference is attributable to the schedule. Kept in
+    # its own table and CSV so comparison.csv's columns do not change shape.
+    zone_rows = []
+    for n in (128, 384, 768, 1024, 4096, 8192, 16384):
+        if not zone:
+            break
+        f = next((p['span_us'] for p in points[2:] if p['context'] == n), predict(new, n))
+        z = next((p['span_us'] for p in zone_points if p['context'] == n), predict(zone, n))
+        zone_rows.append(dict(context=n, prezone_span_us=f, threezone_span_us=z,
+                              prezone_source='observed' if n in (128, 384, 768) else 'extrapolated',
+                              threezone_source='observed' if n in (128, 384, 768) else 'extrapolated',
+                              delta_us=f - z, schedule_ratio=f / z))
     result = dict(points=points, old_model=old, new_model=new, comparison=rows,
         rotation_pc_fingerprint_equal=points[0]['rotation_mmads_pcs']==points[1]['rotation_mmads_pcs'],
         short_new_holdout_error_us=predict(new,128)-points[2]['span_us'],
@@ -131,18 +197,41 @@ def main():
                      'Full end-to-end also needs the missing boundary stages. Host/ACL launch overhead is not in the trace.',
                      'The proxy scenario charges the new path the entire observed old pre-score prefix and charges old normalization zero; this is an assumption, not a measured end-to-end time.',
                      'FP8 versus BF16, Cube PV versus Vector PV, and different fixtures prevent attributing ratios solely to scheduling.'])
+    if zone:
+        result.update(zone_points=zone_points, zone_model=zone, zone_comparison=zone_rows,
+                      zone_holdout_error_us=predict(zone, 128) - zone_points[0]['span_us'],
+                      zone_boundary='identical to `new`: same kernel symbol, fixture, geometry and '
+                                    'rotated-query -> normalized-context boundary; the schedule differs',
+                      zone_assumptions=[
+                          'Both series are the same kernel symbol at the same geometry, so this ratio -- unlike the old/new ratio -- is attributable to the schedule.',
+                          'Each series is fitted on N=384 and N=768 with N=128 held out; residuals are reported, not hidden.',
+                          'N=128 is 2 tiles, below the three-zone deep threshold of 4, so it runs the SHORT bounded path. The holdout therefore crosses a code-path boundary and its residual is not a pure extrapolation error; the 384/768 fit describes the deep path only.',
+                          'Fixed overhead and per-tile slope moved in the same direction here, so the regression is not explained by prologue cost alone.',
+                          'One launch per point, no repeats: CAModel is deterministic per build, but a single span carries no variance estimate.',
+                          'Still CAModel microseconds. The simulator is not a cycle-accurate silicon model, so a scheduling win here is not a measured hardware win.',
+                          'MMAD counts are asserted equal to the new series expectation, so a schedule that changed the GEMM count would fail rather than be compared.'])
     out=args.out; out.mkdir(parents=True, exist_ok=True)
     (out/'comparison.json').write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
     with (out/'comparison.csv').open('w',newline='',encoding='utf-8') as stream:
         writer=csv.DictWriter(stream,fieldnames=rows[0].keys()); writer.writeheader(); writer.writerows(rows)
+    if zone:
+        with (out/'zone_comparison.csv').open('w',newline='',encoding='utf-8') as stream:
+            writer=csv.DictWriter(stream,fieldnames=zone_rows[0].keys())
+            writer.writeheader(); writer.writerows(zone_rows)
     overlay(points[1],points[2],out/'matched_context_128_overlay.json')
-    make_plot(out,points,old,new)
+    if zone:
+        # Same-context, same-kernel overlay: the one overlay in this directory
+        # whose two lanes differ only by schedule.
+        overlay_schedules(points[2], zone_points[0], out/'schedule_context_128_overlay.json')
+    make_plot(out,points,old,new,zone_points,zone)
     md = ['# BF16 AIC versus fused FP8: trace-based context extrapolation','',
           'One KV head, 16 shared query rows, D=256, K=1. All values below are **CAModel microseconds**, not silicon latency.', '',
           '**Boundary difference:** the BF16 trace includes raw-query rotation and exports partials; the FP8 trace accepts a rotated query and writes normalized context. The span ratio is not a measured full-operator speedup.', '',
           '## Native observations', '', '| Path | Context | MMADs | First instruction → last completion (µs) |', '| --- | ---: | ---: | ---: |']
     for i,p in enumerate(points):
-        md.append(f"| {'BF16 AIC' if i<2 else 'FP8 fused'} | {p['context']} | {p['mmads']} | {p['span_us']:.6f} |")
+        md.append(f"| {'BF16 AIC' if i<2 else 'FP8 fused (pre-three-zone)'} | {p['context']} | {p['mmads']} | {p['span_us']:.6f} |")
+    for p in zone_points:
+        md.append(f"| FP8 fused (three-zone) | {p['context']} | {p['mmads']} | {p['span_us']:.6f} |")
     md += ['', '## Affine models', '',
            f"`T_BF16(N) = {old['fixed_us']:.6f} + {old['us_per_token']:.9f} × N` µs.", '',
            f"`T_FP8(N) = {new['fixed_us']:.6f} + {new['us_per_token']:.9f} × N` µs.", '',
@@ -160,6 +249,27 @@ def main():
            '| Context | BF16, normalization free (µs) | FP8 + old-prefix proxy (µs) | Conditional ratio |', '| ---: | ---: | ---: | ---: |']
     for r in rows:
         md.append(f"| {r['context']} | {r['old_partial_span_us']:.3f} | {r['new_with_old_prefix_proxy_us']:.3f} | {r['proxy_ratio']:.2f}× |")
+    if zone:
+        md += ['', '## Three-zone schedule versus the pre-three-zone schedule', '',
+               'This is the **only** comparison here attributable to scheduling. Both series are',
+               'the same kernel symbol (`turboquant_mm_fused_decode_opt_kv4fp8_half`) at the same',
+               'geometry, fixture and boundary; they differ in the schedule alone. The pre-three-zone',
+               'captures were taken at commit `4a1f0cf`, before `6b38819` introduced the three zones.', '',
+               f"`T_three_zone(N) = {zone['fixed_us']:.6f} + {zone['us_per_token']:.9f} × N` µs, "
+               f"fitted on N=384 and N=768, with an N=128 holdout residual of "
+               f"{result['zone_holdout_error_us']:+.6f} µs.", '',
+               f"Per 64-token tile: {zone['us_per_token']*64:.6f} µs three-zone versus "
+               f"{new['us_per_token']*64:.6f} µs pre-three-zone.", '',
+               '| Context | Pre-three-zone span (µs) | Three-zone span (µs) | Δ (µs) | Ratio |',
+               '| ---: | ---: | ---: | ---: | ---: |']
+        for r in zone_rows:
+            md.append(f"| {r['context']} | {r['prezone_span_us']:.3f} ({r['prezone_source']}) | "
+                      f"{r['threezone_span_us']:.3f} ({r['threezone_source']}) | "
+                      f"{r['delta_us']:+.3f} | {r['schedule_ratio']:.3f}× |")
+        md += ['', 'A ratio above 1.000 means the three-zone schedule produced the shorter span.',
+               'MMAD counts are asserted identical to the pre-three-zone expectation, so a schedule',
+               'that had changed the GEMM count would have failed this tool rather than been compared.', '',
+               '### Three-zone limits', ''] + ['* '+x for x in result['zone_assumptions']]
     md += ['', 'Inverse basis/gating and host dispatch are additional costs if the target boundary requires them. Their equality between paths would be another assumption.', '',
            '## Assumptions and limits', ''] + ['* '+x for x in result['assumptions']] + ['',
            '## Artifacts', '',
@@ -167,8 +277,16 @@ def main():
            '* `comparison.png` / `comparison.svg`: observed points and dashed extrapolations.',
            '* `matched_context_128_overlay.json`: two independent real N=128 traces, each shifted to start at zero and given distinct process names. Durations are unchanged; the overlay does not imply concurrent execution.', '',
            'Sources:', ''] + [f"* N={p['context']}: `{p['path']}`; SHA-256 `{p['sha256']}`." for p in points]
+    if zone:
+        md += [''] + [f"* three-zone N={p['context']}: `{p['path']}`; SHA-256 `{p['sha256']}`."
+                      for p in zone_points]
+        md += ['', '* `zone_comparison.csv`: the schedule-only table above.',
+               '* `schedule_context_128_overlay.json`: the two schedules at N=128, each shifted to '
+               'start at zero. Same kernel and geometry; not one concurrent execution.']
     (out/'README.md').write_text('\n'.join(md)+'\n',encoding='utf-8')
-    print(json.dumps(dict(old_model=old,new_model=new,comparison=rows),indent=2))
+    summary = dict(old_model=old,new_model=new,comparison=rows)
+    if zone: summary.update(zone_model=zone, zone_comparison=zone_rows)
+    print(json.dumps(summary,indent=2))
 
 
 if __name__ == '__main__': main()

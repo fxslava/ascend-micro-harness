@@ -1,0 +1,1 @@
+/usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin/msprof op simulator --application=/tmp/ascend-camodel-trace.9mIab8/run/application.sh --output=/tmp/ascend-camodel-trace.9mIab8/profile --soc-version=Ascend950PR_9599 --aic-metrics=PipeUtilization --kernel-name=turboquant_paged_decode_splitk_aic --launch-count=1 --timeout=5 

@@ -1,0 +1,16 @@
+git_commit=713425db3781a90b2e1393303dd0e60553538fac
+build_root=/home/dmin/work/three-zone-check-20261103
+work=/tmp/ascend-fused-opt-json.AAvwdu
+soc=Ascend950PR_9599
+kernel=turboquant_mm_fused_decode_opt_kv4fp8_half
+impl=fused-opt
+context=768
+page_tokens=128
+kv_heads=1
+shared_query_rows=16
+splits=1
+requests=1
+LD_LIBRARY_PATH=/home/dmin/work/three-zone-check-20261103/build/lib:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib:/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/devlib:/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.2.0-beta.2/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/cann-9.2.0-beta.2/devlib
+CAMODEL_CONFIG_PATH=/tmp/ascend-fused-opt-json.AAvwdu/config
+ed557a997a716d39379be9b13885cd7fb1991e610fd44ae1b36244c6d6991b8f  /home/dmin/work/three-zone-check-20261103/build/lib/bench_decode_splitk_sim
+ffc53c9d115226928408a2fdaf28bf0f0198c2d7576d92a6f14594d2d5490e94  /home/dmin/work/three-zone-check-20261103/build/lib/libcamodel_fused_decode_opt_kernel.so
