@@ -193,6 +193,17 @@ struct FusedOptRig {
             tq_npu::require(image[FusedOptBuffer::guard + i] == 0xAA,
                             "fused-opt inactive output changed");
 
+        // The measured worst ULP, said out loud on every raw-query launch. kUlpBudgetRestaged
+        // is a placeholder until a run reports what the number actually is, and a budget nobody
+        // can see the margin on is a budget nobody will ever tighten. stderr, so it cannot land
+        // in the middle of the benchmark's table on stdout.
+        if (!mode.pre_rotate)
+            std::fprintf(stderr,
+                         "fused-opt basis: raw-query entry, prologue %s, output stage %u, "
+                         "worst fp16 ULP %d against a budget of %d\n",
+                         mode.cube_chunk ? "Cube chunk" : "vector cores", mode.post_rotate,
+                         worst_ulp, budget);
+
         const auto partials = workspace.Download();
         if (config.splits > 1) {
             const auto floats = std::size_t(f.requests) * config.heads * config.splits * (256 + 16);
