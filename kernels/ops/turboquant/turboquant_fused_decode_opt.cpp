@@ -1065,6 +1065,24 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
 
 }
 
+// The raw-query entry, through the same convenience ABI. It exists because the only launcher
+// this harness had called the PRE-ROTATED kernel, so nothing could reach the query prologue or
+// the output stage at all -- neither a test nor a benchmark nor an msprof run.
+extern "C" void launch_fused_decode_opt_raw_query(void* stream,
+    const ascend_micro::fused_decode_opt::Launch* c,
+    const ascend_micro::fused_decode_opt::RawQueryBuffers* b)
+{
+    if (!c || !b) throw std::invalid_argument("null fused decode raw-query launch descriptor");
+    vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl(4, vllm_ascend::AscendType::FP16,
+        stream, c->grid, b->raw_query, b->pi_signs, b->rot_tables, b->h16, b->gate,
+        b->decode.query, b->decode.key, b->decode.value, b->decode.scales, b->decode.block_table,
+        b->decode.context_lengths, b->decode.mode_tables, b->decode.workspace, b->decode.output,
+        c->tokens, c->heads, c->kv_heads, c->head_size, c->block_size, c->max_blocks, c->splits,
+        c->heads_per_task, c->tasks_per_block, c->reduce_tasks_per_block,
+        c->prologue_vectors_per_block, c->prologue_cube_chunk_vectors, c->output_stage,
+        c->fused_context_limit, c->scale, c->inv_sqrt_len);
+}
+
 extern "C" void launch_fused_decode_opt(void* stream,
     const ascend_micro::fused_decode_opt::Launch* c,
     const ascend_micro::fused_decode_opt::Buffers* b)

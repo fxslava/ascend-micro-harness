@@ -239,6 +239,48 @@ The benchmark's `--context` accepts a ragged value on the fused-opt path only, s
 decoders' fixture still requires alignment, and its zone decomposition counts
 `ceil(live rows / 64)` per page rather than assuming whole pages.
 
+### The query basis: pre-rotate on/off, and the post-rotate stage
+
+The operator has two entry points. The pre-rotated one takes `queryRot` already in the rotated
+basis; the RAW-QUERY one takes the query in the original basis plus the basis tables, rotates it
+once in a prologue, and picks an output stage for the egress. **Neither the raw-query entry nor
+the output stage had ever been called anywhere in this repository** — no test, no probe, no
+benchmark, and no launcher in the convenience ABI, because `launch_fused_decode_opt` only ever
+called the pre-rotated kernel. So `--pre-rotate off` was not a flag over an existing path; it
+needed that path brought online first.
+
+**The basis, read off the kernel rather than assumed.** `TurboQuantCodec4::ApplyPi` is
+`x *= piSigns; FWHT(x); x *= piSigns`, and the FWHT applies `Muls(invSqrtLen)` once at the end,
+so `Pi = diag(s) . H . diag(s) / sqrt(D)` with `H` the unnormalised Walsh-Hadamard. `H` is
+symmetric and `H^2 = D.I`, which makes **Pi symmetric and Pi^2 = I exactly**.
+
+**The table pool.** `rotTables` is the codec's whole constant pool, and nothing here had ever
+built one. `Init` carves it as three early-stage `sign_`/`xorOffset_` pairs followed by the
+quantiser's tables, which the word count pins exactly: `7*256 + 2*256 + 16 = 2320`. `ApplyPi`
+reads only the early stages, and `Gather(swap_, x, xorOffset_[stage], 0, n)` followed by
+`Add(x, swap_, tmp)` forces the contents — `sign[i] = +1` iff `(i & stride) == 0`, and the
+gather index is a BYTE offset to `i ^ stride`, `kGatherSrcBase` being 0 and the vector service's
+own gather indices being byte offsets too. The quantiser's part of the pool is left zero, which
+is also an in-bounds offset.
+
+**Why the oracle survives the mode switch.** Because Pi is an exact involution, the raw query
+whose rotation is the fixture's pre-rotated query is simply `Pi(query)` — and every entry of it
+is fp16-exact. So output stage 0 is held to the SAME attention oracle as the pre-rotated entry
+rather than to a looser one, and `tests/cpu/test_fused_decode_opt_fixture.cpp` pins that:
+`Pi(raw) == query` **bitwise**, channel for channel, plus Pi's involution and orthogonality and
+the 2320-word pool length. Stages 1 and 2 compare against `Pi(context)` and
+`Pi(context) / (1 + exp(-gate))` computed on the host.
+
+The rig also validates the **prologue by itself**: in raw-query mode the query buffer is an
+OUTPUT, so `Validate` compares what the kernel wrote against the host's own Pi image before it
+looks at the attention at all, which separates a prologue fault from a decode fault.
+
+**Not established.** The raw-query path had not been executed when this was written — a CAModel
+sweep of the control, the three stages, the Cube-chunk prologue and the CLI guards was in flight.
+And the ULP budget for stages 1 and 2 (`kUlpBudgetRestaged = 8`) is a **first-run placeholder,
+not a measurement**: the rig prints the worst ULP it actually saw, and that number is what
+should replace it.
+
 ### The benchmark, isolated
 
 `bench_turboquant_decode_splitk` now contains **one kernel**: the fused operator. The legacy
@@ -359,16 +401,34 @@ proof of it:
 benchmark row are `NA` because the simulator reports no device-event timing, and this preset's
 workers are one tile deep, which is below the steady loop entirely.
 
-### 5.2a The expanded ladder's own CAModel sweep, in flight
+### 5.2a The expanded ladder's geometries, on CAModel
 
-A CAModel sweep of the geometries the ladder gained — ragged contexts, non-power-of-2 splits and
-4 KV heads — was launched against this tree and had not finished when this was written:
-`N = 79` at `S = 1` and `S = 3`, `N = 257` at `S = 2`, `N = 384` at `S = 3`, `N = 128` at 4 KV
-heads, and an aligned control, all through the benchmark's simulator twin so that the SHARED
-fixture's new ragged oracle is what the kernel is compared against; plus `--tail-rows 15` and
-`--tail-rows 1` through the CAModel probe, whose oracle is independent of the fixture's.
-**If their results are not recorded here, they did not finish, and the commands are in §6.**
-Nothing else in this report's PASS column depends on them.
+Nine launches, all **PASS**. Six went through the benchmark's simulator twin, which builds from
+the SHARED fixture — so these are the new row-weighted ragged oracle checked against the kernel,
+not against itself — and three through the CAModel probe, whose oracle is written independently
+of the fixture and which reports canaries and input immutability as well:
+
+| rung | geometry | result |
+| --- | --- | --- |
+| `ragged-79-s1` | `N = 79`, one page, 2 tiles, a 15-row tail, `S = 1` | **PASS** — oracle matched, `AIV=0 AIC=0 OPT=1` |
+| `ragged-257-s2` | `N = 257`, three pages, the last holding ONE token, `S = 2` | **PASS** — the worker owning page 2 has a single live row in its only tile |
+| `ragged-79-s3` | `N = 79`, `S = 3`: a ragged worker and two empty ones | **PASS** — ragged tail, empty workers and a non-power-of-2 split count together |
+| `npo2-384-s3` | `N = 384`, three pages, `S = 3` | **PASS** — the aligned non-power-of-2 partition |
+| `kvh4-128-s1` | 4 KV heads, 64 query heads, `S = 1` | **PASS** |
+| `aligned-128-s1` | the aligned control | **PASS** |
+| `probe-tail-15` | probe, `--tiles 2 --tail-rows 15` | **PASS** — `comparison=exact inputs=unchanged guards=0x5A-intact` |
+| `probe-tail-1` | probe, `--tiles 5 --tail-rows 1 --splits 2` | **PASS** — same, at a one-row tail with Split-K |
+| `probe-aligned` | probe, `--tiles 2 --tail-rows 64` | **PASS** — the probe's own control |
+
+The two sets matter for different reasons. The benchmark rungs are the only check that the
+fixture's new oracle agrees with the kernel; the probe rungs are the only ones here that also
+assert canaries and byte-for-byte input immutability, and their oracle shares no code with the
+fixture's, so `comparison=exact` on a 15-row and a 1-row tail is independent corroboration that
+the masking is right rather than that two copies of one formula agree.
+
+What this still does not cover: these are CAModel launches at small geometries, not the hardware
+ladder, and they do not touch the deep three-zone path with a ragged tail (every rung above is
+1–6 tiles per worker). §5's summary stands.
 
 ### 5.2 The switch gate, three legs
 
@@ -431,10 +491,10 @@ oracle. That is one geometry. What it does **not** cover:
   §5's "not run by instruction" list. A benchmark comparing its result against an oracle is not
   a canary check: nothing in §5.1 would have noticed a write outside a buffer that the oracle
   does not read.
-* **every rung the ladder gained for ragged contexts, non-power-of-2 splits and 4 KV heads.**
-  They compile, their geometry is checked over all 36 launches, and the fixture change behind
-  them is gated on the host — but no ragged or 4-KV-head geometry has been executed, on a model
-  or on silicon, as part of this change. §5.2a lists the sweep that was in flight.
+* **the ladder's new geometries on HARDWARE.** Ragged contexts, non-power-of-2 splits and 4 KV
+  heads now have CAModel evidence at small geometries — §5.2a, nine launches, all passing,
+  including a probe whose oracle is independent of the fixture's — but none of it is a hardware
+  run, and none of it reaches the deep three-zone path with a ragged tail.
 
 So: the tree compiles strictly on both legs at the new default, the switch is reversible and
 gated in both directions, and the one run that exists says the operator is still correct at one

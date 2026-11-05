@@ -92,6 +92,15 @@ struct Launch {
     std::uint32_t splits = 1, heads_per_task = 16, tasks_per_block = 1;
     std::uint32_t reduce_tasks_per_block = 16, fused_context_limit = 4096;
     float scale = 0.0625f, inv_sqrt_len = 0.0625f;
+    // The RAW-QUERY entry only; the pre-rotated entry ignores all three.
+    //   prologue_vectors_per_block  grid * this must cover tokens * heads query vectors
+    //   prologue_cube_chunk_vectors 0 = the vector cores rotate the whole share with ApplyPi;
+    //                               16 = whole chunks of the share rotate on the Cube
+    //   output_stage                TurboQuantOutputStage: 0 leaves the context in the rotated
+    //                               basis, 1 rotates it back (Pi^2 = I), 2 also divides by
+    //                               1 + exp(-gate). Only 1 and 2 read the gate buffer.
+    std::uint32_t prologue_vectors_per_block = 0, prologue_cube_chunk_vectors = 0;
+    std::uint32_t output_stage = 0;
     // Diagnostic ABI only: production launcher never receives these fields.
     std::uint32_t probe_page = UINT32_MAX, probe_tile = 0;
 };
@@ -99,11 +108,26 @@ struct Buffers {
     void *query, *key, *value, *scales, *block_table, *context_lengths;
     void *mode_tables, *workspace, *output;
 };
+
+// The raw-query entry's inputs: the pre-rotated entry's buffers plus the original-basis query
+// and the basis tables. `raw_query` is scalar_t -- fp16 for the kv4fp8 instance -- while
+// `decode.query` is the fp32 rotated image the prologue WRITES and the decode then reads, so a
+// raw-query launch needs both and they are not interchangeable.
+struct RawQueryBuffers {
+    void *raw_query, *pi_signs, *rot_tables, *h16, *gate;
+    Buffers decode;
+};
 } // namespace ascend_micro::fused_decode_opt
 
 extern "C" void launch_fused_decode_opt(void* stream,
     const ascend_micro::fused_decode_opt::Launch* launch,
     const ascend_micro::fused_decode_opt::Buffers* buffers);
+
+// The raw-query counterpart. Same geometry, same validation, one extra guard set: the prologue
+// share has to cover every query vector and the output stage has to name a real stage.
+extern "C" void launch_fused_decode_opt_raw_query(void* stream,
+    const ascend_micro::fused_decode_opt::Launch* launch,
+    const ascend_micro::fused_decode_opt::RawQueryBuffers* buffers);
 
 // Original launch APIs retained for callers that already have upstream tiling.
 namespace vllm_ascend {

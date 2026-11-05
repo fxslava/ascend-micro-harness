@@ -141,7 +141,79 @@ int main()
         for (float v : r.expected) (void)fused_decode_opt_test::reference_half(v);
     }
 
+    // ------------------------------------------------------- the raw-query Pi basis
+    // Pi = diag(s) . H . diag(s) / sqrt(D) with H the unnormalised Walsh-Hadamard. H is
+    // symmetric and H^2 = D.I, so Pi is symmetric and Pi^2 = I EXACTLY -- which is the whole
+    // reason the raw-query fixture can reuse the pre-rotated oracle. Checked, not assumed.
+    {
+        using fused_decode_opt_test::RawQueryBasis;
+        const RawQueryBasis pi;
+        require(pi.dim == 256);
+        require(RawQueryBasis::inv_sqrt_len(256) == 1.0f / 16.0f);
+        // The codec's pool is exactly ConstTableWords(256, 1) = 7*256 + 2*256 + 16 words.
+        require(pi.tables().size() == 7u * 256 + 2u * 256 + 16);
+        require(pi.h16().size() == 16u * 16);
+        for (int c = 0; c < 256; c += 17) {
+            std::vector<float> e(256, 0.0f);
+            e[std::size_t(c)] = 1.0f;
+            const auto once = pi.apply(e.data());
+            const auto twice = pi.apply(once.data());
+            for (int i = 0; i < 256; ++i) {
+                require(twice[std::size_t(i)] == e[std::size_t(i)]);  // bitwise
+                require(std::fabs(std::fabs(once[std::size_t(i)]) - 1.0f / 16.0f) < 1e-12);
+            }
+        }
+        for (int a = 0; a < 8; ++a)
+            for (int b = 0; b < 8; ++b) {
+                std::vector<float> ea(256, 0.0f), eb(256, 0.0f);
+                ea[std::size_t(a)] = 1.0f;
+                eb[std::size_t(b)] = 1.0f;
+                const auto ca = pi.apply(ea.data()), cb = pi.apply(eb.data());
+                double dot = 0;
+                for (int i = 0; i < 256; ++i) dot += double(ca[std::size_t(i)]) * cb[std::size_t(i)];
+                require(std::fabs(dot - (a == b ? 1.0 : 0.0)) < 1e-9);
+            }
+
+        // The raw query the device's prologue is handed, and what it must produce from it: the
+        // pre-rotated query, BIT FOR BIT. If this ever stops holding, the raw-query entry's
+        // output can no longer be held to the pre-rotated entry's oracle at output stage 0.
+        Fixture r(1024, 1, 1, 16, 128);
+        const auto raw = r.raw_query(pi);
+        require(raw.size() == r.query.size());
+        for (std::size_t row = 0; row < r.query.size() / 256; ++row) {
+            std::vector<float> back(256);
+            for (int c = 0; c < 256; ++c)
+                back[std::size_t(c)] =
+                    ascend_micro::sim::half_to_float(raw[row * 256 + std::size_t(c)]);
+            const auto rotated = pi.apply(back.data());
+            for (int c = 0; c < 256; ++c)
+                require(rotated[std::size_t(c)] == r.query[row * 256 + std::size_t(c)]);
+        }
+        // The three output stages, and the gate.
+        const auto s0 = r.expected_row(pi, 0, 0), s1 = r.expected_row(pi, 0, 1),
+                   s2 = r.expected_row(pi, 0, 2);
+        for (int c = 0; c < 256; ++c) require(s0[std::size_t(c)] == r.expected[std::size_t(c)]);
+        const auto again = pi.apply(s1.data());
+        for (int c = 0; c < 256; ++c)
+            require(std::fabs(again[std::size_t(c)] - s0[std::size_t(c)]) < 1e-4);
+        int gated = 0;
+        for (int c = 0; c < 256; ++c)
+            if (s2[std::size_t(c)] != s1[std::size_t(c)]) ++gated;
+        require(gated > 200);
+        const auto gate = r.gate_logits();
+        require(gate.size() == r.query.size());
+        for (std::size_t i = 0; i < 64; ++i)
+            require(ascend_micro::sim::half_to_float(gate[i]) == Fixture::gate_value(i));
+        // The raw-query launch covers every query vector with its prologue share.
+        const auto rc = r.launch_raw(2, 1, 0);
+        require(rc.output_stage == 1 && rc.prologue_cube_chunk_vectors == 0);
+        require(std::uint64_t(rc.grid) * rc.prologue_vectors_per_block >=
+                std::uint64_t(r.requests) * rc.heads);
+    }
+
     std::puts("PASS fused-opt fixture: fragmented pages, independent NZ inverse, GQA/request "
               "variation, exact one-tile oracle, capped grid, ragged tile/page arithmetic, "
-              "bit-identical aligned oracle and an independently recomputed ragged oracle");
+              "bit-identical aligned oracle, an independently recomputed ragged oracle, and a "
+              "Pi basis that is an exact involution whose raw query rotates back to the "
+              "pre-rotated query bitwise");
 }

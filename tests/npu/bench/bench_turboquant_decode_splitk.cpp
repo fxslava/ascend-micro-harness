@@ -77,6 +77,11 @@ struct Options {
 #endif
     int page_begin = 0, page_count = -1;
     bool zone_report = false;
+    // The query basis, fused-opt only. pre_rotate off selects the RAW-QUERY entry, whose
+    // prologue rotates the query on the device and whose output stage post_rotate selects:
+    // 0 leaves the context in the rotated basis, 1 rotates it back, 2 also applies the gate.
+    bool pre_rotate = true;
+    unsigned post_rotate = 0, prologue_cube = 0;
     bool Aiv() const { return impl == "aiv" || impl == "both" || impl == "all"; }
     bool Aic() const { return impl == "aic" || impl == "both" || impl == "all"; }
     // `three-zone` is an alias, not a second kernel: the three-zone schedule
@@ -213,6 +218,9 @@ Options parse(int argc, char** argv)
                       "fused-opt page-tokens: 64 or 128; other implementations: 16 or 128.\n"
                       "fused-opt also takes a RAGGED --context (not a multiple of page-tokens\n"
                       "or of the 64-row tile), e.g. --context 79 or 1055; the others do not.\n"
+                      "--pre-rotate on|off: off selects the raw-query entry, whose prologue\n"
+                      "  rotates the query on the device. --post-rotate rotated|unrotated|gated\n"
+                      "  and --prologue-cube 0|16 configure it and need --pre-rotate off.\n"
                       "Use --page-tokens 16 --heads 1 --context 48 for a short CAModel run.");
             std::exit(0);
         }
@@ -229,6 +237,15 @@ Options parse(int argc, char** argv)
         else if (arg == "--rows") o.rows = number(value);
         else if (arg == "--page-tokens") o.page_tokens = number(value);
         else if (arg == "--impl") o.impl = value;
+        else if (arg == "--pre-rotate") {
+            require(value == "on" || value == "off", "--pre-rotate takes on or off");
+            o.pre_rotate = value == "on";
+        } else if (arg == "--post-rotate") {
+            if (value == "rotated" || value == "0") o.post_rotate = 0;
+            else if (value == "unrotated" || value == "1") o.post_rotate = 1;
+            else if (value == "gated" || value == "2") o.post_rotate = 2;
+            else require(false, "--post-rotate takes rotated|unrotated|gated (or 0|1|2)");
+        } else if (arg == "--prologue-cube") o.prologue_cube = unsigned(number(value));
         else if (arg == "--csv-out") o.csv_out = value;
         else if (arg == "--page-begin") o.page_begin = number(value);
         else if (arg == "--page-count") o.page_count = number(value);
@@ -269,6 +286,15 @@ Options parse(int argc, char** argv)
     }
     for (int k : o.splits) require(k >= 1 && k <= (o.OptOnly() ? 8 : 16),
                                  "splitk must be 1..8 for fused-opt, otherwise 1..16");
+    // The query basis only exists on the fused operator, and the output stage and the prologue
+    // Cube chunk only exist on its raw-query entry: the pre-rotated entry is handed an already
+    // rotated query and emits the context in that basis, with no stage to choose.
+    require(o.pre_rotate || o.Opt(),
+            "--pre-rotate off needs --impl fused-opt, three-zone or all");
+    require(o.pre_rotate ? (o.post_rotate == 0 && o.prologue_cube == 0) : true,
+            "--post-rotate and --prologue-cube need --pre-rotate off");
+    require(o.prologue_cube == 0 || o.prologue_cube == 16,
+            "--prologue-cube takes 0 (vector cores) or 16 (the Cube chunk)");
     require(o.iters > 0 && o.warmup >= 0 && o.requests > 0 && o.requests <= 16,
             "invalid iteration or batch bound");
     return o;
@@ -468,6 +494,17 @@ int main(int argc, char** argv)
         if (o.Opt()) {
             std::puts("OPT: KV4/FP8, FP32 pre-rotated GQA queries, FP16 rotated-basis output; complete in-launch Split-K combine.");
             std::printf("OPT GQA query heads per KV head=%d; OPT Grid is the actual dispatch (capped at 32 blocks).\n", o.rows);
+            if (o.pre_rotate) {
+                std::puts("OPT query basis: PRE-ROTATED entry; the host supplies the rotated query,");
+                std::puts("and the context stays in that basis. --pre-rotate off takes the raw-query entry.");
+            } else {
+                static const char* const kStageName[] = {"rotated basis", "unrotated", "gated"};
+                std::printf("OPT query basis: RAW-QUERY entry; the device rotates the query in a "
+                            "prologue (%s), output stage %u (%s).\n",
+                            o.prologue_cube ? "Cube chunk of 16 vectors" : "vector cores only",
+                            o.post_rotate, kStageName[o.post_rotate]);
+                std::puts("Its rotated query is checked against the host Pi image before the context is.");
+            }
             std::puts("OPT speedup uses its own K=1 baseline; cache GB/s excludes fragmented canary pages. Worker timestamps: unavailable.");
             if (o.impl == "all") std::puts("OPT columns are NA for unsupported K>8. Fixtures/precision differ; no cross-implementation speedup is inferred.");
         }
@@ -530,7 +567,9 @@ int main(int argc, char** argv)
                 }
 #endif
                 if (opt_fixture && k <= 8) {
-                    tq_splitk_rig::FusedOptRig d(*opt_fixture, k);
+                    const tq_splitk_rig::FusedOptMode basis_mode{o.pre_rotate, o.post_rotate,
+                                                                 o.prologue_cube};
+                    tq_splitk_rig::FusedOptRig d(*opt_fixture, k, basis_mode);
                     opt = measure(d, o, k, session.stream, events);
                     opt_launches += opt.launches; opt_grid = d.config.grid;
                     if (k == 1 && opt.timed) opt_baseline = opt.us;
