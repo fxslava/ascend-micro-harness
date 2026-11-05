@@ -136,17 +136,26 @@ ZoneShape zone_shape(int tiles)
 // the fused-opt fixture specifically, whose block table maps EVERY logical
 // page; CountTiles skips negative entries, so a fixture with holes would need
 // the table itself rather than this arithmetic.
+//
+// RAGGED CONTEXTS: seqBlocks is the CEILING, the last page holds
+// context - (seqBlocks - 1) * page_tokens live rows, and a page contributes
+// ceil(live / 64) tiles -- never a tile of zero, which is what keeps an
+// all-masked strip out of the masking phase.
 std::vector<ZoneShape> worker_zones(int context, int page_tokens, int k)
 {
-    const int seq_blocks = context / page_tokens;
-    const int tiles_per_block = page_tokens / kZoneTileRows;
+    const int seq_blocks = (context + page_tokens - 1) / page_tokens;
     const int workers = k <= 1 ? 1 : k;
     const int per_split = (seq_blocks + workers - 1) / workers;
     std::vector<ZoneShape> out;
     for (int split = 0; split < workers; ++split) {
         const int start = split * per_split;
         const int end = std::min(start + per_split, seq_blocks);
-        out.push_back(zone_shape(std::max(0, end - start) * tiles_per_block));
+        int tiles = 0;
+        for (int block = start; block < end; ++block) {
+            const int live = std::min(page_tokens, context - block * page_tokens);
+            if (live > 0) tiles += (live + kZoneTileRows - 1) / kZoneTileRows;
+        }
+        out.push_back(zone_shape(tiles));
     }
     return out;
 }
@@ -202,6 +211,8 @@ Options parse(int argc, char** argv)
                       "and with --impl fused-opt as well, so it predates the three-zone work).\n"
                       "--rows 16 passes. The range is left as-is so the failure stays reproducible.\n"
                       "fused-opt page-tokens: 64 or 128; other implementations: 16 or 128.\n"
+                      "fused-opt also takes a RAGGED --context (not a multiple of page-tokens\n"
+                      "or of the 64-row tile), e.g. --context 79 or 1055; the others do not.\n"
                       "Use --page-tokens 16 --heads 1 --context 48 for a short CAModel run.");
             std::exit(0);
         }
@@ -243,9 +254,14 @@ Options parse(int argc, char** argv)
             o.rows <= (o.OptOnly() ? 16 : 8),
             "heads must be 1..4; rows 1..16 for fused-opt, otherwise 1..8");
     for (int n : o.contexts) {
-        require(n > 0 && n <= 16384 && n % o.page_tokens == 0,
-                "context must be a multiple of page-tokens, at most 16384");
-        const int pages = n / o.page_tokens;
+        // The fused operator takes a RAGGED context: its fixture's page count is the ceiling,
+        // the last page holds n - (pages - 1) * page_tokens live tokens, and the kernel masks
+        // the tail of the last 64-row tile. The legacy decoders' fixture requires an aligned
+        // context, so an unaligned one stays an error for them rather than being rounded.
+        require(n > 0 && n <= 16384, "context must be positive and at most 16384");
+        require(o.OptOnly() || n % o.page_tokens == 0,
+                "an unaligned context needs --impl fused-opt or three-zone");
+        const int pages = (n + o.page_tokens - 1) / o.page_tokens;
         require(o.page_begin <= pages && (o.page_count < 0 || o.page_count <= pages - o.page_begin),
                 "AIC page window exceeds context");
         if (o.impl != "aic") require(o.page_begin == 0 && (o.page_count == -1 || o.page_count == pages),

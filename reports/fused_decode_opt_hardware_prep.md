@@ -159,8 +159,11 @@ and nothing else would notice it rotting.
 
 ### `tests/npu/validation/test_turboquant_fused_decode_opt_npu.cpp`
 
-16 launches: four contexts × `S ∈ {1, 2, 4, 8}`, 16 query heads over one KV head, `D = 256`,
-128-token pages. Per launch:
+36 launches over nine rungs, each a (context, tokens, KV heads, query heads per KV head)
+geometry with its own split sweep. `D = 256` and 128-token pages throughout; `S` ranges over
+`{1, 2, 3, 4, 5, 7, 8}` across the ladder, 1 and 4 KV heads, 16 query heads per KV head. Four
+of the nine rungs are **ragged** — the context divides neither the page nor the 64-row Cube
+tile. Per launch:
 
 * **the oracle**, every emitted FP16 channel against the fixture's own scalar FP64 attention
   sum, at a budget of **zero fp16 ULP** (§8 of the batched-reduction report measured 0 on
@@ -177,10 +180,64 @@ and nothing else would notice it rotting.
   `NeedsReduction()` says it should not;
 * **input immutability**, byte for byte, on all seven input allocations.
 
-The contexts cover every path the schedule has: one page (so `S > 1` leaves unmapped, empty
-workers — §2.3's exit), eight pages (the bounded short pipeline at `S = 8`), sixteen pages
-(the deep three-zone path at every `S`, and 32 tiles in one worker at `S = 1`, which wraps the
-three-slot ring ten times), and sixteen pages over two tokens.
+The rungs cover every path the schedule has. **Aligned, one KV head:** one page (so `S > 1`
+leaves unmapped, empty workers — §2.3's exit); eight pages (the bounded short pipeline at
+`S = 8`); sixteen pages (the deep three-zone path at every `S`, 32 tiles in one worker at
+`S = 1`, which wraps the three-slot ring ten times, and the non-power-of-2 sweep
+`S ∈ {3, 5, 7}`); sixteen pages over two tokens. **Ragged:** 79 (one page, 79 live rows — one
+full tile and a 15-row tail), 257 (three pages, the last holding ONE token, so its only tile
+has a single live row), and 1055 (nine pages, a 31-row tail that lands on a different worker as
+`S` changes). **Multi-KV-head:** 4 KV heads × 16 query heads = 64 query heads, at 1024 aligned
+(where `S = 8` dispatches a grid of exactly 32 blocks, the co-resident bound hit exactly) and at
+1055 ragged with `S ∈ {3, 7}`.
+
+Three things about the expanded set are measured rather than assumed, and two of them corrected
+what the rung comments first claimed:
+
+* **A non-power-of-2 split count is not simply an uneven partition.** `blocksPerSplit` is
+  `ceil(seqBlocks / S)`, so 16 pages over 5 workers gives four workers 8 tiles each and leaves
+  the **fifth empty**; over 7 it gives five workers 6 tiles, one worker 2 and one nothing. An
+  empty worker still publishes a partial — `BeginTask` zeroes the accumulator and sets `runMax`
+  to `-inf`, and `StageTaskOutput` writes that neutral element — so these rungs make the
+  reduction combine `S` partials of which some carry `l = 0`, with its row stride equal to
+  `numSplits_` rather than to a power of two.
+* **The 1055 tail lands on worker 2 at `S = 3` and on worker 4 at `S = 5` and `S = 7`**, so the
+  short tile belongs to a worker that is neither the first nor the last.
+* **At 4 KV heads the inter-head scale padding canary is vacuous by construction.** The codec
+  reads lanes `[head]` and `[4 + head]` of eight, so all eight are live and there is no padding
+  lane left to guard. The ladder reports that rather than asserting it, and requires at least
+  one rung elsewhere to have had padding to guard.
+
+What the ladder does **not** canary is the TAIL ROWS of a mapped page. A masked lane's scale
+still flows through the `Gather` and the `Muls` in front of the mask, so a `0x5A5A5A5A` scale
+there (~3.8e15) would be testing the masking phase's numerical headroom rather than its logic,
+and a failure could not be told apart from one. Those rows carry ordinary fixture data — which
+the oracle already rejects if they are counted, because a tail row shares its tile's key level
+and value levels, so including it weights that tile by 64 rows instead of by its true count.
+
+### The shared fixture, and why the aligned numbers did not move
+
+The hardware ladder, the benchmark and the benchmark's simulator twin all build their geometry
+from `tests/common/fused_decode_opt_fixture.hpp`, which required `context % page_tokens == 0`
+and whose oracle summed one term per whole 64-row tile. Ragged contexts needed both relaxed:
+`pages` is now the ceiling, and each tile contributes `live_rows * exp(score)` to both sums
+instead of `exp(score)`. All 64 rows of a tile share one key level, so that is the correct
+weighting, and it is what the CAModel runner's own independent oracle already did
+(`numerator += valid * weight * ...`).
+
+The risk in that change is to the ALIGNED rungs, whose numbers are the baseline for everything
+already measured. At `live_rows = 64` both sums are scaled by exactly 64, a power of two, so
+the quotient cannot move a single bit — but "cannot move" and "did not move" are different
+claims about floating point, so `tests/cpu/test_fused_decode_opt_fixture.cpp` now recomputes the
+whole aligned oracle with the OLD expression and compares it **bitwise**, over every channel of
+every query head of every token of a 192-token, 2-token, 2-KV-head, 3-group fixture. It also
+recomputes the ragged oracle along a different rounding path — normalising the weights first and
+accumulating a convex combination — and requires the 15-row tail to actually change the answer
+at more than 200 of 256 channels, which it would not if the weighting were dropped.
+
+The benchmark's `--context` accepts a ragged value on the fused-opt path only, since the legacy
+decoders' fixture still requires alignment, and its zone decomposition counts
+`ceil(live rows / 64)` per page rather than assuming whole pages.
 
 ### The benchmark, isolated
 
@@ -245,7 +302,8 @@ Environment: CANN 9.2.0-beta.2 in the Ubuntu-22.04 WSL instance
 | Host geometry gate (`tests/cpu/test_gemm_reduce_geometry.cpp`), `-Wall -Wextra -Werror` | **PASS** — workspace addressing, Zn operand, id budget, task slicing, reference combine, block-diagonal containment, subcore split, batch formation, batched ingest strides, batched budgets |
 | Host fixture gate (`tests/cpu/test_fused_decode_opt_fixture.cpp`) | **PASS** — fragmented pages, independent NZ inverse, GQA/request variation, exact one-tile oracle, capped grid |
 | New validation ladder, host compile, `-Wall -Wextra -Werror` | **PASS** |
-| New validation ladder's **geometry**, on the host: all 16 rungs | **PASS** — every rung builds a fixture and a `valid_launch`, every grid is 1..16 blocks and so inside the 32-block one-wave bound the reduction's `SyncAll<false>()` needs, and every rung has unmapped physical KV pages to guard (3 at one page, 34 at sixteen pages over two tokens). It also confirms the paths the contexts were chosen for: `ctx 128` leaves empty workers at `S = 2, 4, 8`; `ctx 1024, S = 8` is 2 tiles per worker, the bounded short path; `ctx 2048` is 4 to 32 tiles per worker, deep at every `S` |
+| New validation ladder's **geometry**, on the host: all 36 launches of all 9 rungs | **PASS** — every launch builds a fixture and a `valid_launch`, every grid is 1..32 blocks and so inside the 32-block one-wave bound the reduction's `SyncAll<false>()` needs, and every rung has unmapped physical KV pages to guard (3 at one page, 34 at sixteen pages over two tokens). It also reconstructs the kernel's own partition arithmetic per worker and requires the per-worker tile counts to **sum to the fixture's own tile count**, so a ragged partition neither drops a live tile nor counts one twice, and no worker is handed a page with no live rows |
+| Extended host fixture gate: ragged arithmetic, **bit-identical aligned oracle**, independently recomputed ragged oracle | **PASS** — the aligned expected values are bitwise unchanged by the ragged support, channel for channel; the 79-token oracle agrees with a convex-combination recomputation to within 1e-5; and the 15-row tail changes more than 200 of 256 channels against a full second tile, which it would not if the row weighting were dropped |
 | Isolated benchmark, host compile, `-Wall -Wextra -Werror` | **PASS** |
 | Benchmark with `-DTQ_BENCH_LEGACY_DECODERS=1`, host compile, `-Wall -Wextra -Werror` | **PASS** — the switch restores the three-kernel driver without touching the source |
 | Device compile, **physical** leg, `-Wall -Werror`, at the new default (`turboquant_fused_decode_opt_npu`) | **PASS** — AIC, AIV and preprocess legs, 21m45s. `-DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1` is present in that target's own `flags.make` for both `aic_obj` and `aiv_obj`, which is the check that the define actually reached the physical leg and not only the simulator one |
@@ -300,6 +358,17 @@ proof of it:
 **No timing or overlap claim.** Model ticks are not hardware time, the `OPT` columns of the
 benchmark row are `NA` because the simulator reports no device-event timing, and this preset's
 workers are one tile deep, which is below the steady loop entirely.
+
+### 5.2a The expanded ladder's own CAModel sweep, in flight
+
+A CAModel sweep of the geometries the ladder gained — ragged contexts, non-power-of-2 splits and
+4 KV heads — was launched against this tree and had not finished when this was written:
+`N = 79` at `S = 1` and `S = 3`, `N = 257` at `S = 2`, `N = 384` at `S = 3`, `N = 128` at 4 KV
+heads, and an aligned control, all through the benchmark's simulator twin so that the SHARED
+fixture's new ragged oracle is what the kernel is compared against; plus `--tail-rows 15` and
+`--tail-rows 1` through the CAModel probe, whose oracle is independent of the fixture's.
+**If their results are not recorded here, they did not finish, and the commands are in §6.**
+Nothing else in this report's PASS column depends on them.
 
 ### 5.2 The switch gate, three legs
 
@@ -362,6 +431,10 @@ oracle. That is one geometry. What it does **not** cover:
   §5's "not run by instruction" list. A benchmark comparing its result against an oracle is not
   a canary check: nothing in §5.1 would have noticed a write outside a buffer that the oracle
   does not read.
+* **every rung the ladder gained for ragged contexts, non-power-of-2 splits and 4 KV heads.**
+  They compile, their geometry is checked over all 36 launches, and the fixture change behind
+  them is gated on the host — but no ragged or 4-KV-head geometry has been executed, on a model
+  or on silicon, as part of this change. §5.2a lists the sweep that was in flight.
 
 So: the tree compiles strictly on both legs at the new default, the switch is reversible and
 gated in both directions, and the one run that exists says the operator is still correct at one
@@ -408,6 +481,16 @@ bash scripts/run_fused_decode_opt_camodel.sh ladder
 ```bash
 # The four-tile preset, which is the one that exercises the steady loop with the new cache.
 bash scripts/profile_single_tile_msprof.sh steady
+```
+
+```bash
+# A ragged context on CAModel, through the shared fixture and its new row-weighted oracle.
+./build-sim/lib/bench_decode_splitk_sim --impl fused-opt --single --context 79 --page-tokens 128 --heads 1 --rows 16 --requests 1 --splitk 1
+```
+
+```bash
+# The same tail through the CAModel probe, whose oracle is independent of the fixture's.
+./build-sim/lib/test_camodel_fused_decode_opt --tiles 2 --tail-rows 15
 ```
 
 ## 7. Limitations

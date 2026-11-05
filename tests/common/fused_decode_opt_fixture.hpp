@@ -24,6 +24,22 @@ inline std::uint16_t reference_half(float value)
 // FP32 pre-rotated GQA queries, source-format KV4 NZ cache, FP16 context.
 // Tile scores vary by request, KV head and query head. Values vary by tile
 // and channel. A scalar FP64 attention sum supplies an independent oracle.
+//
+// RAGGED CONTEXTS. `context` need not be a multiple of `page_tokens` or of the 64-row Cube
+// tile: `pages` is the ceiling, the last page holds `context - (pages - 1) * page_tokens`
+// live tokens, and the last live tile holds `context % 64` of them when that is nonzero. The
+// cache is still filled over EVERY row of every mapped page, tail rows included, which is what
+// makes the kernel's masking observable -- a tail row it fails to mask carries the same key
+// level and the same value levels as the live rows of its own tile, so including it weights
+// that tile by 64 rows instead of by its true count and the oracle below disagrees.
+//
+// The oracle weights each tile by its live row count, which is the same thing the CAModel
+// runner's own oracle does (`numerator += valid * weight * ...` in
+// tests/sim/kernel/test_camodel_fused_decode_opt.cpp). All 64 rows of a tile share one key
+// level, so a tile of v live rows contributes v * exp(score) to both sums; at v = 64 that is
+// an exact power-of-two scaling of both, so an ALIGNED context's expected values are
+// bit-identical to the unweighted form this replaced. tests/cpu/test_fused_decode_opt_fixture
+// pins that.
 struct Fixture {
     int context, requests, kv_heads, group_heads, page_tokens, pages, physical_pages;
     std::vector<float> query, scales, expected;
@@ -31,9 +47,12 @@ struct Fixture {
     std::vector<std::int32_t> table, lengths;
     Fixture(int n, int b, int h, int g, int block)
         : context(n), requests(b), kv_heads(h), group_heads(g), page_tokens(block),
-          pages(block > 0 ? n / block : 0), physical_pages(2 * b * pages + 2)
+          pages(block > 0 && n > 0 ? (n + block - 1) / block : 0), physical_pages(2 * b * pages + 2)
     {
-        if (n <= 0 || n > 16384 || (block != 64 && block != 128) || n % block || b < 1 || b > 16 ||
+        // n is no longer required to divide the page: see RAGGED CONTEXTS above. The page size
+        // still has to be 64 or 128, because that is what valid_launch admits and what the
+        // NZ-tiled ingest is built on.
+        if (n <= 0 || n > 16384 || (block != 64 && block != 128) || b < 1 || b > 16 ||
             h < 1 || h > 4 || g < 1 || g > 16)
             throw std::invalid_argument("invalid fused-opt fixture geometry");
         query.resize(std::size_t(b) * h * g * 256);
@@ -73,9 +92,10 @@ struct Fixture {
                 std::fill(query.begin() + base, query.begin() + base + 256, coefficient / 256.0f);
                 for (int col = 0; col < 256; ++col) {
                     double numerator = 0, denominator = 0;
-                    for (int tile = 0; tile < n / 64; ++tile) {
+                    for (int tile = 0; tile < tiles(); ++tile) {
+                        const int live = valid_rows(tile);
                         const double score = (2 * key_level(request, head, tile) + 1) * coefficient / 16.0;
-                        const double weight = std::exp(score);
+                        const double weight = live * std::exp(score);
                         numerator += weight * (2 * value_level(request, head, tile, col) + 1);
                         denominator += weight;
                     }
@@ -83,6 +103,21 @@ struct Fixture {
                 }
             }
         }
+    }
+    // 64-row Cube tiles over the live context, and the live rows of one of them. The last tile
+    // is short exactly when context % 64 != 0; every other tile is full, including the ones in
+    // a page that is itself partially live.
+    int tiles() const { return (context + 63) / 64; }
+    int valid_rows(int tile) const
+    {
+        const int rest = context - 64 * tile;
+        return rest < 64 ? rest : 64;
+    }
+    // The live tokens of one logical page, which is page_tokens for every page but the last.
+    int page_rows(int page) const
+    {
+        const int rest = context - page_tokens * page;
+        return rest < page_tokens ? rest : page_tokens;
     }
     static unsigned key_level(int request, int head, int tile)
     { return (tile + 2 * request + 3 * head) % 8; }

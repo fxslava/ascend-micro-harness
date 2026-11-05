@@ -43,26 +43,66 @@
 //
 // THE LADDER
 //
-// GQA at the geometry the operator ships: 16 query heads over one KV head, D = 256, 128-token
-// physical pages, splits S in {1, 2, 4, 8}. 128-token pages are two 64-row Cube tiles, so the
-// per-worker tile count -- which is what selects the schedule's path -- is 2 * (pages per
-// worker), and the four contexts are chosen to cover every path the kernel has:
+// Nine rungs, each a (context, tokens, KV heads, query heads per KV head) geometry with its own
+// split sweep; one launch per (rung, S). D = 256 and 128-token physical pages throughout, so a
+// page is two 64-row Cube tiles and a worker's tile count -- which is what selects the
+// schedule's path -- is 2 * (pages it owns), less any ragged tail.
 //
-//   * 128 (one page): at S = 2, 4 and 8 only the first worker has a block range at all. The
-//     others are UNMAPPED SPLITS, blockStart >= blockEnd, which is the early exit that now
-//     leaves through ComputeTask's join like every other path.
+// ALIGNED, one KV head, 16 query heads:
+//
+//   * 128 (one page): at S > 1 only the first worker has a block range at all. The others are
+//     UNMAPPED SPLITS, blockStart >= blockEnd, which is the early exit that now leaves through
+//     ComputeTask's join like every other path.
 //   * 1024 (eight pages): S = 8 gives each worker one page, two tiles -- the bounded short
 //     pipeline, below the three-slot ring's depth. S <= 4 reaches the steady loop.
 //   * 2048 (sixteen pages): every worker of every S is on the deep three-zone path, and at
-//     S = 1 one worker walks all 32 tiles, which wraps the three-slot ring ten times.
+//     S = 1 one worker walks all 32 tiles, which wraps the three-slot ring ten times. This is
+//     the rung that carries the NON-POWER-OF-2 split sweep, S in {3, 5, 7}. blocksPerSplit is
+//     ceil(16 / S), so the partition is uneven in a way that differs with S: at S = 3 the
+//     workers own 12, 12 and 8 tiles; at S = 5 four own 8 each and the FIFTH IS EMPTY; at
+//     S = 7 five own 6, one owns 2 and one is empty. An empty worker still publishes a
+//     partial -- BeginTask zeroes the accumulator and sets runMax to -inf, and StageTaskOutput
+//     writes that neutral element -- so the reduction has to combine S partials of which some
+//     carry l = 0, with its row stride equal to numSplits_ rather than to a power of two and
+//     the C0 lanes above numSplits_ zero, or the dense Mmad sums padding into a live row.
 //   * 2048 with two tokens: the token dimension of the reduce phase, whose per-token
 //     NeedsReduction() loop and whose task ids both have to stay in step across the roles.
 //
-// WHAT THIS LADDER DOES NOT ESTABLISH: it is one launch per rung, so it says nothing about
+// RAGGED, where the context divides neither the page nor the 64-row tile. The fixture fills
+// every row of every mapped page, tail rows included, so a tail the kernel fails to mask
+// carries its own tile's key level and value levels and weights that tile by 64 rows instead
+// of by its true count -- which the oracle, weighting each tile by its live rows, rejects:
+//
+//   * 79 (one page, 79 live rows): one full tile and a 15-row tail. The pure tail-mask rung,
+//     and at S = 2 and 3 a ragged worker beside empty ones.
+//   * 257 (three pages, the last holding ONE token): five tiles, the last with a single live
+//     row. The inter-page boundary switch with a minimal tail -- at S = 2 and 3 the worker
+//     that owns page 2 has nothing but that one row, which is the narrowest mask the engine
+//     can be given (an all-masked tile must never be staged at all, and CountTiles is what
+//     guarantees that: a page contributes ceil(live rows / 64) tiles, never a tile of zero).
+//   * 1055 (nine pages, a 31-row tail): 17 tiles. The tail lands on worker 2 at S = 3 and on
+//     worker 4 at S = 5 and 7, and at S = 7 two workers are empty besides -- so the short tile
+//     is owned by a worker that is neither the first nor the last.
+//
+// MULTI-KV-HEAD, 4 KV heads x 16 query heads = 64 query heads:
+//
+//   * 1024 at S in {1, 2, 4, 8}: tasks = tokens * KV heads * S, so S = 8 dispatches a grid of
+//     exactly 32 blocks -- the co-resident bound the reduction's SyncAll<false>() needs, hit
+//     exactly rather than approached. It is also the rung where the scale cache has NO padding
+//     lane left: the codec reads lanes [head] and [4 + head] of eight, so all eight are live
+//     and that canary is vacuous here by construction, which this reports rather than skips.
+//   * 1055 at S in {3, 7}: 4 KV heads, a ragged tail and a non-power-of-2 split count at once.
+//
+// WHAT THIS LADDER DOES NOT ESTABLISH: it is one launch per (rung, S), so it says nothing about
 // inter-wave behaviour -- every grid here is inside the 32-block co-resident bound
 // (turboquant_splitk_contract.hpp), which is also what the reduction's SyncAll<false>()
 // requires, so a second execution wave is out of scope by construction. It takes no timing and
-// makes no overlap claim; scripts/profile_single_tile_msprof.sh is for that.
+// makes no overlap claim; scripts/profile_single_tile_msprof.sh is for that. And it does not
+// canary the TAIL ROWS of a mapped page: a masked lane's scale still flows through the Gather
+// and the Muls in front of the mask, so a 0x5A5A5A5A scale there (~3.8e15) would be testing the
+// masking phase's numerical headroom rather than its logic, and a failure could not be told
+// apart from one. Those rows carry ordinary fixture data, which the oracle already rejects if
+// they are counted.
 
 #include "../turboquant_npu_common.hpp"
 #include "../../common/fused_decode_opt_fixture.hpp"
@@ -73,6 +113,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -91,9 +132,8 @@ constexpr std::uint32_t kGuardWord = 0x5A5A5A5Au;
 // cannot step past it unseen.
 constexpr std::size_t kGuard = 64;
 
-// Real operator geometry.
-constexpr int kKvHeads = 1;
-constexpr int kQueryHeads = 16;  // group heads per KV head; 16 query heads in total
+// Real operator geometry. The page size and the ULP budget are the ladder's; the head counts
+// vary per rung and live in the rung table.
 constexpr int kPageTokens = 128;
 constexpr int kUlpBudget = 0;
 // Scale lanes per cache row, of which the codec reads two per KV head.
@@ -193,8 +233,11 @@ void paint_unmapped(std::vector<std::uint8_t>& plane, const CanaryPlan& plan, st
 }
 
 // 0x5A over the unmapped pages of the scale plane AND over the inter-head padding lanes of
-// every mapped page. The codec reads lanes [head] and [kv_heads + head] of each row's eight,
-// so lanes [2 * kv_heads, 8) are padding at every row of every page.
+// every mapped page. The codec reads lanes [head] and [kv_heads + head] of each row's eight, so
+// lanes [2 * kv_heads, 8) are padding at every row of every page -- six of eight at one KV
+// head, and NONE at four, where all eight lanes are live. At four KV heads this paints the
+// unmapped pages only and leaves plan.scale_pad_floats at zero for the mapped ones, which the
+// run reports: a canary with nothing to guard is worth saying out loud rather than asserting.
 void paint_scales(std::vector<float>& scales, const Fixture& f, CanaryPlan& plan)
 {
     float canary;
@@ -203,14 +246,14 @@ void paint_scales(std::vector<float>& scales, const Fixture& f, CanaryPlan& plan
     const std::size_t used_lanes = std::size_t(2 * f.kv_heads);
     require(scales.size() == std::size_t(f.physical_pages) * rows_per_page * kScaleLanes,
             "fused-opt NPU validation: scale plane geometry drifted from the fixture");
-    require(used_lanes < kScaleLanes,
-            "fused-opt NPU validation: no scale padding lanes at this KV head count");
+    require(used_lanes <= kScaleLanes,
+            "fused-opt NPU validation: the scale slot cannot hold this KV head count");
     for (std::size_t page = 0; page < plan.unmapped_page.size(); ++page)
         for (std::size_t row = 0; row < rows_per_page; ++row) {
             const std::size_t base = (page * rows_per_page + row) * kScaleLanes;
             const std::size_t from = plan.unmapped_page[page] ? 0 : used_lanes;
             for (std::size_t lane = from; lane < kScaleLanes; ++lane) scales[base + lane] = canary;
-            plan.scale_pad_floats += kScaleLanes - from;
+            if (!plan.unmapped_page[page]) plan.scale_pad_floats += kScaleLanes - from;
         }
 }
 
@@ -256,6 +299,9 @@ OracleResult check_output(const std::vector<std::uint8_t>& image, const Fixture&
 struct Rung {
     int context;
     int requests;
+    int kv_heads;
+    int group_heads;  // query heads per KV head
+    std::vector<int> splits;
     const char* note;
 };
 
@@ -264,22 +310,46 @@ int run()
     tq_npu::Session session;
 
     const std::vector<Rung> ladder = {
-        {kPageTokens, 1, "one page: S>1 leaves unmapped (empty) splits"},
-        {8 * kPageTokens, 1, "eight pages: bounded short path at S=8"},
-        {16 * kPageTokens, 1, "sixteen pages: deep three-zone path at every S"},
-        {16 * kPageTokens, 2, "sixteen pages, two tokens: the reduce phase's token dimension"},
+        // aligned, one KV head, 16 query heads
+        {kPageTokens, 1, 1, 16, {1, 2, 4, 8}, "one page: S>1 leaves unmapped (empty) splits"},
+        {8 * kPageTokens, 1, 1, 16, {1, 2, 4, 8}, "eight pages: bounded short path at S=8"},
+        {16 * kPageTokens, 1, 1, 16, {1, 2, 3, 4, 5, 7, 8},
+         "sixteen pages: deep path at every S, and the non-power-of-2 split sweep"},
+        {16 * kPageTokens, 2, 1, 16, {1, 2, 4, 8},
+         "sixteen pages, two tokens: the reduce phase's token dimension"},
+        // ragged: context divides neither the page nor the 64-row tile
+        {79, 1, 1, 16, {1, 2, 3}, "one page, 79 rows: one full tile and a 15-row tail"},
+        {257, 1, 1, 16, {1, 2, 3, 5},
+         "three pages, the last holding ONE token: a single-row tile across a page boundary"},
+        {1055, 1, 1, 16, {1, 3, 5, 7},
+         "nine pages, a 31-row tail: the tail lands on a different worker at each S"},
+        // multi-KV-head: 4 x 16 = 64 query heads
+        {8 * kPageTokens, 1, 4, 16, {1, 2, 4, 8},
+         "4 KV heads, 64 query heads: grid reaches exactly the 32-block bound at S=8"},
+        {1055, 1, 4, 16, {3, 7},
+         "4 KV heads, ragged tail and a non-power-of-2 split count at once"},
     };
-    const std::vector<int> splits = {1, 2, 4, 8};
 
-    int launches = 0, worst_ulp = 0;
+    int launches = 0, worst_ulp = 0, ragged_rungs = 0, narrowest_tail = 64;
     double worst_abs = 0;
     long long canary_pages = 0, canary_pad_floats = 0;
+    std::set<int> splits_seen, kv_heads_seen;
 
     for (const Rung& rung : ladder) {
-        // One fixture per (context, tokens): the oracle is the expensive part and the split
-        // count changes only how the work is partitioned, never the answer.
-        const Fixture f(rung.context, rung.requests, kKvHeads, kQueryHeads, kPageTokens);
+        // One fixture per rung: the oracle is the expensive part and the split count changes
+        // only how the work is partitioned, never the answer.
+        const Fixture f(rung.context, rung.requests, rung.kv_heads, rung.group_heads, kPageTokens);
         CanaryPlan plan = plan_canaries(f);
+        const int tail = f.context % 64;
+        if (tail != 0) {
+            ++ragged_rungs;
+            if (tail < narrowest_tail) narrowest_tail = tail;
+            // The rung has to be ragged in the way its note claims, or it is testing the
+            // aligned path under a ragged name.
+            require(f.valid_rows(f.tiles() - 1) == tail,
+                    "fused-opt NPU validation: a ragged rung's last tile is not short");
+        }
+        kv_heads_seen.insert(rung.kv_heads);
 
         std::vector<std::uint8_t> key = f.key, value = f.value;
         std::vector<float> scales = f.scales;
@@ -288,7 +358,8 @@ int run()
         paint_unmapped(value, plan, page_bytes);
         paint_scales(scales, f, plan);
 
-        for (const int k : splits) {
+        for (const int k : rung.splits) {
+            splits_seen.insert(k);
             const fd::Launch config = f.launch(k);
             require(config.grid <= turboquant_splitk::kMaxCoResidentBlocks,
                     "fused-opt NPU validation: grid exceeds the one-wave bound the reduction's "
@@ -365,23 +436,41 @@ int run()
                                "false");
             }
 
-            std::printf("  ok  context %5d  tokens %d  S %d  grid %2d  worst %d ULP  "
-                        "worst abs %.3e  %d unmapped pages and %zu scale pad floats intact\n",
-                        rung.context, rung.requests, k, config.grid, oracle.worst_ulp,
-                        oracle.worst_abs, plan.unmapped_pages, plan.scale_pad_floats);
+            std::printf("  ok  N %5d  tok %d  kvh %d  qh %2d  S %d  grid %2d  tiles %3d "
+                        "tail %2d  worst %d ULP  worst abs %.3e  %d unmapped pages, %zu scale "
+                        "pad floats intact\n",
+                        rung.context, rung.requests, rung.kv_heads,
+                        rung.kv_heads * rung.group_heads, k, config.grid, f.tiles(), tail,
+                        oracle.worst_ulp, oracle.worst_abs, plan.unmapped_pages,
+                        plan.scale_pad_floats);
         }
-        std::printf("  rung context %5d tokens %d: %s\n", rung.context, rung.requests, rung.note);
+        std::printf("  rung N %5d tok %d kvh %d: %s\n", rung.context, rung.requests,
+                    rung.kv_heads, rung.note);
     }
 
-    std::printf("PASS fused decode opt NPU validation: %d launches over %zu contexts x "
-                "S in {1,2,4,8} at %d query heads over %d KV head, D=%d, %d-token pages. "
-                "Worst fp16 ULP %d against a budget of %d; worst absolute residual %.3e "
-                "(the fp16 quantisation of the oracle). 0x%08X canaries held: %lld unmapped "
-                "physical KV pages, %lld inter-head scale padding floats, both guard bands of "
-                "every allocation, the output tail and the workspace outside the live partial "
-                "extent. Every input allocation byte-identical afterwards.\n",
-                launches, ladder.size(), kQueryHeads, kKvHeads, int(fd::kHeadSize), kPageTokens,
-                worst_ulp, kUlpBudget, worst_abs, kGuardWord, canary_pages, canary_pad_floats);
+    require(ragged_rungs >= 3, "fused-opt NPU validation: the ragged rungs went missing");
+    require(narrowest_tail == 1, "fused-opt NPU validation: no single-row tail was exercised");
+    require(kv_heads_seen.count(4) == 1, "fused-opt NPU validation: no multi-KV-head rung ran");
+    for (const int k : {3, 5, 7})
+        require(splits_seen.count(k) == 1,
+                "fused-opt NPU validation: a non-power-of-2 split count went missing");
+    require(canary_pad_floats > 0,
+            "fused-opt NPU validation: no rung had an inter-head scale padding lane to guard");
+
+    std::string split_list;
+    for (const int k : splits_seen) split_list += (split_list.empty() ? "" : ",") + std::to_string(k);
+    std::printf("PASS fused decode opt NPU validation: %d launches over %zu rungs, S in {%s}, "
+                "1 and 4 KV heads, 16 query heads per KV head, D=%d, %d-token pages. %d rungs "
+                "are RAGGED (context divides neither the page nor the 64-row tile), the "
+                "narrowest live tail being %d row. Worst fp16 ULP %d against a budget of %d; "
+                "worst absolute residual %.3e (the fp16 quantisation of the oracle). 0x%08X "
+                "canaries held: %lld unmapped physical KV pages, %lld inter-head scale padding "
+                "floats, both guard bands of every allocation, the output tail and the "
+                "workspace outside the live partial extent. Every input allocation "
+                "byte-identical afterwards.\n",
+                launches, ladder.size(), split_list.c_str(), int(fd::kHeadSize), kPageTokens,
+                ragged_rungs, narrowest_tail, worst_ulp, kUlpBudget, worst_abs, kGuardWord,
+                canary_pages, canary_pad_floats);
     return 0;
 }
 
