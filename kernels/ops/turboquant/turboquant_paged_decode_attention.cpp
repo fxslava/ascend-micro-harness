@@ -143,19 +143,25 @@ constexpr std::uint32_t kUbMPrev        = NextSlot(kUbDqSigned,     kPanel * kI1
 constexpr std::uint32_t kUbLPrev        = NextSlot(kUbMPrev,        kTokens * kStateLanes * kF32);
 constexpr std::uint32_t kUbAcc          = NextSlot(kUbLPrev,        kTokens * kStateLanes * kF32);
 
+// Phase 1 runs once for all kTokens query rows, so the five operands it
+// produces hold a row each instead of just the current one. The narrow views
+// the later phases read are carved out of these by `select_query_wide`; see
+// `update_max_and_alpha_all` in routine_vector_decode_recurrence.hpp and
+// section 7d of reports/decode_splitk_aic_contraction.md.
+constexpr std::uint32_t kRowState       = kTokens * kStateLanes * kF32;
 constexpr std::uint32_t kUbMNew         = NextSlot(kUbAcc,          kTokens * kHeadSize * kF32);
-constexpr std::uint32_t kUbLNew         = NextSlot(kUbMNew,         kStateLanes * kF32);
+constexpr std::uint32_t kUbLNew         = NextSlot(kUbMNew,         kRowState);
 constexpr std::uint32_t kUbAlpha        = NextSlot(kUbLNew,         kStateLanes * kF32);
-constexpr std::uint32_t kUbAlphaDelta   = NextSlot(kUbAlpha,        kStateLanes * kF32);
-constexpr std::uint32_t kUbLScaled      = NextSlot(kUbAlphaDelta,   kStateLanes * kF32);
+constexpr std::uint32_t kUbAlphaDelta   = NextSlot(kUbAlpha,        kRowState);
+constexpr std::uint32_t kUbLScaled      = NextSlot(kUbAlphaDelta,   kRowState);
 constexpr std::uint32_t kUbTileMaxRaw   = NextSlot(kUbLScaled,      kStateLanes * kF32);
-constexpr std::uint32_t kUbPSumRaw      = NextSlot(kUbTileMaxRaw,   kStateLanes * kF32);
+constexpr std::uint32_t kUbPSumRaw      = NextSlot(kUbTileMaxRaw,   kTokens * kF32);
 constexpr std::uint32_t kUbTileMaxBc    = NextSlot(kUbPSumRaw,      kStateLanes * kF32);
-constexpr std::uint32_t kUbMBc          = NextSlot(kUbTileMaxBc,    kBcLanes * kF32);
+constexpr std::uint32_t kUbMBc          = NextSlot(kUbTileMaxBc,    kRowState);
 constexpr std::uint32_t kUbPSumBc       = NextSlot(kUbMBc,          kBcLanes * kF32);
 constexpr std::uint32_t kUbAlphaBc      = NextSlot(kUbPSumBc,       kBcLanes * kF32);
 constexpr std::uint32_t kUbScaledRow    = NextSlot(kUbAlphaBc,      kBcLanes * kF32);
-constexpr std::uint32_t kUbCentered     = NextSlot(kUbScaledRow,    kTokens * kF32);
+constexpr std::uint32_t kUbCentered     = NextSlot(kUbScaledRow,    kScores * kF32);
 constexpr std::uint32_t kUbP            = NextSlot(kUbCentered,     kTokens * kF32);
 constexpr std::uint32_t kUbPScaled      = NextSlot(kUbP,            kTokens * kF32);
 constexpr std::uint32_t kUbPx4          = NextSlot(kUbPScaled,      kTokens * kF32);
@@ -185,9 +191,12 @@ constexpr std::uint32_t kUbTailSel      = NextSlot(kUbZeroFill,     kReadPadByte
 // tail so that no existing operand's offset moves.
 constexpr std::uint32_t kPairPartials   = 2u * kHeadSize;
 constexpr std::uint32_t kUbPairPartials = NextSlot(kUbTailSel,     kReadPadBytes);
-constexpr std::uint32_t kArenaEnd       = kUbPairPartials + kPairPartials * kF32;
+// key_scale replicated four times, so one 64-lane repeat of the wide phase-1
+// Mul covers four score rows with src1RepStride = 0. The p_x4 shape.
+constexpr std::uint32_t kUbKeyScaleX4   = NextSlot(kUbPairPartials, kPairPartials * kF32);
+constexpr std::uint32_t kArenaEnd       = kUbKeyScaleX4 + kBcLanes * kF32;
 
-static_assert(kUbScoreRing     % kBlock == 0 && kUbPackedKRing   % kBlock == 0 && kUbPackedVRing   % kBlock == 0 && kUbKeyRing       % kBlock == 0 && kUbValueRing     % kBlock == 0 && kUbScaleRing     % kBlock == 0 && kUbDqSigned     % kBlock == 0 && kUbMPrev        % kBlock == 0 && kUbLPrev        % kBlock == 0 && kUbAcc          % kBlock == 0 && kUbWeighted     % kBlock == 0 && kUbWeightedSum  % kBlock == 0 && kUbAccScaled    % kBlock == 0 && kUbScoreArchive % kBlock == 0 && kUbEgressA      % kBlock == 0 && kUbEgressB      % kBlock == 0 && kUbPermuted     % kBlock == 0 && kUbSignedTmp    % kBlock == 0 && kUbDenominator  % kBlock == 0 && kUbGateRow      % kBlock == 0 && kUbPiSign       % kBlock == 0 && kUbGatherOffsets% kBlock == 0 && kUbGatherSigns  % kBlock == 0 && kUbContext      % kBlock == 0 && kUbRotated      % kBlock == 0 && kUbPairPartials % kBlock == 0, "every UB operand base must be 32-byte aligned");
+static_assert(kUbScoreRing     % kBlock == 0 && kUbPackedKRing   % kBlock == 0 && kUbPackedVRing   % kBlock == 0 && kUbKeyRing       % kBlock == 0 && kUbValueRing     % kBlock == 0 && kUbScaleRing     % kBlock == 0 && kUbDqSigned     % kBlock == 0 && kUbMPrev        % kBlock == 0 && kUbLPrev        % kBlock == 0 && kUbAcc          % kBlock == 0 && kUbWeighted     % kBlock == 0 && kUbWeightedSum  % kBlock == 0 && kUbAccScaled    % kBlock == 0 && kUbScoreArchive % kBlock == 0 && kUbEgressA      % kBlock == 0 && kUbEgressB      % kBlock == 0 && kUbPermuted     % kBlock == 0 && kUbSignedTmp    % kBlock == 0 && kUbDenominator  % kBlock == 0 && kUbGateRow      % kBlock == 0 && kUbPiSign       % kBlock == 0 && kUbGatherOffsets% kBlock == 0 && kUbGatherSigns  % kBlock == 0 && kUbContext      % kBlock == 0 && kUbRotated      % kBlock == 0 && kUbPairPartials % kBlock == 0 && kUbKeyScaleX4  % kBlock == 0, "every UB operand base must be 32-byte aligned");
 static_assert(kRingScore       % kBlock == 0 && kRingPacked      % kBlock == 0 && kRingKey         % kBlock == 0 && kRingValue       % kBlock == 0 && kRingScale       % kBlock == 0, "every ring slot stride must be a whole number of DataBlocks");
 static_assert(kRingScore       % 256u   != 0u && kRingPacked     % 256u   != 0u && kRingKey        % 256u   != 0u && kRingValue      % 256u   != 0u && kRingScale      % 256u   != 0u, "a 256-byte ring stride puts every slot on one bank phase");
 static_assert(kArenaEnd + kReadPadBytes <= kUbWindow, "UB arena leaves no VECTOR_REG_WIDTH read pad behind the state");
@@ -571,6 +580,23 @@ __aicore__ inline void FillRecurEngine(ascend_micro::NativeDecodeRecurrenceEngin
     recur_engine.masked_fill  = {kUb, kUbMaskedFill,                      kTokens};
     recur_engine.zero_fill    = {kUb, kUbZeroFill,                        kTokens};
     recur_engine.tail_sel     = {kUb, kUbTailSel,                         kTokens};
+
+    // Phase-major operands. The narrow views above stay where they are --
+    // `scaled_row`, `m_new` and `alpha` are per-row scratch on the masked
+    // path, and the start of each widened slot is row 0 -- so
+    // `vector_decode_recur_strip_masked` is unaffected by any of this.
+    // `select_query_wide` re-points those three per row on the aligned path.
+    recur_engine.scaled_all     = {kUb, kUbScaledRow,  kScores};
+    recur_engine.tile_max_all   = {kUb, kUbTileMaxRaw, kTokens};
+    recur_engine.tile_max_bc_all= {kUb, kUbTileMaxBc,  kTokens * kStateLanes};
+    recur_engine.m_new_all      = {kUb, kUbMNew,       kTokens * kStateLanes};
+    recur_engine.alpha_all      = {kUb, kUbAlpha,      kTokens * kStateLanes};
+    recur_engine.alpha_delta_all= {kUb, kUbAlphaDelta, kTokens * kStateLanes};
+    recur_engine.key_scale_x4   = {kUb, kUbKeyScaleX4, kBcLanes};
+
+    recur_engine.scaled_all_base = kUbScaledRow;
+    recur_engine.m_new_all_base  = kUbMNew;
+    recur_engine.alpha_all_base  = kUbAlpha;
 }
 
 template <std::uint32_t Slot, std::uint32_t Strip>
@@ -1254,8 +1280,13 @@ __aicore__ inline void StreamRecurStrip(std::uint32_t strip, std::uint32_t activ
     // this edge put back, and it must still be ACCEPTED.
     AscendC::CrossCoreWaitFlag<2, kSync2Aiv0Wait>(kSync2StepRetired);
 
+    // Phase 1 once for all 16 rows instead of once per row. Bit-identical to
+    // `vector_decode_recur_strip` -- MAX selects an operand rather than
+    // rounding one, so widening its reduction cannot move a bit. The partial
+    // path is unchanged: it masks the score row inside phase 1, which the wide
+    // form does not express.
     if (active == kTokens) {
-        ascend_micro::vector_decode_recur_strip(recur_engine);
+        ascend_micro::vector_decode_recur_strip_phase_major(recur_engine);
     } else if (active != 0u) {
         ascend_micro::vector_decode_recur_strip_masked(recur_engine, active);
     }
