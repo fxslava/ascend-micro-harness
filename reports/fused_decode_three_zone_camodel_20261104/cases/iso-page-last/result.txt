@@ -1,0 +1,3 @@
+PASS fused_decode_opt tiles=1 page=7 tile=0 heads=16 splits=1 grid=1 repeats=1 elements=4096 tail_rows=64 hole=4294967295 comparison=exact inputs=unchanged guards=0x5A-intact
+Model RUN TIME: 51970.2 ms
+[INFO] Total tick: 17880

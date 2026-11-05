@@ -1,0 +1,21 @@
+case                   core             span_ticks  MTE3&RVECEX  MTE2&RVECEX  MTE2&VEC CUBE&FIXP  unpaired
+deep-exact-n9          core0.cubecore0       70615            0            0         0      2342         0
+deep-exact-n9          core0.veccore0        70210        11241         1410      2938         0      1361
+deep-exact-n9          core0.veccore1        70222        11213         1495      3729         0      1361
+deep-noperiod-n4       core0.cubecore0       40533            0            0         0      1054         0
+deep-noperiod-n4       core0.veccore0        39341         5230          661      2292         0       686
+deep-noperiod-n4       core0.veccore1        40187         5255          784      3066         0       686
+deep-ragged-n12        core0.cubecore0       94961            0            0         0      3137         0
+deep-ragged-n12        core0.veccore0        94461        14339         1732      2940         0      1766
+deep-ragged-n12        core0.veccore1        94619        14190         1814      3731         0      1766
+deep-twoperiod-n16     core0.cubecore0      119746            0            0         0      4176         0
+deep-twoperiod-n16     core0.veccore0       119296        19004         2301      3080         0      2312
+deep-twoperiod-n16     core0.veccore1       119407        19056         2165      3874         0      2312
+short-n3               core0.cubecore0       32045            0            0         0       757         0
+short-n3               core0.veccore0        31173         4171           96      1327         0       551
+short-n3               core0.veccore1        31710         4154          153      1589         0       551
+
+Ticks are CAModel model ticks, not nanoseconds and not silicon time.
+Intersections are measured on merged per-engine interval unions, so a
+nonzero value is real concurrency in the model -- not source order.
+Unpaired dispatches have no completion line in the dump and no span.

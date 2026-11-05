@@ -4,6 +4,18 @@ function(add_ascend_micro_npu_targets)
   # The BiSheng system-header reclassification, defined once in the top-level
   # CMakeLists.txt so this leg and the simulator leg cannot drift apart.
   set(CANN_SYSTEM_OPTIONS ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS})
+  # TQ_FUSED_DECODE_REDUCE_DEFINES carries -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1 when
+  # TQ_GEMM_REDUCE is ON, which it is by default. The option lives in the top-level
+  # CMakeLists.txt so this leg gets the identical define the simulator leg does: the two
+  # legs compile the same kernel source, and a reduction phase selected on one leg only is
+  # a different operator on hardware than the one the CAModel evidence is about.
+  ascendc_library(turboquant_fused_decode_opt_npu SHARED
+      kernels/ops/turboquant/turboquant_fused_decode_opt.cpp)
+  ascendc_compile_definitions(turboquant_fused_decode_opt_npu PRIVATE ASCEND_MICRO_CANN_LAUNCH)
+  ascendc_compile_options(turboquant_fused_decode_opt_npu PRIVATE
+      -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
+      ${TQ_FUSED_DECODE_REDUCE_DEFINES}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
   set(BASELINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/baseline")
   set(BASELINE_SOURCE "${BASELINE_DIR}/turboquant_paged_attention.cpp")
   ascendc_library(turboquant_a8_npu SHARED
@@ -135,12 +147,29 @@ function(add_ascend_micro_npu_targets)
   # reason. `add_ascend_micro_sim_targets` registers a simulator twin that
   # exercises the CLI, the statistics and the tail arithmetic where no device
   # exists.
+  # KERNEL ISOLATION. OFF, the default, builds a benchmark that contains exactly one kernel:
+  # the fused decode operator. The legacy AIV and AIC decoders are compiled out of the driver
+  # and their libraries are NOT linked, which follows the same rule the two split-K validation
+  # drivers below already follow -- each links the one kernel library its own rigs reference,
+  # because CANN keeps BUILD_ALWAYS on every ascendc_library and a spare link costs a 54-second
+  # rebuild of a library nothing calls. ON restores the three-kernel comparison sweep and the
+  # modeled crossover, and the source's TQ_BENCH_FUSED_OPT_ONLY blocks are that switch.
+  option(TQ_BENCH_LEGACY_DECODERS
+      "Benchmark the legacy AIV and AIC split-K decoders alongside the fused operator" OFF)
   add_executable(bench_turboquant_decode_splitk
       tests/npu/bench/bench_turboquant_decode_splitk.cpp)
   target_include_directories(bench_turboquant_decode_splitk PRIVATE
       "${ASCEND_HOME_PATH}/include")
-  target_link_libraries(bench_turboquant_decode_splitk PRIVATE
-      turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu ascendcl)
+  if(TQ_BENCH_LEGACY_DECODERS)
+    target_compile_definitions(bench_turboquant_decode_splitk PRIVATE
+        TQ_BENCH_LEGACY_DECODERS=1)
+    target_link_libraries(bench_turboquant_decode_splitk PRIVATE
+        turboquant_single_token_decode_splitk_npu turboquant_paged_decode_npu
+        turboquant_fused_decode_opt_npu ascendcl)
+  else()
+    target_link_libraries(bench_turboquant_decode_splitk PRIVATE
+        turboquant_fused_decode_opt_npu ascendcl)
+  endif()
   target_compile_options(bench_turboquant_decode_splitk PRIVATE
       -Wall -Wextra -Werror)
 
@@ -189,6 +218,30 @@ function(add_ascend_micro_npu_targets)
       turboquant_single_token_decode_splitk_npu ascendcl)
   target_compile_options(test_npu_decode_splitk_aiv PRIVATE
       -Wall -Wextra -Werror)
+
+  # ------------------- fused decode operator validation (hardware, GQA + canaries)
+  # tests/npu/validation/test_turboquant_fused_decode_opt_npu.cpp: the hardware counterpart of
+  # the operator's CAModel ladder. 16 query heads over one KV head at D = 256, 128-token pages,
+  # S in {1, 2, 4, 8} over four contexts, every emitted channel against the fixture's own FP64
+  # attention oracle at a budget of ZERO fp16 ULP, and 0x5A5A5A5A canaries on the guard bands of
+  # every allocation, on every physical KV page the block table does not map, on the inter-head
+  # scale padding of every page it does, on the output tail and on the workspace outside the
+  # live partial extent.
+  #
+  # HARDWARE ONLY, like the benchmark and the two split-K ladders above and for the same
+  # reason: every rung is a real launch compared against an FP64 oracle, so a build on a host
+  # with no 950PR establishes that this harness compiles and nothing about the kernel. It links
+  # the one library it calls into, turboquant_fused_decode_opt_npu, which carries
+  # -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1 whenever TQ_GEMM_REDUCE is ON -- so with the default
+  # configuration this ladder validates the Cube GEMM reduction, and with -DTQ_GEMM_REDUCE=OFF
+  # the same ladder validates the vector reducer. Neither is selected here.
+  add_executable(test_npu_fused_decode_opt
+      tests/npu/validation/test_turboquant_fused_decode_opt_npu.cpp)
+  target_include_directories(test_npu_fused_decode_opt PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_link_libraries(test_npu_fused_decode_opt PRIVATE
+      turboquant_fused_decode_opt_npu ascendcl)
+  target_compile_options(test_npu_fused_decode_opt PRIVATE -Wall -Wextra -Werror)
 
   # ------------------------- single-token decode at an unaligned context S
   # tests/npu/test_npu_decode_single_token_unaligned.cpp walks the ladder
@@ -250,6 +303,7 @@ function(add_ascend_micro_npu_targets)
   foreach(target test_turboquant_a8_validation test_turboquant_bf16_validation
       bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
       test_npu_decode_splitk_aic test_npu_decode_splitk_aiv
+      test_npu_fused_decode_opt
       test_npu_decode_single_token_unaligned
       test_cluster_sync_probe)
     set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
@@ -259,5 +313,6 @@ function(add_ascend_micro_npu_targets)
       test_turboquant_a8_validation test_turboquant_bf16_validation
       bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
       test_npu_decode_splitk_aic test_npu_decode_splitk_aiv
+      test_npu_fused_decode_opt
       test_npu_decode_single_token_unaligned)
 endfunction()

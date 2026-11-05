@@ -20,3 +20,9 @@ cmake --build "${build}" --target turboquant_npu_all -j 4
 echo "NPU binaries built at: ${build}"
 echo "Hardware only: ${build}/lib/test_turboquant_a8_validation"
 echo "Hardware only: ${build}/lib/bench_turboquant_reshape_and_cache"
+# The fused decode operator's own pair. The benchmark holds one kernel unless it was
+# configured with -DTQ_BENCH_LEGACY_DECODERS=ON, and the validation ladder is 16 launches
+# against an FP64 oracle with 0x5A canaries on every allocation, every unmapped KV page and
+# every inter-head scale padding lane. Both need a 950PR.
+echo "Hardware only: ${build}/lib/test_npu_fused_decode_opt"
+echo "Hardware only: ${build}/lib/bench_turboquant_decode_splitk"

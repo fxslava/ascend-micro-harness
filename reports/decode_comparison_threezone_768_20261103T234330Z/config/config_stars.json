@@ -1,0 +1,14 @@
+{
+    "stars": {
+        "ffts_mode": 3
+    },
+    "model_top": {
+        "sim_type": 0,
+        "num_aic": 32,
+        "num_aiv": 64
+    },
+    "pem": {
+        "parsim": 0,
+        "parsim_thd_limit": 0
+    }
+}

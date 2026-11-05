@@ -1,0 +1,50 @@
+{
+  "status": "PASS",
+  "sha256": "091eb1b64ba7a18178c98349c36ccf99b1622c888ade44b49fbb30de23b49bb5",
+  "bytes": 16100017,
+  "events": 67753,
+  "phases": {
+    "M": 75,
+    "X": 67678
+  },
+  "positive_duration_events": 64933,
+  "timestamp_range_us": [
+    0.3499999940395355,
+    31.577777922153473
+  ],
+  "core_pipe_event_counts": {
+    "core0.cubecore0": {
+      "SCALAR": 2250,
+      "MTE2": 2,
+      "MTE1": 32,
+      "FLOWCTRL": 148,
+      "CUBE": 12,
+      "FIXP": 24
+    },
+    "core0.veccore0": {
+      "SCALAR": 7540,
+      "MTE3": 65,
+      "MTE2": 15,
+      "PUSHQ": 470,
+      "FLOWCTRL": 910,
+      "RVECLP": 250,
+      "RVECSU": 528,
+      "RVECEX": 10553,
+      "RVECST": 6230,
+      "RVECLD": 6044
+    },
+    "core0.veccore1": {
+      "SCALAR": 7540,
+      "MTE3": 65,
+      "MTE2": 15,
+      "PUSHQ": 470,
+      "FLOWCTRL": 910,
+      "RVECLP": 250,
+      "RVECSU": 528,
+      "RVECEX": 10553,
+      "RVECST": 6230,
+      "RVECLD": 6044
+    }
+  },
+  "note": "Native CANN timeline, unchanged; simulator timestamps are not hardware timings."
+}

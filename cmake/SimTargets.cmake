@@ -66,7 +66,11 @@ function(add_ascend_micro_sim_targets)
   # camodel_paged_decode_attention_kernel, so the duplicate was the one
   # translation unit of this operator compiled without it.
   function(add_micro_camodel_runner name kernel_target)
-    add_executable(test_camodel_${name} tests/camodel/test_camodel_${name}.cpp)
+    if(name STREQUAL "fused_decode_opt" OR name STREQUAL "gemm_reduce")
+      add_executable(test_camodel_${name} tests/sim/kernel/test_camodel_${name}.cpp)
+    else()
+      add_executable(test_camodel_${name} tests/camodel/test_camodel_${name}.cpp)
+    endif()
     if(ARGN)
       target_compile_definitions(test_camodel_${name} PRIVATE ${ARGN})
     endif()
@@ -108,6 +112,51 @@ function(add_ascend_micro_sim_targets)
   target_compile_options(test_wta_convergence_probe PRIVATE -Wall -Wextra -Werror)
   add_micro_camodel_probe(normalize_store)
   add_micro_camodel_probe(online_softmax)
+  add_micro_camodel_probe(fused_decode_opt
+      tests/sim/kernel/fused_decode_opt_kernel.cpp)
+  add_executable(test_fused_decode_opt_contract tests/cpu/test_fused_decode_opt_contract.cpp)
+  target_compile_options(test_fused_decode_opt_contract PRIVATE -Wall -Wextra -Werror)
+  add_executable(test_fused_decode_opt_fixture tests/cpu/test_fused_decode_opt_fixture.cpp)
+  target_compile_options(test_fused_decode_opt_fixture PRIVATE -Wall -Wextra -Werror)
+  # TQ_GEMM_REDUCE drives the operator's reduction phase with the Cube GEMM reduction
+  # (TurboQuantBatchedGemmReducer) instead of the shipping vector reducer. It is ON by
+  # default and the option itself is declared in the top-level CMakeLists.txt, so this leg
+  # and the physical leg cannot disagree about which reduction the operator ships.
+  #
+  # It used to be OFF, and turning it ON used to FAIL the build on a static_assert naming
+  # the operator's 19648-byte UB deficit -- the batched form's two 8-row fp32 panels did not
+  # fit the 4256 bytes left under the 192 KB window. That deficit is now paid by a TBufPool
+  # aliased onto the attention phase's dead transient pool, so ON builds and runs; the
+  # arithmetic is in include/turboquant_gemm_reduce.hpp and the overlay's own evidence in
+  # reports/gemm_batched_reduction_camodel_20261104.md. scripts/gemm_reduce_switch_gate.sh
+  # is the retained sanity check: ON must build, and a pool cut too short must still be
+  # rejected by that static_assert rather than silently aliasing out of bounds.
+  ascendc_compile_options(camodel_fused_decode_opt_kernel PRIVATE
+      -std=c++17 -Wall -Werror ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS}
+      ${TQ_FUSED_DECODE_REDUCE_DEFINES}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  # The Split-K final reduction on the Cube. Its KERNEL source stays under tests/, so the
+  # probe's entry points cannot reach a production launcher, but its SERVICE header now lives
+  # in kernels/ops/turboquant/fused_decode/cube/ because the dense batched reducer is wired
+  # into the operator's reduction phase behind TQ_GEMM_REDUCE above. The probe emits five entry
+  # points over one workspace -- the M = 1 GEMV stage, that stage with Mmad's GEMV mode left
+  # on, the dense batched form, the batched form with the same knob, and the shipping
+  # TurboQuantPartialReducer as the numerical reference -- so every comparison is against
+  # production arithmetic compiled in the same build rather than a host reimplementation of it.
+  add_micro_camodel_probe(gemm_reduce
+      tests/sim/kernel/gemm_reduce_kernel.cpp)
+  add_executable(test_gemm_reduce_geometry tests/cpu/test_gemm_reduce_geometry.cpp)
+  target_compile_options(test_gemm_reduce_geometry PRIVATE -Wall -Wextra -Werror)
+  # -Wall -Werror, the same strictness the operator's own device leg is built at, and NOT
+  # -Wextra: this variant includes the production vector service, and -Wextra fails there on a
+  # pre-existing unused parameter in TurboQuantModeName
+  # (kernels/ops/turboquant/fused_decode/common/turboquant_mode.h:297), which is not this
+  # prototype's to fix. The -Wall -Wextra -Werror compile §6.1 asks for is the host gate over
+  # the shared contract header, test_gemm_reduce_geometry above.
+  ascendc_compile_options(camodel_gemm_reduce_kernel PRIVATE
+      -std=c++17 -Wall -Werror ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
 
   # The randomised-Hadamard butterfly leaf (roadmap No.6) and its three
   # competing permutation strategies. One kernel source, three entry points,
@@ -325,11 +374,22 @@ function(add_ascend_micro_sim_targets)
   target_compile_options(test_aic_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
   add_executable(test_aic_splitk_acc_error_model tests/cpu/test_aic_splitk_acc_error_model.cpp)
   target_compile_options(test_aic_splitk_acc_error_model PRIVATE -Wall -Wextra -Werror)
-  target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM)
+  # ASCEND_MICRO_BENCH_SIM says this is the simulator leg. TQ_BENCH_LEGACY_DECODERS keeps the
+  # AIV and AIC decoders compiled IN on this leg only: the physical benchmark is now isolated to
+  # the fused operator (cmake/NpuTargets.cmake), but the simulator twin is what
+  # scripts/profile_camodel_trace.sh, scripts/capture_fused_decode_opt_camodel_json.sh and
+  # scripts/check_decode_splitk_bench_cli.sh drive with --impl aiv, aic and all, and those are
+  # the existing CAModel evidence paths for the OTHER two kernels. Isolating this leg too would
+  # make an msprof capture of the AIC decoder impossible to reproduce, which is not what
+  # isolating the hardware benchmark was for. The CLI, the validation and the CSV schema are
+  # identical on both legs; only which kernels a given binary can launch differs.
+  target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM
+      TQ_BENCH_LEGACY_DECODERS=1)
   target_include_directories(bench_decode_splitk_sim PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(bench_decode_splitk_sim PRIVATE
-      camodel_single_token_decode_splitk_kernel camodel_paged_decode_attention_kernel ascendcl
+      camodel_single_token_decode_splitk_kernel camodel_paged_decode_attention_kernel
+      camodel_fused_decode_opt_kernel ascendcl
       "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
   target_link_options(bench_decode_splitk_sim PRIVATE
       "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")

@@ -1,2 +1,8 @@
 # Shell entry points run in WSL, including when checked out on Windows.
 *.sh text eol=lf
+
+# Preserve the exact bytes covered by the CAModel trace SHA-256 manifests.
+reports/decode_comparison_*/trace.json -text
+reports/fused_decode_opt_json_*/trace.json -text
+reports/decode_trace_comparison_*/matched_context_128_overlay.json -text
+reports/decode_trace_comparison_*/old_bf16_n16_source/trace.json -text

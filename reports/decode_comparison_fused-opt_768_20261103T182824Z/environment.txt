@@ -1,0 +1,16 @@
+git_commit=4a1f0cf327c7a9b2982126c03ab6ae9c59647b66
+build_root=/tmp/ascend-fused-opt-bench.yOuivK
+work=/tmp/ascend-fused-opt-json.GtN1UB
+soc=Ascend950PR_9599
+kernel=turboquant_mm_fused_decode_opt_kv4fp8_half
+impl=fused-opt
+context=768
+page_tokens=128
+kv_heads=1
+shared_query_rows=16
+splits=1
+requests=1
+LD_LIBRARY_PATH=/tmp/ascend-fused-opt-bench.yOuivK/build/lib:/usr/local/Ascend/cann-9.2.0-beta.2/tools/simulator/Ascend950PR_9599/lib:/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/devlib:/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.2.0-beta.2/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/cann-9.2.0-beta.2/devlib
+CAMODEL_CONFIG_PATH=/tmp/ascend-fused-opt-json.GtN1UB/config
+0957d620bd4f07c5cd36e360ad1674ed56f404fc4f5884e3951d0e5786108512  /tmp/ascend-fused-opt-bench.yOuivK/build/lib/bench_decode_splitk_sim
+f789ffd6ce1ba5b351ab4f459e0cc6571c71bfd4f0949363bdb3f73912c0f159  /tmp/ascend-fused-opt-bench.yOuivK/build/lib/libcamodel_fused_decode_opt_kernel.so

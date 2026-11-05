@@ -1,0 +1,12 @@
+{
+  "csrc/attention/turboquant/op_kernel/common/turboquant_common.h": "909566d68796215bfb570b6bb36467610b4d65b291160077d85e0caff9ea548c",
+  "csrc/attention/turboquant/op_kernel/common/turboquant_layout.h": "50817c785f7ee2f24999d03b7f192294b34e8183d0b332ce8c2bb13421adbf5b",
+  "csrc/attention/turboquant/op_kernel/common/turboquant_mode.h": "b636d3df4c93fbf03c22bb29fda3f212abd4456d57b7b3b936aeacc97b7a426b",
+  "csrc/attention/turboquant/op_kernel/common/turboquant_codec_950.h": "680c25b557a63874efa9432633711303a1fab3eada96ac72ea3003b81d3bfb3c",
+  "csrc/attention/turboquant/op_kernel/common/turboquant_codec_mx.h": "10c5a880e19d9c796aa53e7889e69b924aa344a1d0584bd32e70bd710f6d0ba0",
+  "csrc/attention/turboquant/op_kernel/cube/turboquant_cube_service.h": "76c58b12f1981e79b65da3a16a92b4bee669c1edce43a5fde57b61f857501546",
+  "csrc/attention/turboquant/op_kernel/cube/turboquant_query_basis.h": "7f02230b41956f48b397dc0aeec25a547b8e1ff1932f723fbd76812aec677902",
+  "csrc/attention/turboquant/op_kernel/vector/turboquant_vector_service.h": "f0a8e5c68e993e859667361adb04a936fbc2b9e83757ced3abaded17ad30b326",
+  "csrc/attention/turboquant/op_kernel/turboquant_fused_decode_opt.cpp": "31ca2e28d91d91f4c54a2f7945ee896dafcf3fce09e1cd89ba3ec5bc13b0a1c2",
+  "csrc/kernels/types.h": "dc6695092915c2f1b14a28c3fddc9374a9bf3aef9c60a2f830d34639095ec9e6"
+}

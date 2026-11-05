@@ -1,0 +1,16 @@
+# Audit status of the stored traces re-audited with the FIXED auditor.
+# No new simulation was run; same dump files as ladder-summary.txt.
+# repeat-launch-n4x2 was SIGTERM-truncated mid-run, so its dangling token
+# is an artifact of the interrupted run, not a kernel finding.
+deep-first-n4          PASS
+depth-n3               PASS
+fulldepth-n12          PASS
+iso-page-last-strip    PASS
+iso-page-last          PASS
+iso-page-mid           PASS
+iso-page0              PASS
+odd-n7                 PASS
+period-exact-n9        PASS
+repeat-launch-n4x2     FAIL: ValueError: nonempty final marking
+tail-rows-n16          PASS
+wrap-n6                PASS

@@ -1,0 +1,1 @@
+/tmp/ascend-camodel-trace.9mIab8/profile/OPPROF_20261103132408_WIOCCRTDMMYDCCPL/simulator/trace.json

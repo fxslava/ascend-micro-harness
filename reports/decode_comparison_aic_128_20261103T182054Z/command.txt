@@ -1,0 +1,1 @@
+/usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin/msprof op simulator --application=/tmp/ascend-fused-opt-json.FI4jQn/run/application.sh --output=/tmp/ascend-fused-opt-json.FI4jQn/profile --soc-version=Ascend950PR_9599 --aic-metrics=PipeUtilization --kernel-name=turboquant_paged_decode_splitk_aic --launch-count=1 --timeout=10 
