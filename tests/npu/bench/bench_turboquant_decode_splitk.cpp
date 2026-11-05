@@ -1,6 +1,26 @@
 // Single-launch, real page-partitioned Split-K decode benchmark.
 // No synthetic partial states or cyclic page waves. Each sample resets its
 // head slots outside the ACL event interval, then times exactly one launch.
+//
+// KERNEL ISOLATION. By default this executable benchmarks ONE kernel: the fused decode
+// operator, turboquant_mm_fused_decode_opt_kv4fp8_half, with the Cube GEMM reduction that
+// TQ_GEMM_REDUCE=ON selects for its reduction phase. The legacy decoders -- the AIV-only
+// split-K decoder and the AIC M=16 lock-step partial-state model -- are compiled OUT, so
+// nothing else launches, nothing else is timed and the two legacy kernel libraries are not
+// even linked (cmake/NpuTargets.cmake drops them from the link in this configuration). That is
+// what makes an msprof capture of this binary a capture of the operator and not of a sweep
+// that happens to contain it.
+//
+// They are not deleted. Configure with -DTQ_BENCH_LEGACY_DECODERS=ON and the comparison
+// columns, the modeled AIC crossover and --impl aiv|aic|both|all all come back exactly as they
+// were; the CSV schema is the same either way, with NA in the columns a given build cannot
+// fill. Everything under TQ_BENCH_FUSED_OPT_ONLY below is that switch and nothing else.
+#if defined(TQ_BENCH_LEGACY_DECODERS) && TQ_BENCH_LEGACY_DECODERS
+#define TQ_BENCH_FUSED_OPT_ONLY 0
+#else
+#define TQ_BENCH_FUSED_OPT_ONLY 1
+#endif
+
 #include "../turboquant_npu_common.hpp"
 #include "../../common/aic_splitk_decode_fixture.hpp"
 #include "../../../include/turboquant_splitk_contract.hpp"
@@ -35,11 +55,26 @@ using AicDevice = tq_splitk_rig::AicRig;
 
 struct Options {
     std::vector<int> contexts{1024, 2048, 4096, 8192, 16384};
+#if TQ_BENCH_FUSED_OPT_ONLY
+    // The operator's own sweep: contexts 1024..16384, S in {1,2,4,8} (K>8 is outside
+    // valid_launch), and 16 query heads over one KV head at D=256 -- the GQA shape the
+    // validation ladder and the CAModel evidence are both about. 1 is kept in the split sweep
+    // because it is the fused path, which is the baseline every speedup is against and the one
+    // geometry that reaches no reduction at all.
+    std::vector<int> splits{1, 2, 4, 8};
+    int warmup = 5, iters = 30, requests = 1;
+    int heads = 1, rows = 16, page_tokens = 128;
+#else
     std::vector<int> splits{1, 2, 4, 8, 12, 16};
     int warmup = 5, iters = 30, requests = 1;
     int heads = 4, rows = 6, page_tokens = 128;
+#endif
     bool single = false;
+#if TQ_BENCH_FUSED_OPT_ONLY
+    std::string impl = "fused-opt", csv_out;
+#else
     std::string impl = "aiv", csv_out;
+#endif
     int page_begin = 0, page_count = -1;
     bool zone_report = false;
     bool Aiv() const { return impl == "aiv" || impl == "both" || impl == "all"; }
@@ -146,6 +181,13 @@ Options parse(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--help") {
+#if TQ_BENCH_FUSED_OPT_ONLY
+            std::puts("Fused decode operator only. Configure -DTQ_BENCH_LEGACY_DECODERS=ON for\n"
+                      "the AIV/AIC comparison columns and --impl aiv|aic|both|all.\n"
+                      "Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8;\n"
+                      "          --heads 1 --rows 16 (16 query heads over one KV head), D=256,\n"
+                      "          --page-tokens 128.");
+#endif
             std::puts("--context N[,N...] --splitk K[,K...] --warmup N --iters N "
                       "--requests N --heads N --rows N --page-tokens N\n"
                       "--impl aiv|aic|both|fused-opt|three-zone|all --single --csv-out PATH --page-begin P --page-count P\n"
@@ -182,8 +224,14 @@ Options parse(int argc, char** argv)
         else throw std::runtime_error("unknown option: " + std::string(arg));
     }
     if (o.single) { o.warmup = 0; o.iters = 1; }
+#if TQ_BENCH_FUSED_OPT_ONLY
+    require(o.OptOnly(), "this build benchmarks the fused decode operator alone: --impl must be "
+                         "fused-opt or three-zone. Configure -DTQ_BENCH_LEGACY_DECODERS=ON to "
+                         "restore aiv, aic, both and all");
+#else
     require(o.Aiv() || o.Aic() || o.Opt(),
             "impl must be aiv, aic, both, fused-opt, three-zone or all");
+#endif
     require(!o.zone_report || o.Opt(), "--zone-report needs fused-opt, three-zone or all");
     if (o.OptOnly() && !explicit_splits) o.splits = {1, 2, 4, 8};
     require(o.page_begin >= 0 && o.page_count >= -1, "invalid AIC page window");
@@ -393,8 +441,14 @@ int main(int argc, char** argv)
             csv << "context,splits,grid,aiv_us,aiv_speedup,aiv_kv_gbs,aic_batch_us,aic_model_us_per_req,aic_model_gbs,aic_physical_kv_gbs,tail_ticks,export_ticks,aiv_launches,aic_launches,opt_grid,opt_us,opt_speedup,opt_kv_cache_gbs,opt_launches\n";
         }
         if (o.single) std::puts("[PROFILING MODE] Single launch mode active for msprof op.");
+#if TQ_BENCH_FUSED_OPT_ONLY
+        std::puts("ISOLATED: the fused decode operator is the only kernel in this binary. The AIV and AIC");
+        std::puts("columns are NA by construction, not by a missing device; so is the modeled crossover.");
+        std::puts("Configure -DTQ_BENCH_LEGACY_DECODERS=ON to benchmark them alongside it again.");
+#else
         std::puts("AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.");
         std::puts("AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.");
+#endif
         if (o.Opt()) {
             std::puts("OPT: KV4/FP8, FP32 pre-rotated GQA queries, FP16 rotated-basis output; complete in-launch Split-K combine.");
             std::printf("OPT GQA query heads per KV head=%d; OPT Grid is the actual dispatch (capped at 32 blocks).\n", o.rows);
@@ -421,13 +475,21 @@ int main(int argc, char** argv)
         std::map<std::string, int> zone_classes;
         std::uint64_t aiv_launches = 0, aic_launches = 0, opt_launches = 0;
         for (int n : o.contexts) {
+#if !TQ_BENCH_FUSED_OPT_ONLY
             std::unique_ptr<Fixture> av, ac;
+#endif
             std::unique_ptr<fused_decode_opt_test::Fixture> opt_fixture;
+#if !TQ_BENCH_FUSED_OPT_ONLY
             if (o.Aiv()) av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
             if (o.Aic()) ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens));
+#endif
             if (o.Opt()) opt_fixture.reset(new fused_decode_opt_test::Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
             std::vector<int> sweep;
+#if TQ_BENCH_FUSED_OPT_ONLY
+            if (!o.single && opt_fixture) sweep.push_back(1);
+#else
             if (!o.single && (av || opt_fixture)) sweep.push_back(1);
+#endif
             for (int k : o.splits)
                 if (std::find(sweep.begin(), sweep.end(), k) == sweep.end()) sweep.push_back(k);
             double baseline = 0, opt_baseline = 0;
@@ -435,6 +497,7 @@ int main(int argc, char** argv)
                 Measurement aiv, aic, opt;
                 double aiv_bytes = 0, aic_bytes = 0, opt_bytes = 0;
                 int opt_grid = 0;
+#if !TQ_BENCH_FUSED_OPT_ONLY
                 if (av) {
                     Device d(*av, k);
                     aiv = measure(d, o, k, session.stream, events);
@@ -449,6 +512,7 @@ int main(int argc, char** argv)
                     aic_launches += aic.launches;
                     aic_bytes = static_cast<double>(ac->key.size() + ac->value.size() + ac->scales.size() * 4) * pages / ac->pages;
                 }
+#endif
                 if (opt_fixture && k <= 8) {
                     tq_splitk_rig::FusedOptRig d(*opt_fixture, k);
                     opt = measure(d, o, k, session.stream, events);

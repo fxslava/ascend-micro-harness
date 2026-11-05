@@ -356,14 +356,36 @@ private:
         return numSplits_ <= 1 || contextLen <= static_cast<int32_t>(fusedContextLimit_);
     }
 
+    // THE TASK'S ONE JOIN. Every path out of a task leaves through the DrainFusedDecodeTask()
+    // below, including the paths that do no work at all:
+    //
+    //   * the duplicate splits of a FUSED token, which this used to leave by a bare `return`
+    //     in front of the join -- symmetric across the roles, because both read the same
+    //     contextLen word, but the one task exit that did not pass the rendezvous;
+    //   * an UNMAPPED split, whose block range is empty because blockStart >= blockEnd;
+    //   * a split whose every block-table entry is negative, so numTiles == 0 and neither role
+    //     may touch a pipeline flag.
+    //
+    // The last two already fell through to the join; the first does now. The cost is one
+    // mode-2 rendezvous per skipped split of a fused token, and what it buys is that the
+    // per-task flag protocol is identical on every exit: the trace auditor's
+    // dispatch == completion count then holds over the whole task stream without a case
+    // analysis, and a future divergence between the two roles' view of `fused` cannot leave
+    // one of them one task ahead of the other. RunTask holds the work and has no join.
     __aicore__ inline void ComputeTask(const uint32_t token, const uint32_t kvHead, const uint32_t split,
                                        const uint32_t chunk)
     {
         const int32_t contextLen = contextLenGm_.GetValue(token);
         const bool fused = IsFused(contextLen);
-        if (fused && split > 0) {
-            return;
+        if (!fused || split == 0) {
+            RunTask(token, kvHead, split, chunk, contextLen, fused);
         }
+        DrainFusedDecodeTask();
+    }
+
+    __aicore__ inline void RunTask(const uint32_t token, const uint32_t kvHead, const uint32_t split,
+                                   const uint32_t chunk, const int32_t contextLen, const bool fused)
+    {
         const uint32_t offset = chunk * headsPerTask_;
         const uint32_t rows = groupHeads_ - offset < headsPerTask_ ? groupHeads_ - offset : headsPerTask_;
         const TurboQuantTaskHeads heads = Vector::Heads(kvHead * groupHeads_ + offset, rows);
@@ -382,6 +404,12 @@ private:
         if (blockEnd > seqBlocks) {
             blockEnd = seqBlocks;
         }
+
+        // The split's block table, fetched once, here, by both roles. This is the earliest
+        // point at which the range exists: BeginTask runs before the split's extent is known
+        // and on the vector role only, while the AIC needs the same entries because CountTiles
+        // is the one predicate both roles branch on.
+        PrefetchBlockTable(token, blockStart, blockEnd);
 
         if (blockStart < blockEnd) {
             PipelineTask task;
@@ -419,7 +447,57 @@ private:
         if ASCEND_IS_AIV {
             vector_.StageTaskOutput(token, split, heads, fused, basis_);
         }
-        DrainFusedDecodeTask();
+    }
+
+    // THE BLOCK TABLE, OUT OF THE PIPELINE.
+    //
+    // CountTiles and NextTile both used to read blockTableGm_ with GetValue -- a scalar load
+    // from Global Memory -- and NextTile runs INSIDE the steady loop, once per tile on each of
+    // the two cursors. So one logical page's entry was fetched three times per task (the count,
+    // on both roles; the read cursor; the consume cursor) and two of those three fetches sat
+    // between a softmax and the next tile's stage, on the scalar queue, inside the dependence
+    // chain the three-zone schedule exists to keep full.
+    //
+    // The task prologue now sweeps [blockStart, blockEnd) once into this scalar cache and both
+    // walkers read local memory. The sweep is still GetValue rather than a DataCopy into UB on
+    // purpose: the Cube GEMM reduction's overlay already spends the only transient UB this
+    // operator has, and a UB landing would make the AIC walk a TPipe allocation the AIV does
+    // not -- the fault that made that reduction's first Cube run target an unallocated tensor.
+    //
+    // Both roles prefetch, identically, over the same GM words in the same order, so the
+    // numTiles both cores branch on comes from one read each rather than from two reads that
+    // could in principle see different bytes.
+    //
+    // A split longer than the cache falls back to the direct read, per block, exactly as the
+    // old code always did -- correct, and slow in the same way. 64 entries covers every
+    // geometry the validation ladder and the benchmark's split sweeps reach: 16384 context
+    // tokens at 128-token pages is 128 blocks, so splits >= 2 is inside the cache and
+    // splits == 1 at that context is the one sweep row that falls back. 256 bytes of scalar
+    // local memory, which is why it is 64 entries and not 256.
+    static constexpr uint32_t kBlockCacheEntries = 64;
+
+    __aicore__ inline void PrefetchBlockTable(const uint32_t token, const uint32_t blockStart,
+                                              const uint32_t blockEnd)
+    {
+        blockCacheBase_ = blockStart;
+        if (blockEnd <= blockStart) {
+            blockCacheCount_ = 0;
+            return;
+        }
+        const uint32_t span = blockEnd - blockStart;
+        blockCacheCount_ = span < kBlockCacheEntries ? span : kBlockCacheEntries;
+        const uint64_t row = static_cast<uint64_t>(token) * maxBlocksPerSeq_;
+        for (uint32_t i = 0; i < blockCacheCount_; ++i) {
+            blockCache_[i] = blockTableGm_.GetValue(row + blockStart + i);
+        }
+    }
+
+    __aicore__ inline int32_t BlockTableEntry(const uint32_t token, const uint32_t block)
+    {
+        if (block >= blockCacheBase_ && block - blockCacheBase_ < blockCacheCount_) {
+            return blockCache_[block - blockCacheBase_];
+        }
+        return blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + block);
     }
 
     __aicore__ inline uint32_t CountTiles(const uint32_t token, const uint32_t contextLen, const uint32_t blockStart,
@@ -428,8 +506,7 @@ private:
         uint32_t tiles = 0;
         for (uint32_t block = blockStart; block < blockEnd; ++block) {
             if (probePage_ != UINT32_MAX && block != probePage_) continue;
-            const int32_t physical =
-                blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + block);
+            const int32_t physical = BlockTableEntry(token, block);
             if (physical < 0) {
                 continue;
             }
@@ -461,8 +538,7 @@ private:
         }
         while (cursor.block < blockEnd) {
             if (probePage_ != UINT32_MAX && cursor.block != probePage_) { ++cursor.block; continue; }
-            const int32_t physical =
-                blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + cursor.block);
+            const int32_t physical = BlockTableEntry(token, cursor.block);
             if (physical >= 0) {
                 uint32_t rows = blockSize_;
                 const uint32_t consumed = cursor.block * blockSize_;
@@ -710,6 +786,11 @@ private:
     }
 
     uint32_t probePage_ = UINT32_MAX, probeTile_ = 0;
+    // The prefetched block table of the task in flight. blockCacheCount_ == 0 means every
+    // lookup falls back to GM, which is what an empty or unmapped split leaves behind.
+    int32_t blockCache_[kBlockCacheEntries] = {};
+    uint32_t blockCacheBase_ = 0;
+    uint32_t blockCacheCount_ = 0;
     AscendC::TPipe *pipe_;
     Mm mm_;
     Vector vector_;
@@ -765,13 +846,54 @@ private:
 #if defined(ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE) && ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE
 #include "fused_decode/cube/turboquant_gemm_reduce_service.h"
 
-// The restatement check for the pool, the counterpart of the one in
-// include/turboquant_fused_decode_opt.hpp for kUbEnd: the contract header cannot include the
-// vector service, so it restates the pool's length, and this pins the two together.
+// OVERLAY SAFETY: what is checked here, and the one thing no compiler can check.
+//
+// ReduceGemm's two panel slots live in a TBufPool aliased onto the attention phase's transient
+// pool -- kUbSizes[15..17], which are nzOperandBuf_ (the tile ingest's NZ staging operand),
+// accBuf_ (the per-task online-softmax accumulator) and queryWorkBuf_ (the query staging). The
+// reduction therefore WRITES the same UB bytes the attention phase read. Four checks below,
+// and all four are extent checks:
+//
+//   1. the pool's length is what the contract header says it is, so the two headers that
+//      restate it cannot drift (this was the only check here before);
+//   2. the reducer's UB claim fits inside the pool the OPERATOR allocates -- kTransientPoolBytes,
+//      not the reducer's own restatement of it, so this holds even while the restatement is
+//      being changed, and it is the use-site counterpart of the reducer header's own fit
+//      assert. (The extent itself needs no assert here: kTransientPoolBytes is DEFINED as
+//      kUbSizes[15] + kUbSizes[16] + kUbSizes[17] in the contract header and pinned to 32768
+//      there, and check 1 ties the reducer's copy to it. A pool one allocation longer would
+//      move kUbEnd and every offset after it, and the Cube's dual-destination Fixpipe windows
+//      at UB offsets 0 and kScoreBytes are addressed by offset on three cores with nothing in
+//      the toolchain checking that they agree.)
+//   3. the launch validator rejects a split count the reduction's partial fractal cannot
+//      hold. kMaxSplits is baked into the fractal geometry (one 8-float C0 per query row), so
+//      a valid_launch that admitted splits > kMaxSplits would hand the reducer a source
+//      stride it has no lane for. valid_launch is constexpr, so the bound is checked by
+//      calling it rather than by restating it.
+//
+// NOT CHECKED, AND NOT CHECKABLE HERE: that those three buffers are DEAD when the reduction
+// starts. Nothing in the toolchain verifies liveness. What establishes it is the
+// AscendC::SyncAll<false>() in the launch macros -- every block's attention phase has retired
+// before any block reduces -- plus the fact that no method reachable from ReduceGemm reads
+// them. A future change that reads nzOperandBuf_, accBuf_ or queryWorkBuf_ after the attention
+// phase breaks this SILENTLY, with no diagnostic and correct-looking output at geometries that
+// do not reduce. The gate that would catch it is a multi-split CAModel rung with its canary
+// and exact-comparison checks -- section 9 of
+// reports/gemm_batched_reduction_camodel_20261104.md -- not this translation unit.
 static_assert(ascend_micro::fused_decode_opt::kTransientPoolBytes ==
                   ascend_micro::gemm_reduce::kGemmSharedPoolBytes,
               "turboquant_gemm_reduce.hpp restates the transient pool's length; update "
               "kGemmSharedPoolBytes there to match kTransientPoolBytes");
+static_assert(ascend_micro::gemm_reduce::kGemmReducerUbBytes <=
+                  ascend_micro::fused_decode_opt::kTransientPoolBytes,
+              "the batched reducer's panels do not fit the attention phase's transient pool");
+static_assert(ascend_micro::fused_decode_opt::valid_launch(
+                  1, 1, 16, 1, 256, 128, 8, ascend_micro::gemm_reduce::kMaxSplits, 16, 8, 16),
+              "the launch validator refuses the reduction's own maximum split count");
+static_assert(!ascend_micro::fused_decode_opt::valid_launch(
+                  1, 1, 16, 1, 256, 128, 8, ascend_micro::gemm_reduce::kMaxSplits + 1, 16, 9, 16),
+              "the launch validator admits more splits than the Cube GEMM reduction's partial "
+              "fractal has lanes for");
 
 #define ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE)                                                                    \
     do {                                                                                                             \
@@ -780,6 +902,33 @@ static_assert(ascend_micro::fused_decode_opt::kTransientPoolBytes ==
         op.ReduceGemm(reducer, reduceTasksPerBlock);                                                                  \
     } while (0)
 #else
+// THE DEFAULT PHASE'S ROLE CONTRACT, and why its asymmetry is not a hang.
+//
+// The reducer object and the Reduce() call stay behind `if ASCEND_IS_AIV`: the Cube has no part
+// in the vector recurrence, and -- unlike the Cube GEMM form above -- the reducer's destination
+// is the vector cores' own UB, so the two roles do not have to walk the same TPipe allocation.
+// The AIC allocates nothing and does nothing in this phase.
+//
+// That asymmetry was audited for a cross-core join deadlock and does not have one:
+//
+//   * Both roles reach the launch macro's DrainFusedDecodeTask() after this phase, and that
+//     drain is a balanced two-phase rendezvous on ONE flag id. CrossCoreSetFlag(ISASI) mode 2
+//     (CANN 9.2, Ascend 950PR): the AIC's set releases the CrossCoreWaitFlag on BOTH AIVs, and
+//     the two AIVs' sets TOGETHER release the AIC's wait. So one AIC set and one set from each
+//     subcore is exactly the balance DrainFusedDecodeTask() posts, in both directions.
+//   * The AIC therefore announcing its join while the AIVs are still reducing is the intended
+//     order, not a race: the AIC then blocks in its own wait until both AIVs have finished
+//     reducing AND drained MTE3, which the AIV leg's SyncEvent<MTE3_S>() in front of its set is
+//     what guarantees.
+//   * Nothing on TurboQuantPartialReducer's path takes a cross-core flag or a SyncAll of its
+//     own -- its only barrier is a PipeBarrier inside its own Init -- so the AIC's absence
+//     cannot block the AIVs either.
+//
+// What a future change must preserve is that last bullet. A cross-core primitive introduced
+// anywhere under op.Reduce() turns this guard into a hang, and the gate that would show it is
+// a multi-split CAModel rung and its trace audit, not a build. The join itself stays in the
+// launch macros, once, after the phase, so both forms of this macro are followed by the same
+// rendezvous and neither has to post one of its own.
 #define ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE)                                                                    \
     do {                                                                                                             \
         if ASCEND_IS_AIV {                                                                                           \

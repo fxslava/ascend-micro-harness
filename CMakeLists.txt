@@ -34,6 +34,28 @@ foreach(path IN ITEMS
       "-isystem${ASCEND_HOME_PATH}/x86_64-linux/${path}")
 endforeach()
 
+# The Cube GEMM reduction for the fused decode operator's reduction phase
+# (TurboQuantBatchedGemmReducer, kernels/ops/turboquant/fused_decode/cube/). ON by
+# default: the reducer's 27264 UB bytes come from a TBufPool aliased onto the
+# attention phase's dead 32768-byte transient pool, so the 19648-byte deficit that
+# used to make this switch a static_assert failure is paid without spending
+# headroom. reports/gemm_batched_reduction_camodel_20261104.md carries the
+# arithmetic, the overlay's CAModel rungs and what is NOT established; the ladder
+# that gates a change to this default is scripts/gemm_reduce_switch_gate.sh.
+#
+# Defined here, once, rather than in SimTargets.cmake, for the same reason
+# ASCEND_MICRO_CANN_SYSTEM_OPTIONS is: both target modules compile the identical
+# kernel source, so an option visible to one leg only would build the Cube GEMM
+# reduction on the simulator and the vector reducer on the physical device -- two
+# different operators behind one flag, and whichever leg a given host can build
+# decides which one it gets. Turn it off with -DTQ_GEMM_REDUCE=OFF and both legs
+# fall back to TurboQuantPartialReducer together.
+option(TQ_GEMM_REDUCE "Drive TurboQuantFusedDecodeOpt's reduction with the Cube GEMM" ON)
+set(TQ_FUSED_DECODE_REDUCE_DEFINES "")
+if(TQ_GEMM_REDUCE)
+  set(TQ_FUSED_DECODE_REDUCE_DEFINES -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1)
+endif()
+
 set(ASCENDC_CMAKE_DIR
     "${ASCEND_HOME_PATH}/tools/tikcpp/ascendc_kernel_cmake")
 if(NOT EXISTS "${ASCENDC_CMAKE_DIR}/ascendc.cmake")

@@ -119,17 +119,18 @@ function(add_ascend_micro_sim_targets)
   add_executable(test_fused_decode_opt_fixture tests/cpu/test_fused_decode_opt_fixture.cpp)
   target_compile_options(test_fused_decode_opt_fixture PRIVATE -Wall -Wextra -Werror)
   # TQ_GEMM_REDUCE drives the operator's reduction phase with the Cube GEMM reduction
-  # (TurboQuantBatchedGemmReducer) instead of the shipping vector reducer. It is OFF by
-  # default and turning it ON is EXPECTED TO FAIL the build, on a static_assert naming the
-  # operator's 19648-byte UB deficit -- the batched form's two 8-row fp32 panels do not fit
-  # the 4256 bytes left under the 192 KB window. The arithmetic and the three ways out are in
-  # include/turboquant_gemm_reduce.hpp; scripts/gemm_reduce_switch_gate.sh is the negative
-  # control that checks the build fails for THAT reason and not another.
-  option(TQ_GEMM_REDUCE "Drive TurboQuantFusedDecodeOpt's reduction with the Cube GEMM" OFF)
-  set(TQ_FUSED_DECODE_REDUCE_DEFINES "")
-  if(TQ_GEMM_REDUCE)
-    set(TQ_FUSED_DECODE_REDUCE_DEFINES -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1)
-  endif()
+  # (TurboQuantBatchedGemmReducer) instead of the shipping vector reducer. It is ON by
+  # default and the option itself is declared in the top-level CMakeLists.txt, so this leg
+  # and the physical leg cannot disagree about which reduction the operator ships.
+  #
+  # It used to be OFF, and turning it ON used to FAIL the build on a static_assert naming
+  # the operator's 19648-byte UB deficit -- the batched form's two 8-row fp32 panels did not
+  # fit the 4256 bytes left under the 192 KB window. That deficit is now paid by a TBufPool
+  # aliased onto the attention phase's dead transient pool, so ON builds and runs; the
+  # arithmetic is in include/turboquant_gemm_reduce.hpp and the overlay's own evidence in
+  # reports/gemm_batched_reduction_camodel_20261104.md. scripts/gemm_reduce_switch_gate.sh
+  # is the retained sanity check: ON must build, and a pool cut too short must still be
+  # rejected by that static_assert rather than silently aliasing out of bounds.
   ascendc_compile_options(camodel_fused_decode_opt_kernel PRIVATE
       -std=c++17 -Wall -Werror ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS}
       ${TQ_FUSED_DECODE_REDUCE_DEFINES}
@@ -373,7 +374,17 @@ function(add_ascend_micro_sim_targets)
   target_compile_options(test_aic_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
   add_executable(test_aic_splitk_acc_error_model tests/cpu/test_aic_splitk_acc_error_model.cpp)
   target_compile_options(test_aic_splitk_acc_error_model PRIVATE -Wall -Wextra -Werror)
-  target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM)
+  # ASCEND_MICRO_BENCH_SIM says this is the simulator leg. TQ_BENCH_LEGACY_DECODERS keeps the
+  # AIV and AIC decoders compiled IN on this leg only: the physical benchmark is now isolated to
+  # the fused operator (cmake/NpuTargets.cmake), but the simulator twin is what
+  # scripts/profile_camodel_trace.sh, scripts/capture_fused_decode_opt_camodel_json.sh and
+  # scripts/check_decode_splitk_bench_cli.sh drive with --impl aiv, aic and all, and those are
+  # the existing CAModel evidence paths for the OTHER two kernels. Isolating this leg too would
+  # make an msprof capture of the AIC decoder impossible to reproduce, which is not what
+  # isolating the hardware benchmark was for. The CLI, the validation and the CSV schema are
+  # identical on both legs; only which kernels a given binary can launch differs.
+  target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM
+      TQ_BENCH_LEGACY_DECODERS=1)
   target_include_directories(bench_decode_splitk_sim PRIVATE
       "${ASCEND_HOME_PATH}/include")
   target_link_libraries(bench_decode_splitk_sim PRIVATE

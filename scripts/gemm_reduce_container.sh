@@ -22,7 +22,19 @@ set -euo pipefail
 image="${GEMM_IMAGE:-ascendai/cann:9.2.0-beta.2-910b-ubuntu22.04-py3.12}"
 name="${GEMM_CONTAINER:-gemm_dev}"
 work="${GEMM_WORK:-$HOME/gemm-work}"
-checkout="${GEMM_CHECKOUT:-/mnt/d/Projects/ascend-micro-harness}"
+# The checkout, derived from this script's own location rather than hardcoded. It used to name
+# one absolute Windows path, which silently synced the WRONG tree -- or nothing -- as soon as
+# the checkout moved. $BASH_SOURCE is already the path inside whatever filesystem invoked this,
+# /mnt/<drive>/... included, so `sync` copies the tree this script was actually run from.
+# GEMM_CHECKOUT still overrides it.
+checkout="${GEMM_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+# NOTE ON THIS HOST. The container above is not the only way to reach CANN 9.2 here any more:
+# the Ubuntu-22.04 WSL instance carries /usr/local/Ascend/cann-9.2.0-beta.2 directly, so
+# `cmake -S . -B <dir>` and the gates under scripts/ run in WSL without docker at all, which is
+# what scripts/profile_single_tile_msprof.sh and the build gates assume. This wrapper stays for
+# the image-based path and for hosts where the toolkit is only in the image; check
+# `ls /usr/local/Ascend` before assuming you need it.
 
 case "${1:-}" in
 sync)
