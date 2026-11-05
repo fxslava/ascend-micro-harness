@@ -462,6 +462,21 @@ public:
         AscendC::Duplicate(StateField(kStateRunMax), kVectorNegInf, heads.mine * kFp32PerBlock);
     }
 
+    // Synthetic Split-K network probe: publish a neutral partial for one split without
+    // entering the page/tile pipeline. This uses the same production partial packing and
+    // MTE3 publication as StageTaskOutput, so the Cube reducer reads the normal workspace ABI.
+    __aicore__ inline void WriteNeutralPartial(const uint32_t token, const uint32_t split,
+                                               const TurboQuantTaskHeads &heads)
+    {
+        if ASCEND_IS_AIV {
+            if (heads.mine == 0) return;
+            BeginTask(heads);
+            AscendC::Duplicate(StateField(kStateRunMax), -1.0e9f, heads.mine * kFp32PerBlock);
+            AscendC::Duplicate(StateField(kStateRunSum), 0.0f, heads.mine * kFp32PerBlock);
+            StagePartials(token, split, heads);
+        }
+    }
+
     // Quantises this subcore's query heads onto the operand grid, stages them into the Cube's L1 query slot
     // in NZ order, one row per head, and indexes the task's kv head in the tile scale lanes.
     __aicore__ inline void StageQuery(Mm &mm, const uint32_t token, const uint32_t kvHead,

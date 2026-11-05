@@ -114,6 +114,7 @@ function(add_ascend_micro_sim_targets)
   add_micro_camodel_probe(online_softmax)
   add_micro_camodel_probe(fused_decode_opt
       tests/sim/kernel/fused_decode_opt_kernel.cpp)
+  add_micro_camodel_runner(reduction_probe camodel_fused_decode_opt_kernel)
   add_executable(test_fused_decode_opt_contract tests/cpu/test_fused_decode_opt_contract.cpp)
   target_compile_options(test_fused_decode_opt_contract PRIVATE -Wall -Wextra -Werror)
   add_executable(test_fused_decode_opt_fixture tests/cpu/test_fused_decode_opt_fixture.cpp)

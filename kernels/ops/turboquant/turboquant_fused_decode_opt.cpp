@@ -251,6 +251,35 @@ public:
         }
     }
 
+    // CAModel-only reduction-network probe schedule. Split zero processes the first 64-token
+    // tile of page zero through the real attention pipeline. Every other split publishes the
+    // neutral state using the production partial layout and immediately joins the same task
+    // drain. The global context length remains full-sized, so every block takes the reduction.
+    __aicore__ inline void ProcessReductionProbe(const uint32_t tasksPerBlock)
+    {
+        const uint32_t tasks = numTokens_ * numKvHeads_ * numSplits_ * chunksPerGroup_;
+        const uint32_t start = MixBlockIdx() * tasksPerBlock;
+        uint32_t end = start + tasksPerBlock;
+        if (end > tasks) end = tasks;
+        for (uint32_t task = start; task < end; ++task) {
+            const uint32_t chunk = task % chunksPerGroup_;
+            const uint32_t splitTask = task / chunksPerGroup_;
+            const uint32_t split = splitTask % numSplits_;
+            const uint32_t tokenKvHead = splitTask / numSplits_;
+            const uint32_t token = tokenKvHead / numKvHeads_;
+            const uint32_t kvHead = tokenKvHead % numKvHeads_;
+            const uint32_t offset = chunk * headsPerTask_;
+            const uint32_t rows = groupHeads_ - offset < headsPerTask_ ? groupHeads_ - offset : headsPerTask_;
+            const TurboQuantTaskHeads heads = Vector::Heads(kvHead * groupHeads_ + offset, rows);
+            if (split == 0) {
+                ComputeTask(token, kvHead, split, chunk, static_cast<int32_t>(kCubeTileRows));
+            } else {
+                vector_.WriteNeutralPartial(token, split, heads);
+                DrainFusedDecodeTask();
+            }
+        }
+    }
+
     // Grid-uniform, like the lock-step decode's: every block reads every token's length, so the SyncAll
     // the caller guards with this is entered by all of them or by none.
     __aicore__ inline bool NeedsReduction()
@@ -373,10 +402,11 @@ private:
     // analysis, and a future divergence between the two roles' view of `fused` cannot leave
     // one of them one task ahead of the other. RunTask holds the work and has no join.
     __aicore__ inline void ComputeTask(const uint32_t token, const uint32_t kvHead, const uint32_t split,
-                                       const uint32_t chunk)
+                                       const uint32_t chunk, const int32_t contextOverride = -1)
     {
-        const int32_t contextLen = contextLenGm_.GetValue(token);
-        const bool fused = IsFused(contextLen);
+        const int32_t fullContextLen = contextLenGm_.GetValue(token);
+        const int32_t contextLen = contextOverride >= 0 ? contextOverride : fullContextLen;
+        const bool fused = IsFused(fullContextLen);
         if (!fused || split == 0) {
             RunTask(token, kvHead, split, chunk, contextLen, fused);
         }
