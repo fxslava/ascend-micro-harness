@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "turboquant_fused_decode.hpp"
 #include "../kernels/ops/turboquant/fused_decode/types.h"
 #include "../kernels/ops/turboquant/fused_decode/common/turboquant_layout.h"
 #include "../kernels/ops/turboquant/fused_decode/common/turboquant_mode.h"
@@ -11,6 +12,8 @@ constexpr std::uint32_t kSlots = vllm_ascend::turboquant::kCubePipelineSlots;
 constexpr std::uint32_t kWindows = vllm_ascend::turboquant::kCubeScoreWindows;
 constexpr std::uint32_t kTaskJoinFlag = 10;
 static_assert(kSlots == 3 && kWindows == 2 && kTileRows == 64);
+static_assert(kTileRows == ascend_micro::fused_decode::kDecodeTileRows,
+    "the host tiling contract and the device layout disagree about the tile");
 static_assert(vllm_ascend::turboquant::kOptFlagProbsReady < kTaskJoinFlag);
 static_assert(kTaskJoinFlag < vllm_ascend::turboquant::kOptFlagReservedFirst);
 
@@ -75,6 +78,11 @@ constexpr bool valid_launch(std::uint32_t grid, std::uint32_t tokens,
         heads % kv_heads || dim != kHeadSize || !block_size || block_size % kTileRows ||
         !max_blocks || !splits || splits > 8 || !heads_per_task || heads_per_task > 16 ||
         !tasks_per_block || !reduce_tasks_per_block) return false;
+    // The device turns a tile index into (logical page, row base) with one shift and one
+    // mask, so a page has to be a power-of-two multiple of kTileRows. A page of 192 rows
+    // would need an integer division on the SPU once per tile, which is the whole thing
+    // the host tiling exists to remove; it is refused here rather than divided for.
+    if (block_size & (block_size - 1)) return false;
     const auto group = heads / kv_heads;
     const auto chunk = heads_per_task < group ? heads_per_task : group;
     const std::uint64_t tasks = std::uint64_t{tokens} * kv_heads * splits *
@@ -107,6 +115,12 @@ struct Launch {
 struct Buffers {
     void *query, *key, *value, *scales, *block_table, *context_lengths;
     void *mode_tables, *workspace, *output;
+    // The host tiling descriptors, decode_tiling_bytes(tokens, splits, grid) of them,
+    // built by ascend_micro::fused_decode::build_decode_tiling and uploaded like any
+    // other input. Read-only on the device and read by BOTH roles. There is no device
+    // fallback if it is null: the launcher refuses the launch, because a decode that
+    // derived this itself is the operator this change removed.
+    void *tiling = nullptr;
 };
 
 // The raw-query entry's inputs: the pre-rotated entry's buffers plus the original-basis query
@@ -134,7 +148,8 @@ namespace vllm_ascend {
 void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
                                          void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
                                          void *blockTables, void *contextLens, void *modeTables, void *workspace,
-                                         void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                         void *output, void *tiling, uint32_t numTokens, uint32_t numHeads,
+                                         uint32_t numKvHeads,
                                          uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                          uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
                                          uint32_t reduceTasksPerBlock, uint32_t fusedContextLimit, float scale,
@@ -142,7 +157,8 @@ void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *st
 void turboquant_mm_fused_decode_opt_raw_query_impl(
     int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query, void *piSigns, void *rotTables,
     void *h16, void *gate, void *queryRot, void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
-    void *contextLens, void *modeTables, void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
+    void *contextLens, void *modeTables, void *workspace, void *output, void *tiling, uint32_t numTokens,
+    uint32_t numHeads,
     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
     uint32_t prologueCubeChunkVectors, uint32_t outputStage, uint32_t fusedContextLimit, float scale,

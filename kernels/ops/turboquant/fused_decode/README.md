@@ -7,7 +7,10 @@ upstream edits; the Git revision alone is not the snapshot identity.
 Apache-2.0 notices remain in each imported file. Builds use this directory and
 do not need the other checkout, PyTorch, or the vLLM extension.
 
-The integration is `../turboquant_fused_decode_opt.cpp`. Its original FP16
+The integration is `../vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp`,
+which is the single copy of this operator and the one every build leg compiles; the
+service headers in this directory are the pre-staging originals and the decode no
+longer reads them. Its original FP16
 pre-rotated and raw-query kernel symbols and namespace launch functions are
 retained. The harness API is `include/turboquant_fused_decode_opt.hpp`.
 

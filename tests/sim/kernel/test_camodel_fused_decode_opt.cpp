@@ -1,5 +1,6 @@
 #include "fused_decode_opt_sim_common.hpp"
 #include "../../../include/turboquant_fused_decode_opt.hpp"
+#include "../../../include/turboquant_fused_decode.hpp"
 #include "../../../include/sim_micro_testbed.hpp"
 #include <algorithm>
 #include <cmath>
@@ -11,6 +12,7 @@ extern "C" void launch_fused_decode_opt_sim(void*,
 
 namespace fd = ascend_micro::fused_decode_opt;
 namespace tq = vllm_ascend::turboquant;
+namespace tq_tiling = ascend_micro::fused_decode;
 
 int main(int argc, char** argv)
 {
@@ -55,7 +57,11 @@ int main(int argc, char** argv)
         camodel::GuardedDeviceBuffer workspace(round32(c.heads * c.splits * (dim + 16) * 4 + 4096));
         // Extra inactive rows are an output-canary gate.
         camodel::GuardedDeviceBuffer output(round32((c.heads + 2) * dim * 2));
-        std::vector<camodel::GuardedDeviceBuffer*> inputs{&query, &key, &value, &scales, &table, &lengths, &modes};
+        // The host tiling descriptors. An input like any other: guard-banded, canary-flooded
+        // outside its payload, snapshotted before upload and compared bitwise after the run.
+        camodel::GuardedDeviceBuffer tiling(round32(tq_tiling::decode_tiling_bytes_for(c)));
+        std::vector<camodel::GuardedDeviceBuffer*> inputs{&query, &key, &value, &scales, &table,
+            &lengths, &modes, &tiling};
         for (auto* b : inputs) std::fill(b->host.begin() + 16, b->host.end() - 16, camodel::kCanary);
         auto* q = static_cast<float*>(query.host_payload());
         std::fill(q, q + c.heads * dim, 1.0f / 256);
@@ -87,10 +93,30 @@ int main(int argc, char** argv)
                 }
             }
         }
+        // THE HOST TILING, BUILT HERE AND NOWHERE ELSE.
+        //
+        // Every tile count, live-tail length and logical page span the kernel will act on comes
+        // out of this one call, from the same context length and block table the device is given.
+        // `--hole` is the exception and it is deliberate: the table is planted with an unmapped
+        // interior page and the builder is NOT shown it, so the descriptor claims a dense span the
+        // table does not have. That is the only way to reach the kernel's own density guard, and
+        // what this rung asserts is that reaching it skips the worker -- a defined zero result,
+        // canaries intact, no deadlock -- rather than indexing through an unmapped page. The
+        // host-side refusal of the same geometry is a Tier-1 gate
+        // (tests/cpu/test_fused_decode_opt_contract.cpp), not a CAModel case.
+        const bool planted_hole = hole != UINT32_MAX;
+        auto request = tq_tiling::decode_tiling_request(c);
+        const auto status = tq_tiling::build_decode_tiling(request,
+            static_cast<const std::int32_t*>(lengths.host_payload()),
+            planted_hole ? nullptr : bt, tiling.host_payload());
+        if (status != tq_tiling::DecodeTilingStatus::kOk)
+            throw std::runtime_error(tq_tiling::decode_tiling_status_text(status));
+
         std::vector<std::vector<std::uint32_t>> snapshots;
         for (auto* b : inputs) { b->upload(); snapshots.push_back(b->host); }
         fd::Buffers b{query.payload(), key.payload(), value.payload(), scales.payload(),
-            table.payload(), lengths.payload(), modes.payload(), workspace.payload(), output.payload()};
+            table.payload(), lengths.payload(), modes.payload(), workspace.payload(),
+            output.payload(), tiling.payload()};
         for (unsigned repeat = 0; repeat < repeats; ++repeat) {
             launch_fused_decode_opt_sim(session.stream, &c, &b);
             camodel::check(aclrtSynchronizeStream(session.stream), "fused decode synchronize");
@@ -103,7 +129,10 @@ int main(int argc, char** argv)
             const auto* actual = static_cast<const std::uint16_t*>(output.host_payload());
             for (unsigned h = 0; h < c.heads; ++h) for (unsigned d = 0; d < dim; ++d) {
                 double numerator = 0, denominator = 0;
-                if (!empty) {
+                // A planted hole makes the whole worker undescribable, so the kernel skips it and
+                // the token's context is the neutral element -- not the hole-free subset of its
+                // tiles, which is what the walking cursor used to produce.
+                if (!empty && !planted_hole) {
                     for (unsigned tile = first_tile; tile < last_tile; ++tile) {
                         if (bt[tile / 2] < 0) continue;
                         const unsigned valid = !isolated && tile + 1 == tiles ? tail_rows : 64;
@@ -133,7 +162,7 @@ int main(int argc, char** argv)
                 if (inputs[i]->host != snapshots[i]) throw std::runtime_error("input bytes changed");
             }
         }
-        std::printf("PASS fused_decode_opt tiles=%u page=%u tile=%u heads=%u splits=%u grid=%u repeats=%u elements=%u tail_rows=%u hole=%u comparison=%s inputs=unchanged guards=0x5A-intact\n",
+        std::printf("PASS fused_decode_opt tiles=%u page=%u tile=%u heads=%u splits=%u grid=%u repeats=%u elements=%u tail_rows=%u hole=%u comparison=%s inputs=unchanged guards=0x7FC0BEEF-intact\n",
             tiles, c.probe_page, c.probe_tile, c.heads, c.splits, c.grid, repeats, c.heads * dim,
             tail_rows, hole, varied ? "fp16_1ulp" : "exact");
     } catch (const std::exception& e) {

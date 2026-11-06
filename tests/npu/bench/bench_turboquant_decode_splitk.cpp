@@ -96,7 +96,8 @@ struct Options {
 // Zone decomposition of the fused-opt schedule.
 //
 // This mirrors the kernel's own selection in
-// kernels/ops/turboquant/turboquant_fused_decode_opt.cpp: kSlots = 3 L1 ring
+// kernels/ops/turboquant/vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp:
+// kSlots = 3 L1 ring
 // slots, kPhases = 6 unrolled steady phases, steady_limit = numTiles - kSlots,
 // the deep path taken at numTiles >= kSlots + 1 and a bounded three-step drain.
 // It is a host-side restatement for reporting, so a bench row can say whether
@@ -137,10 +138,13 @@ ZoneShape zone_shape(int tiles)
 }
 
 // Per-worker tile counts. Mirrors the kernel's block slicing: a worker owns
-// [split * blocksPerSplit, min(start + blocksPerSplit, seqBlocks)). Valid for
-// the fused-opt fixture specifically, whose block table maps EVERY logical
-// page; CountTiles skips negative entries, so a fixture with holes would need
-// the table itself rather than this arithmetic.
+// [split * blocksPerSplit, min(start + blocksPerSplit, seqBlocks)). It is the
+// same arithmetic ascend_micro::fused_decode::build_decode_tiling now does on
+// the host and the kernel reads out of its descriptor, so this is a second,
+// independent spelling of it rather than a model of a device-side loop. Valid
+// for the fused-opt fixture specifically, whose block table maps EVERY logical
+// page -- a span with an unmapped page is outside the closed-form cursor's
+// contract and the builder refuses it.
 //
 // RAGGED CONTEXTS: seqBlocks is the CEILING, the last page holds
 // context - (seqBlocks - 1) * page_tokens live rows, and a page contributes

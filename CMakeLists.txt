@@ -70,8 +70,30 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
+# The vLLM integration layer under kernels/ops/turboquant/vllm_integration_layer/.
+# Its device legs are a SECOND compile of three operators this build already compiles -- for the
+# fused decode because SimTargets/NpuTargets compile that very file (it is the single copy of
+# that operator now), and for the two writers because their sources are staging copies -- and
+# `ascendc_library` plus CannRebuild.cmake's retained BUILD_ALWAYS makes that cost recur on
+# every build, so they are off unless asked for. Its
+# device-free targets (the Tier-1 host gate, the adapter-header compile, the tiling
+# descriptor) are three ordinary C++ compiles and are always built: the host gate is the only
+# verification target of that subtree that runs without an NPU or the simulator, and it is
+# where the UB restatement turboquant_gemm_reduce.hpp makes of
+# turboquant_fused_decode_opt.hpp's figures is checked -- no production translation unit
+# includes both headers, so nowhere else can check it.
+#
+# Declared here, next to TQ_GEMM_REDUCE and ASCEND_MICRO_CANN_SYSTEM_OPTIONS and for the same
+# reason: the staged kernel sources are compiled by both target legs below, so an option
+# visible to one leg only would stage one operator on the simulator and another on the
+# physical device.
+#   cmake -B <dir> -DTQ_VLLM_INTEGRATION_LAYER=ON
+option(TQ_VLLM_INTEGRATION_LAYER
+    "Build the staged vLLM integration layer's device legs as well as its host gate" OFF)
+
 include(cmake/SimTargets.cmake)
 include(cmake/NpuTargets.cmake)
+include(cmake/IntegrationTargets.cmake)
 
 # The research probes under tests/research are registered inside these two
 # functions rather than through add_subdirectory, because RUN_MODE is set per
@@ -80,6 +102,15 @@ include(cmake/NpuTargets.cmake)
 # and simulator pair the evidence needs.
 add_ascend_micro_sim_targets()
 add_ascend_micro_npu_targets()
+
+# The staged integration layer, for the same reason and in the same shape: its host targets
+# carry no RUN_MODE at all, and each device leg sets its own, so the two legs are registered
+# by two calls rather than by one subdirectory that would pick up whichever mode was global.
+add_turboquant_integration_host_targets()
+if(TQ_VLLM_INTEGRATION_LAYER)
+  add_turboquant_integration_targets(sim)
+  add_turboquant_integration_targets(npu)
+endif()
 
 include(cmake/CannRebuild.cmake)
 add_ascend_micro_cann_rebuild_steps()

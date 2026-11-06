@@ -78,8 +78,9 @@
 //   * 257 (three pages, the last holding ONE token): five tiles, the last with a single live
 //     row. The inter-page boundary switch with a minimal tail -- at S = 2 and 3 the worker
 //     that owns page 2 has nothing but that one row, which is the narrowest mask the engine
-//     can be given (an all-masked tile must never be staged at all, and CountTiles is what
-//     guarantees that: a page contributes ceil(live rows / 64) tiles, never a tile of zero).
+//     can be given (an all-masked tile must never be staged at all, and the host tiling is what
+//     guarantees that: num_tiles is ceil(live rows / 64) per worker, never counting a tile of
+//     zero, and it is the one word both roles branch on to skip an empty worker).
 //   * 1055 (nine pages, a 31-row tail): 17 tiles. The tail lands on worker 2 at S = 3 and on
 //     worker 4 at S = 5 and 7, and at S = 7 two workers are empty besides -- so the short tile
 //     is owned by a worker that is neither the first nor the last.
@@ -370,7 +371,8 @@ int run()
                 modes(32),
                 workspace(std::size_t(f.requests) * config.heads * std::size_t(k) * (256 + 16) * 4 +
                           4096),
-                out(f.query.size() * 2 + 32);
+                out(f.query.size() * 2 + 32),
+                tiling(ascend_micro::fused_decode::decode_tiling_bytes_for(config));
             query.Upload(f.query);
             keys.Upload(key);
             values.Upload(value);
@@ -378,12 +380,26 @@ int run()
             table.Upload(f.table);
             lengths.Upload(f.lengths);
             modes.Upload(std::vector<std::uint32_t>(8, 0));
+            // The host tiling, from the same context lengths and block table the device gets.
+            // Every tile count, live-tail length and page span this launch acts on is decided
+            // here; the device derives none of it.
+            {
+                namespace fd_tiling = ascend_micro::fused_decode;
+                std::vector<std::uint32_t> image(
+                    fd_tiling::decode_tiling_words(config.tokens, config.splits, config.grid), 0);
+                const auto status = fd_tiling::build_decode_tiling(
+                    fd_tiling::decode_tiling_request(config), f.lengths.data(), f.table.data(),
+                    image.data());
+                require(status == fd_tiling::DecodeTilingStatus::kOk,
+                        fd_tiling::decode_tiling_status_text(status));
+                tiling.Upload(image);
+            }
             workspace.FillGuard();
             out.FillGuard();
 
             const fd::Buffers buffers{query.ptr(), keys.ptr(), values.ptr(), scale.ptr(),
                                       table.ptr(), lengths.ptr(), modes.ptr(), workspace.ptr(),
-                                      out.ptr()};
+                                      out.ptr(), tiling.ptr()};
             check(aclrtSynchronizeStream(session.stream), "pre-launch synchronize");
             launch_fused_decode_opt(session.stream, &config, &buffers);
             check(aclrtSynchronizeStream(session.stream), "post-launch synchronize");

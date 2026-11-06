@@ -1,0 +1,6 @@
+total 2356
+drwxr-xr-x   2 dmin dmin    4096 Nov  6 12:55 .
+drwxr-xr-x 169 dmin dmin   16384 Nov  6 12:55 ..
+-rwxr-xr-x   1 dmin dmin 1422816 Nov  6 12:11 libcamodel_fused_decode_opt_kernel.so
+-rwxr-xr-x   1 dmin dmin  927616 Nov  6 12:55 libturboquant_fused_decode_opt_npu.so
+-rwxr-xr-x   1 dmin dmin   35768 Nov  6 12:11 test_camodel_fused_decode_opt

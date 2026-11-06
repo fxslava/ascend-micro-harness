@@ -201,7 +201,7 @@ extern "C" __global__ __aicore__ void turboquant_vector_reduce_probe(
 
 // GM_ADDR is a BiSheng device builtin, not a header macro, so the host leg of the kernel
 // library needs this include to declare the entry points at all -- the same include
-// turboquant_fused_decode_opt.cpp's own launch branch carries.
+// op_kernel/turboquant_fused_decode.cpp's own launch branch carries.
 #include "kernel_operator.h"
 
 #include <stdexcept>

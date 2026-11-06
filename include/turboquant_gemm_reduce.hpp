@@ -35,7 +35,7 @@
 //
 // WHY THE CUBE IS FREE TO DO IT
 //
-// In turboquant_fused_decode_opt.cpp the reduction phase is
+// In op_kernel/turboquant_fused_decode.cpp the reduction phase is
 //
 //     op.Process(tasksPerBlock);
 //     if (op.NeedsReduction()) { AscendC::SyncAll<false>(); if ASCEND_IS_AIV { ... Reduce ... } }

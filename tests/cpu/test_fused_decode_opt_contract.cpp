@@ -1,5 +1,7 @@
 #include "../../include/turboquant_fused_decode_opt.hpp"
+#include "../../include/turboquant_fused_decode.hpp"
 #include "../../routines/routine_vector_online_softmax.hpp"
+#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
@@ -14,8 +16,15 @@ struct Phases {
     void update_denominator() { require(phase++ == 2); }
     void update_accumulator() { require(phase++ == 3); }
 };
+
+#include "../../kernels/ops/turboquant/vllm_integration_layer/tests/common/decode_tiling_gate.hpp"
+
 int main()
 {
+    tiling_gate::run();
+    // valid_launch refuses the same non-power-of-two page the tiling builder does. Checked here
+    // rather than in the shared gate header, which must not include an operator contract header.
+    require(!fd::valid_launch(1, 1, 16, 1, 256, 192, 8, 1, 16, 1, 16));
     require(fd::valid_launch(1, 1, 16, 1, 256, 128, 8, 1, 16, 1, 16));
     require(fd::valid_launch(1, 1, 17, 1, 256, 128, 8, 1, 16, 2, 17));
     require(!fd::valid_launch(1, 1, 17, 1, 256, 128, 8, 1, 16, 1, 17));
@@ -36,5 +45,7 @@ int main()
     ascend_micro::vector_online_softmax_probabilities(cube);
     ascend_micro::vector_online_softmax(vector);
     require(cube.phase == 3 && vector.phase == 4);
-    std::printf("PASS launch guards, NZ bijection (1..4 heads), shared recurrence phases; UB=%u+256 bytes\n", fd::kUbEnd);
+    std::printf("PASS host tiling (dispatch odometer == the six divisions it replaced, descriptors "
+                "== the page walk, five refusals), launch guards, NZ bijection (1..4 heads), "
+                "shared recurrence phases; UB=%u+256 bytes\n", fd::kUbEnd);
 }

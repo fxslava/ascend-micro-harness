@@ -75,7 +75,7 @@ sed -i 's|^constexpr std::uint32_t kGemmSharedPoolBytes = .*|constexpr std::uint
 sed -i 's|^static_assert(kGemmSharedPoolBytes == 32768.*|static_assert(kGemmSharedPoolBytes == 16384, "negative control");|' \
     "$neg.src/include/turboquant_gemm_reduce.hpp"
 sed -i 's|ascend_micro::fused_decode_opt::kTransientPoolBytes ==|16384u ==|' \
-    "$neg.src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp"
+    "$neg.src/kernels/ops/turboquant/vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp"
 cmake -S "$neg.src" -B "$neg" -DASCEND_HOME_PATH="$ASCEND_HOME_PATH" -DSOC_VERSION="$soc" \
     -DTQ_GEMM_REDUCE=ON >"$neg.log" 2>&1 || {
     printf 'INCONCLUSIVE: the control did not configure\n'; tail -10 "$neg.log"; exit 2; }

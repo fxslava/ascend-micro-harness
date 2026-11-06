@@ -16,8 +16,10 @@ files = ["common/turboquant_common.h", "common/turboquant_layout.h",
          "common/turboquant_codec_mx.h", "cube/turboquant_cube_service.h",
          "cube/turboquant_query_basis.h", "vector/turboquant_vector_service.h"]
 mapping = [(upstream / f, dest / f) for f in files]
+# The optimizations live once, in the subtree exported to vllm-ascend, under the name that
+# integration expects. Upstream still ships the file as turboquant_fused_decode_opt.cpp.
 mapping += [(upstream / "turboquant_fused_decode_opt.cpp",
-             dest.parent / "turboquant_fused_decode_opt.cpp"),
+             dest.parent / "vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp"),
             (source / "csrc/kernels/types.h", dest / "types.h")]
 if any(dst.exists() for _, dst in mapping):
     raise SystemExit("Import destinations already exist; refusing to overwrite local work")

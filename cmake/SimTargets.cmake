@@ -132,10 +132,17 @@ function(add_ascend_micro_sim_targets)
   # reports/gemm_batched_reduction_camodel_20261104.md. scripts/gemm_reduce_switch_gate.sh
   # is the retained sanity check: ON must build, and a pool cut too short must still be
   # rejected by that static_assert rather than silently aliasing out of bounds.
+  # tests/sim/kernel/fused_decode_opt_kernel.cpp includes the single production kernel source,
+  # which now lives in the integration subtree; these are that subtree's include roots, the same
+  # three cmake/IntegrationTargets.cmake and cmake/NpuTargets.cmake put on their own command
+  # lines, so the simulator leg and the two physical legs compile the identical operator.
   ascendc_compile_options(camodel_fused_decode_opt_kernel PRIVATE
       -std=c++17 -Wall -Werror ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS}
       ${TQ_FUSED_DECODE_REDUCE_DEFINES}
-      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH
+      "-I${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/vllm_integration_layer/op_kernel"
+      "-I${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/vllm_integration_layer/include"
+      "-I${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/vllm_integration_layer/routines")
 
   # The Split-K final reduction on the Cube. Its KERNEL source stays under tests/, so the
   # probe's entry points cannot reach a production launcher, but its SERVICE header now lives

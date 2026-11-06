@@ -10,7 +10,14 @@
 
 namespace camodel {
 constexpr std::size_t kGuardBytes = 64;
-constexpr std::uint32_t kCanary = 0x5A5A5A5A;
+// REFINEMENT_OF_COMBAT_KERNELS.md section 3: flood every GM payload with an FP32 quiet NaN
+// before assigning the live slices. 0x5A5A5A5A was a byte pattern that a float view reads as a
+// perfectly ordinary 1.5e+16, so a stray read of an unassigned slice could propagate through the
+// softmax and still land inside a loose tolerance; 0x7FC0BEEF cannot. Packed int4 and FP8 views
+// of these bytes are still byte patterns and not guaranteed NaNs -- the canaries detect WRITES,
+// and the numerical oracle detects wrong reads. Both guard bands and every unassigned payload
+// word carry it.
+constexpr std::uint32_t kCanary = 0x7FC0BEEF;
 
 inline void check(aclError result, const char* call)
 {

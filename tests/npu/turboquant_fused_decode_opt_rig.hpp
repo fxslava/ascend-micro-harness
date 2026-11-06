@@ -91,6 +91,9 @@ struct FusedOptRig {
     // Raw-query inputs. Always allocated (about 10 KB more) so one rig covers both entries;
     // uploaded and checked only when the raw-query entry is the one being launched.
     FusedOptBuffer raw, signs, rot_tables, h16, gate;
+    // The host tiling descriptors. Declared after the raw-query inputs so the existing members
+    // keep their construction order, and sized from `config`, which is already built.
+    FusedOptBuffer tiling;
     int worst_ulp = 0;
 
     FusedOptRig(const fused_decode_opt_test::Fixture& fixture, int splits, FusedOptMode m = {})
@@ -103,7 +106,8 @@ struct FusedOptRig {
           out(f.query.size() * 2 + 32),
           raw(f.query.size() * 2), signs(basis.signs.size() * 4),
           rot_tables(basis.tables().size() * 4), h16(basis.h16().size() * 2),
-          gate(f.query.size() * 2)
+          gate(f.query.size() * 2),
+          tiling(ascend_micro::fused_decode::decode_tiling_bytes_for(config))
     {
         tq_npu::require(mode.pre_rotate || mode.post_rotate <= 2,
                         "fused-opt: output stage must be 0, 1 or 2");
@@ -111,6 +115,20 @@ struct FusedOptRig {
                         "fused-opt: the pre-rotated entry has no output stage and no prologue");
         key.Upload(f.key); value.Upload(f.value); scales.Upload(f.scales);
         table.Upload(f.table); lengths.Upload(f.lengths); modes.Upload(std::vector<std::uint32_t>(8, 0));
+        // THE TILING, BUILT ON THE HOST FROM THE SAME TWO ARRAYS THE DEVICE IS GIVEN. The block
+        // table goes in as well, so the builder refuses a fixture whose live span holds an
+        // unmapped page instead of handing the closed-form cursor a span it cannot walk.
+        {
+            namespace fd_tiling = ascend_micro::fused_decode;
+            std::vector<std::uint32_t> image(
+                fd_tiling::decode_tiling_words(config.tokens, config.splits, config.grid), 0);
+            const auto status = fd_tiling::build_decode_tiling(
+                fd_tiling::decode_tiling_request(config), f.lengths.data(), f.table.data(),
+                image.data());
+            tq_npu::require(status == fd_tiling::DecodeTilingStatus::kOk,
+                            fd_tiling::decode_tiling_status_text(status));
+            tiling.Upload(image);
+        }
         if (mode.pre_rotate) {
             q.Upload(f.query);
         } else {
@@ -134,7 +152,8 @@ struct FusedOptRig {
     void Launch(aclrtStream stream, int)
     {
         const ascend_micro::fused_decode_opt::Buffers b{q.ptr(), key.ptr(), value.ptr(),
-            scales.ptr(), table.ptr(), lengths.ptr(), modes.ptr(), workspace.ptr(), out.ptr()};
+            scales.ptr(), table.ptr(), lengths.ptr(), modes.ptr(), workspace.ptr(), out.ptr(),
+            tiling.ptr()};
         if (mode.pre_rotate) {
             launch_fused_decode_opt(stream, &config, &b);
             return;
@@ -214,7 +233,7 @@ struct FusedOptRig {
             }
         }
         key.CheckInput(); value.CheckInput(); scales.CheckInput();
-        table.CheckInput(); lengths.CheckInput(); modes.CheckInput();
+        table.CheckInput(); lengths.CheckInput(); modes.CheckInput(); tiling.CheckInput();
         if (mode.pre_rotate) {
             q.CheckInput();
         } else {

@@ -9,7 +9,8 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
-SOURCE = ROOT / 'kernels/ops/turboquant/turboquant_fused_decode_opt.cpp'
+SOURCE = ROOT / ('kernels/ops/turboquant/vllm_integration_layer/op_kernel/'
+                 'turboquant_fused_decode.cpp')
 
 
 def method(source, name):

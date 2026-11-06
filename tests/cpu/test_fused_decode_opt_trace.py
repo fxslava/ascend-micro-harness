@@ -16,7 +16,8 @@ def row(op, i, route='PIPE:MTE1, TRIGGER PIPE:CUBE, FLAG ID:0,'):
 class AuditTests(unittest.TestCase):
     def test_source_fences(self):
         source = (Path(__file__).resolve().parents[2] /
-                  'kernels/ops/turboquant/turboquant_fused_decode_opt.cpp').read_text()
+                  'kernels/ops/turboquant/vllm_integration_layer/op_kernel/'
+                  'turboquant_fused_decode.cpp').read_text()
         source = source.replace('<kSubBlockSyncMode,', '<2,')
         source = re.sub(r'AscendC::CrossCoreSetFlag<[^>]+>\([^;]+\);',
                         lambda m: ' '.join(m[0].split()), source)

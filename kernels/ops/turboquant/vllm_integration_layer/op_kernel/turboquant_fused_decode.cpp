@@ -52,19 +52,39 @@
 // id is four bits wide and the toolkit reserves 11..14, and one id per slot and per window spends
 // 2 * kCubePipelineSlots + kCubeScoreWindows + 2 = 10 of the 11 that are left (turboquant_layout.h).
 //
+// WHAT THE SCALAR UNIT NO LONGER DOES
+//
+// The schedule above is only worth its three slots if the SPU can issue ahead of the engines, and
+// on dav-3510 it issues in order for the whole core: one integer divide, or one branch on a value
+// just loaded from GM, stalls everything behind it -- the MTE2 descriptor for the next ring slot
+// and the Mmad issue that keeps the Cube fed included. This operator used to spend, per task, six
+// integer div/mods to decode its task id, two more to turn a context length into a logical page
+// range, and a loop over that range to count its tiles; and then, per TILE and twice over, a
+// NextTile walk with a GM block-table load and two boundary branches, sitting between a tile's
+// softmax and the next tile's stage.
+//
+// All of it is host tiling now (../include/turboquant_fused_decode.hpp). The device reads a
+// per-(token, split) descriptor and a per-block dispatch record, both built on the CPU, and what
+// is left on the scalar unit is adds, multiplies, shifts, masks and one select per tile. There is
+// no integer division anywhere on this kernel's attention path, no loop whose trip count depends
+// on device data, and no diagnostic-ABI comparison in the cursor: the isolated single-tile canary
+// that used to be `probePage_ != UINT32_MAX`, tested once per tile on every production launch, is
+// a descriptor field.
+//
 // Harness integration: local service snapshot, 64-token KV4/FP8 geometry,
-// Vector microroutines and strict CAModel runner. See reports/fused_decode_opt.md.
 
-#include "../../../include/turboquant_fused_decode_opt.hpp"
-#include "fused_decode/types.h"
+#include "../include/turboquant_fused_decode_opt.hpp"
+#include "common/types.h"
 
 #if defined(__CCE_AICORE__)
 #include "kernel_operator.h"
 
-#include "fused_decode/common/turboquant_codec_mx.h"
-#include "fused_decode/cube/turboquant_cube_service.h"
-#include "fused_decode/cube/turboquant_query_basis.h"
-#include "fused_decode/vector/turboquant_vector_service.h"
+#include "common/turboquant_codec.h"
+#include "cube/turboquant_cube_service.h"
+#include "cube/turboquant_query_basis.h"
+#include "vector/turboquant_vector_service.h"
+
+namespace fd = ascend_micro::fused_decode;
 
 using vllm_ascend::turboquant::CeilDiv;
 using vllm_ascend::turboquant::DecodeUnpack;
@@ -164,6 +184,9 @@ public:
     static_assert(kOptFlagProbsReady < kOptFlagReservedFirst,
                   "the schedule's flag ids run into the ids the toolkit reserves for its own barriers");
     static_assert(kSlots == 3 && kWindows == 2 && kPhases == 6, "three-zone schedule geometry");
+    static_assert(kCubeTileRows == fd::kDecodeTileRows &&
+                      kCubeTileRows == (1u << fd::kDecodeTileRowsShift),
+                  "the host tiling contract and the device ring disagree about the tile");
     static_assert(kWindows >= 2, "one score window is the lock-step schedule, not this one");
     static_assert(kSlots >= 3, "a two-slot ring cannot keep a read, a stage and a GEMM pair in flight");
 
@@ -172,7 +195,8 @@ public:
     __aicore__ inline void Init(__gm__ void *queryRot, __gm__ void *keyCache, __gm__ void *valueCache,
                                 __gm__ void *scaleCache, __gm__ void *blockTables, __gm__ void *contextLens,
                                 __gm__ void *modeTables, __gm__ void *workspace, __gm__ void *output,
-                                const uint32_t numTokens, const uint32_t numHeads, const uint32_t numKvHeads,
+                                __gm__ void *tiling, const uint32_t numTokens, const uint32_t numHeads,
+                                const uint32_t numKvHeads,
                                 const uint32_t headSize, const uint32_t blockSize, const uint32_t maxBlocksPerSeq,
                                 const uint32_t numSplits, const uint32_t headsPerTask,
                                 const uint32_t fusedContextLimit, const float scale, const float invSqrtLen)
@@ -185,7 +209,18 @@ public:
         maxBlocksPerSeq_ = maxBlocksPerSeq;
         numSplits_ = numSplits;
         fusedContextLimit_ = fusedContextLimit;
-        groupHeads_ = numHeads / numKvHeads;
+        blockTableGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(blockTables));
+        contextLenGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(contextLens), numTokens);
+        tilingGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(tiling));
+
+        // THE LAUNCH'S HEAD GEOMETRY, ALSO FROM THE HOST. `numHeads / numKvHeads` and the
+        // CeilDiv over it were the last two runtime integer divides on this operator's device
+        // side; both quantities are launch-uniform, so every descriptor carries them and this
+        // reads the first one. The clamps below are compares and selects, and they match the
+        // builder's: valid_launch already refuses heads_per_task > kCubeTileM, so the second
+        // clamp is a guard rather than a divergence.
+        groupHeads_ = tilingGm_.GetValue(fd::kTilingWordGroupHeads);
+        chunksPerGroup_ = tilingGm_.GetValue(fd::kTilingWordChunksPerGroup);
         headsPerTask_ = headsPerTask < 1 ? 1 : headsPerTask;
         if (headsPerTask_ > groupHeads_) {
             headsPerTask_ = groupHeads_;
@@ -193,10 +228,26 @@ public:
         if (headsPerTask_ > kCubeTileM) {
             headsPerTask_ = kCubeTileM;
         }
-        chunksPerGroup_ = CeilDiv(groupHeads_, headsPerTask_);
 
-        blockTableGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(blockTables));
-        contextLenGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(contextLens), numTokens);
+        // THE BLOCK'S DISPATCH RECORD, ONCE, HERE.
+        //
+        // Process() used to decode its first task id with six runtime integer div/mods -- chunk,
+        // splitTask, split, tokenKvHead, kvHead, token -- and then decode EVERY later task of the
+        // block the same way, so a 16-task block paid 96 of them, the first six in front of the
+        // first tile's MTE2 burst. The host computed the same odometer for every grid block; this
+        // reads the block's entry point out of one 32-byte GM line and AdvanceTask() walks it from
+        // there. Both roles read the same eight words in the same order, so neither is ever told
+        // which task the other picked.
+        const uint32_t record = numTokens * numSplits_ * fd::kDecodeTilingWords +
+            MixBlockIdx() * fd::kDecodeDispatchWords;
+        taskStart_.token = tilingGm_.GetValue(record + 0);
+        taskStart_.kvHead = tilingGm_.GetValue(record + 1);
+        taskStart_.split = tilingGm_.GetValue(record + 2);
+        taskStart_.chunk = tilingGm_.GetValue(record + 3);
+        reduceStart_[0].token = tilingGm_.GetValue(record + 4);
+        reduceStart_[0].head = tilingGm_.GetValue(record + 5);
+        reduceStart_[1].token = tilingGm_.GetValue(record + 6);
+        reduceStart_[1].head = tilingGm_.GetValue(record + 7);
 
         mm_.Init(pipe_, headSize_, kCubeTileRows);
         vector_.Init(pipe_, queryRot, keyCache, valueCache, scaleCache, modeTables, workspace, output, numHeads,
@@ -209,12 +260,6 @@ public:
         // instantiations whose codec does copy a 64 B table fence it inside their own Init
         // (turboquant_codec_mx.h). The first thing to move data after this point is StageQuery, which
         // posts its own MTE2 -> V edge.
-    }
-
-    __aicore__ inline void InitProbe(uint32_t page, uint32_t tile)
-    {
-        probePage_ = page;
-        probeTile_ = tile;
     }
 
     // The raw-query decode's two basis stages: InitBasis after Init, RotateQuery before Process.
@@ -234,6 +279,11 @@ public:
         basis_.Rotate(numTokens_ * numHeads_, vectorsPerBlock);
     }
 
+    // ZERO INTEGER DIVISIONS. `tasks` and `start` are multiplies; the task's four indices come
+    // from the host's dispatch record and advance by AdvanceTask's odometer. What was here --
+    // `task % chunksPerGroup_`, `task / chunksPerGroup_`, `% numSplits_`, `/ numSplits_`,
+    // `/ numKvHeads_`, `% numKvHeads_` -- was six divides by runtime, non-power-of-two values per
+    // task, issued on the SPU in front of the task's first MTE2 burst.
     __aicore__ inline void Process(const uint32_t tasksPerBlock)
     {
         const uint32_t tasks = numTokens_ * numKvHeads_ * numSplits_ * chunksPerGroup_;
@@ -242,12 +292,10 @@ public:
         if (end > tasks) {
             end = tasks;
         }
+        TaskCursor cursor = taskStart_;
         for (uint32_t task = start; task < end; ++task) {
-            const uint32_t chunk = task % chunksPerGroup_;
-            const uint32_t splitTask = task / chunksPerGroup_;
-            const uint32_t split = splitTask % numSplits_;
-            const uint32_t tokenKvHead = splitTask / numSplits_;
-            ComputeTask(tokenKvHead / numKvHeads_, tokenKvHead % numKvHeads_, split, chunk);
+            ComputeTask(cursor.token, cursor.kvHead, cursor.split, cursor.chunk);
+            AdvanceTask(cursor);
         }
     }
 
@@ -261,22 +309,21 @@ public:
         const uint32_t start = MixBlockIdx() * tasksPerBlock;
         uint32_t end = start + tasksPerBlock;
         if (end > tasks) end = tasks;
+        TaskCursor cursor = taskStart_;
         for (uint32_t task = start; task < end; ++task) {
-            const uint32_t chunk = task % chunksPerGroup_;
-            const uint32_t splitTask = task / chunksPerGroup_;
-            const uint32_t split = splitTask % numSplits_;
-            const uint32_t tokenKvHead = splitTask / numSplits_;
-            const uint32_t token = tokenKvHead / numKvHeads_;
-            const uint32_t kvHead = tokenKvHead % numKvHeads_;
-            const uint32_t offset = chunk * headsPerTask_;
+            const uint32_t offset = cursor.chunk * headsPerTask_;
             const uint32_t rows = groupHeads_ - offset < headsPerTask_ ? groupHeads_ - offset : headsPerTask_;
-            const TurboQuantTaskHeads heads = Vector::Heads(kvHead * groupHeads_ + offset, rows);
-            if (split == 0) {
-                ComputeTask(token, kvHead, split, chunk, static_cast<int32_t>(kCubeTileRows));
+            const TurboQuantTaskHeads heads = Vector::Heads(cursor.kvHead * groupHeads_ + offset, rows);
+            if (cursor.split == 0) {
+                // Split zero's single tile is the HOST descriptor's doing now (num_tiles = 1,
+                // block_start_idx = 0, tile_origin = 0), not a context-length override argument
+                // that the device clipped a page against.
+                ComputeTask(cursor.token, cursor.kvHead, cursor.split, cursor.chunk);
             } else {
-                vector_.WriteNeutralPartial(token, split, heads);
+                vector_.WriteNeutralPartial(cursor.token, cursor.split, heads);
                 DrainFusedDecodeTask();
             }
+            AdvanceTask(cursor);
         }
     }
 
@@ -306,14 +353,22 @@ public:
         if (start >= end) {
             return;
         }
+        // CeilDiv by kVectorSubcoresPerBlock is a shift: it is 2 and a compile-time constant.
+        // The (token, head) each half STARTS at was `task / numHeads_` and `task % numHeads_`,
+        // divides by a runtime value, once per reduction task; the host put both halves' starts in
+        // the dispatch record and this walks a head counter from there.
         const uint32_t firstHalf = CeilDiv(end - start, kVectorSubcoresPerBlock);
         const bool secondSubcore = AscendC::GetSubBlockIdx() != 0;
         const uint32_t from = secondSubcore ? start + firstHalf : start;
         const uint32_t to = secondSubcore ? end : start + firstHalf;
+        ReduceCursor cursor = reduceStart_[secondSubcore ? 1 : 0];
         for (uint32_t task = from; task < to; ++task) {
-            const uint32_t token = task / numHeads_;
-            if (!IsFused(contextLenGm_.GetValue(token))) {
-                reducer.Reduce(token, task % numHeads_, basis_);
+            if (!IsFused(contextLenGm_.GetValue(cursor.token))) {
+                reducer.Reduce(cursor.token, cursor.head, basis_);
+            }
+            if (++cursor.head == numHeads_) {
+                cursor.head = 0;
+                ++cursor.token;
             }
         }
     }
@@ -357,27 +412,47 @@ public:
 #endif
 
 private:
-    struct TileCursor {
-        uint32_t block = 0;
-        uint32_t rows = 0;
-        uint32_t base = 0;
-        uint32_t physical = 0;
-        uint32_t valid = 0;
-        bool active = false;
+    // The task-dispatch odometer. Fastest-varying first -- chunk, split, kv head, token -- which is
+    // the order the six divisions Process() used to issue imposed, so the task stream is the same
+    // stream in the same order and the trace census stays comparable across this change.
+    struct TaskCursor {
+        uint32_t token = 0;
+        uint32_t kvHead = 0;
+        uint32_t split = 0;
+        uint32_t chunk = 0;
+    };
+    struct ReduceCursor {
+        uint32_t token = 0;
+        uint32_t head = 0;
     };
 
-    // Everything a phase of either half needs that is not its phase index. The cursors advance across
-    // phases, so they are carried by reference; holding the rest alongside them keeps an unrolled phase
-    // from reloading the task's extents from the frame on every tile.
+    __aicore__ inline void AdvanceTask(TaskCursor &cursor) const
+    {
+        if (++cursor.chunk < chunksPerGroup_) return;
+        cursor.chunk = 0;
+        if (++cursor.split < numSplits_) return;
+        cursor.split = 0;
+        if (++cursor.kvHead < numKvHeads_) return;
+        cursor.kvHead = 0;
+        ++cursor.token;
+    }
+
+    // Everything a phase of either half needs that is not its phase index. The two tile cursors are
+    // now plain counters -- the read cursor runs kSlots tiles ahead of the consume cursor, which is
+    // what the schedule always meant -- and the rest is the worker's host tiling, held here so an
+    // unrolled phase does not reload it from the frame on every tile.
     struct PipelineTask {
-        TileCursor read;
-        TileCursor consume;
+        uint32_t readTile = 0;     // MTE2 cursor:    tiles 0 .. numTiles-1, in order
+        uint32_t consumeTile = 0;  // softmax cursor: kSlots tiles behind it
         uint32_t token = 0;
-        uint32_t contextLen = 0;
-        uint32_t blockEnd = 0;
-        uint32_t numTiles = 0;
         uint32_t kvHead = 0;
-        uint32_t tile = 0;
+        uint32_t numTiles = 0;
+        uint32_t lastTile = 0;     // numTiles - 1, so the ragged test is one compare
+        uint32_t lastValid = 0;    // tail_rows, or kCubeTileRows for an aligned worker
+        uint32_t tileOrigin = 0;   // the tile inside block_start_idx this worker begins at
+        uint32_t pageShift = 0;    // log2(blockSize / kCubeTileRows), from the host descriptor
+        uint32_t pageMask = 0;     // (1 << pageShift) - 1
+        uint32_t tile = 0;         // the steady loop's phase counter, as before
     };
 
     __aicore__ inline bool IsFused(const int32_t contextLen) const
@@ -402,19 +477,22 @@ private:
     // analysis, and a future divergence between the two roles' view of `fused` cannot leave
     // one of them one task ahead of the other. RunTask holds the work and has no join.
     __aicore__ inline void ComputeTask(const uint32_t token, const uint32_t kvHead, const uint32_t split,
-                                       const uint32_t chunk, const int32_t contextOverride = -1)
+                                       const uint32_t chunk)
     {
-        const int32_t fullContextLen = contextLenGm_.GetValue(token);
-        const int32_t contextLen = contextOverride >= 0 ? contextOverride : fullContextLen;
-        const bool fused = IsFused(fullContextLen);
+        // The one GM scalar read left in the task prologue, and it is not arithmetic: `fused`
+        // decides whether StageTaskOutput writes the token's output directly or leaves a partial,
+        // and the reducers' own predicate reads the SAME word, so hoisting a second copy of it
+        // into the descriptor would create exactly the two-sources-of-truth divergence the task
+        // join below exists to make impossible.
+        const bool fused = IsFused(contextLenGm_.GetValue(token));
         if (!fused || split == 0) {
-            RunTask(token, kvHead, split, chunk, contextLen, fused);
+            RunTask(token, kvHead, split, chunk, fused);
         }
         DrainFusedDecodeTask();
     }
 
     __aicore__ inline void RunTask(const uint32_t token, const uint32_t kvHead, const uint32_t split,
-                                   const uint32_t chunk, const int32_t contextLen, const bool fused)
+                                   const uint32_t chunk, const bool fused)
     {
         const uint32_t offset = chunk * headsPerTask_;
         const uint32_t rows = groupHeads_ - offset < headsPerTask_ ? groupHeads_ - offset : headsPerTask_;
@@ -427,50 +505,61 @@ private:
             vector_.BeginTask(heads);
         }
 
-        const uint32_t seqBlocks = contextLen > 0 ? CeilDiv(static_cast<uint32_t>(contextLen), blockSize_) : 0;
-        const uint32_t blocksPerSplit = CeilDiv(seqBlocks, fused ? 1u : numSplits_);
-        const uint32_t blockStart = split * blocksPerSplit;
-        uint32_t blockEnd = blockStart + blocksPerSplit;
-        if (blockEnd > seqBlocks) {
-            blockEnd = seqBlocks;
-        }
+        // THE WORKER'S TILING, READ RATHER THAN DERIVED.
+        //
+        // Six scalar loads out of ONE 64-byte GM line, on both roles, replacing: two integer
+        // divisions by runtime values (CeilDiv by blockSize_, then by numSplits_), the
+        // multiply-and-clamp that turned those into a logical page range, and CountTiles' loop
+        // over that whole range with a block-table load, a sign test, a live-row clamp and a
+        // CeilDiv inside it. The host computed all of it from the context lengths it already has.
+        const uint32_t descriptor = (token * numSplits_ + split) * fd::kDecodeTilingWords;
+        const uint32_t numTiles = tilingGm_.GetValue(descriptor + fd::kTilingWordNumTiles);
+        const uint32_t tailRows = tilingGm_.GetValue(descriptor + fd::kTilingWordTailRows);
+        const uint32_t blockStart = tilingGm_.GetValue(descriptor + fd::kTilingWordBlockStart);
+        const uint32_t blocksInSplit = tilingGm_.GetValue(descriptor + fd::kTilingWordBlocksInSplit);
+        const uint32_t tileOrigin = tilingGm_.GetValue(descriptor + fd::kTilingWordTileOrigin);
+        const uint32_t pageShift = tilingGm_.GetValue(descriptor + fd::kTilingWordTilesPerPageShift);
 
-        // The split's block table, fetched once, here, by both roles. This is the earliest
-        // point at which the range exists: BeginTask runs before the split's extent is known
-        // and on the vector role only, while the AIC needs the same entries because CountTiles
-        // is the one predicate both roles branch on.
-        PrefetchBlockTable(token, blockStart, blockEnd);
+        // The split's page entries, fetched once, here, by both roles, over exactly the span the
+        // host says is live -- no scan for where the span ends, and nothing read past it. The
+        // sweep also decides `pagesMapped_`, which is the kernel's own guard against a device
+        // block table that disagrees with what the host validated: an unmapped page inside a live
+        // span is not a geometry the closed-form cursor can express, so the task is skipped whole
+        // rather than indexed through. Both roles sweep the same words in the same order, so the
+        // predicate they branch on below comes from one read each.
+        PrefetchBlockTable(token, blockStart, blocksInSplit);
 
-        if (blockStart < blockEnd) {
+        // The one condition both cores branch on, so the bypass stays lock-step. A worker can hold
+        // no tile at all -- a split past the end of the sequence, a duplicate split of a fused
+        // token, a zero-length context -- and then neither core may touch a flag: an AIV that
+        // skipped the pipeline while the AIC still entered it would leave the AIC waiting on a
+        // slot nothing is ever going to stage, which is a hung launch rather than a wrong answer.
+        // It is safe to branch on here because it is a WORD BOTH ROLES READ from the same place,
+        // which is strictly stronger than the old "both cores run the same loop over the same GM".
+        if (numTiles > 0 && pagesMapped_) {
             PipelineTask task;
             task.token = token;
-            task.contextLen = static_cast<uint32_t>(contextLen);
-            task.blockEnd = blockEnd;
             task.kvHead = kvHead;
-            task.numTiles = CountTiles(token, task.contextLen, blockStart, blockEnd);
-            task.read.block = blockStart;
-            task.consume.block = blockStart;
+            task.numTiles = numTiles;
+            task.lastTile = numTiles - 1;
+            task.lastValid = tailRows != 0 ? tailRows : kCubeTileRows;
+            task.tileOrigin = tileOrigin;
+            task.pageShift = pageShift;
+            task.pageMask = (1u << pageShift) - 1u;
 
             if ASCEND_IS_AIV {
                 vector_.StageQuery(mm_, token, kvHead, heads);
-                const uint32_t tail = task.contextLen % kCubeTileRows;
-                if (heads.mine > 0 && blockEnd == seqBlocks && tail != 0) {
-                    vector_.ComputeTailMask(tail);
+                // tail_rows is nonzero on exactly the worker that carries the sequence end, which
+                // is what `blockEnd == seqBlocks && contextLen % 64` used to establish on device.
+                if (heads.mine > 0 && tailRows != 0) {
+                    vector_.ComputeTailMask(tailRows);
                 }
             }
-            // The one condition both cores branch on, so the bypass stays lock-step. A block range can
-            // hold no tile at all -- every blockTable entry in it negative, which is what a padding or an
-            // unmapped block carries -- and then neither core may touch a flag: an AIV that skipped the
-            // pipeline while the AIC still entered it would leave the AIC waiting on a slot nothing is
-            // ever going to stage, which is a hung launch rather than a wrong answer. CountTiles is safe
-            // to branch on here because both cores run it over the same GM words with the same indices.
-            if (task.numTiles > 0) {
-                if ASCEND_IS_AIV {
-                    RunVectorPipeline(task, heads);
-                }
-                if ASCEND_IS_AIC {
-                    RunCubePipeline(task, heads.rows);
-                }
+            if ASCEND_IS_AIV {
+                RunVectorPipeline(task, heads);
+            }
+            if ASCEND_IS_AIC {
+                RunCubePipeline(task, heads.rows);
             }
         }
 
@@ -482,111 +571,75 @@ private:
     // THE BLOCK TABLE, OUT OF THE PIPELINE.
     //
     // CountTiles and NextTile both used to read blockTableGm_ with GetValue -- a scalar load
-    // from Global Memory -- and NextTile runs INSIDE the steady loop, once per tile on each of
+    // from Global Memory -- and NextTile ran INSIDE the steady loop, once per tile on each of
     // the two cursors. So one logical page's entry was fetched three times per task (the count,
     // on both roles; the read cursor; the consume cursor) and two of those three fetches sat
     // between a softmax and the next tile's stage, on the scalar queue, inside the dependence
     // chain the three-zone schedule exists to keep full.
     //
-    // The task prologue now sweeps [blockStart, blockEnd) once into this scalar cache and both
-    // walkers read local memory. The sweep is still GetValue rather than a DataCopy into UB on
-    // purpose: the Cube GEMM reduction's overlay already spends the only transient UB this
-    // operator has, and a UB landing would make the AIC walk a TPipe allocation the AIV does
+    // The task prologue sweeps the host-declared live span once into this scalar cache and the
+    // closed-form cursor reads local memory. The sweep is still GetValue rather than a DataCopy
+    // into UB on purpose: the Cube GEMM reduction's overlay already spends the only transient UB
+    // this operator has, and a UB landing would make the AIC walk a TPipe allocation the AIV does
     // not -- the fault that made that reduction's first Cube run target an unallocated tensor.
     //
-    // Both roles prefetch, identically, over the same GM words in the same order, so the
-    // numTiles both cores branch on comes from one read each rather than from two reads that
-    // could in principle see different bytes.
+    // WHAT CHANGED HERE. The span is `blocks_in_split` from the descriptor rather than a
+    // blockStart/blockEnd pair the device derived, so nothing is read to discover where the span
+    // ends and nothing past it is touched; and the sweep ORs the entries' sign bits, which is the
+    // density check the closed-form cursor needs and costs one OR per page on a loop that was
+    // already loading every one of them.
     //
-    // A split longer than the cache falls back to the direct read, per block, exactly as the
-    // old code always did -- correct, and slow in the same way. 64 entries covers every
-    // geometry the validation ladder and the benchmark's split sweeps reach: 16384 context
-    // tokens at 128-token pages is 128 blocks, so splits >= 2 is inside the cache and
-    // splits == 1 at that context is the one sweep row that falls back. 256 bytes of scalar
-    // local memory, which is why it is 64 entries and not 256.
+    // A split longer than the cache falls back to the direct read, per TILE rather than per page,
+    // and that fallback is the one scalar GM load still reachable from the steady loop. 64 entries
+    // covers every geometry the validation ladder and the benchmark's split sweeps reach except
+    // one: 16384 context tokens at 128-token pages is 128 blocks, so splits >= 2 is inside the
+    // cache and splits == 1 at that context is the row that falls back. 256 bytes of scalar local
+    // memory, which is why it is 64 entries and not 256.
     static constexpr uint32_t kBlockCacheEntries = 64;
 
     __aicore__ inline void PrefetchBlockTable(const uint32_t token, const uint32_t blockStart,
-                                              const uint32_t blockEnd)
+                                              const uint32_t blocksInSplit)
     {
         blockCacheBase_ = blockStart;
-        if (blockEnd <= blockStart) {
-            blockCacheCount_ = 0;
+        pagesMapped_ = true;
+        blockCacheCount_ = blocksInSplit < kBlockCacheEntries ? blocksInSplit : kBlockCacheEntries;
+        if (blockCacheCount_ == 0) {
             return;
         }
-        const uint32_t span = blockEnd - blockStart;
-        blockCacheCount_ = span < kBlockCacheEntries ? span : kBlockCacheEntries;
         const uint64_t row = static_cast<uint64_t>(token) * maxBlocksPerSeq_;
+        int32_t signs = 0;
         for (uint32_t i = 0; i < blockCacheCount_; ++i) {
-            blockCache_[i] = blockTableGm_.GetValue(row + blockStart + i);
+            const int32_t entry = blockTableGm_.GetValue(row + blockStart + i);
+            blockCache_[i] = entry;
+            signs |= entry;
         }
+        pagesMapped_ = signs >= 0;
     }
 
-    __aicore__ inline int32_t BlockTableEntry(const uint32_t token, const uint32_t block)
+    // THE TILE CURSOR, CLOSED FORM.
+    //
+    // NextTile was a `while (cursor.block < blockEnd)` loop carrying four mutable fields and an
+    // `active` flag, with a block-table load, a sign test, a live-row clamp and two boundary
+    // branches per call -- and it ran TWICE per tile in the steady state, once for the read cursor
+    // and once for the consume cursor, between a tile's softmax and the next tile's stage. The
+    // host's descriptor makes the tile-to-page map affine, so a cursor is a counter and this is
+    // the whole of the arithmetic:
+    //
+    //   absolute = tile_origin + tile      one add
+    //   page     = absolute >> shift       one shift      (blockSize is a power of two: enforced
+    //   row base = (absolute & mask) << 6  one and, shift  by valid_launch and build_decode_tiling)
+    //
+    // No loop, no branch, no mutable cursor state, no sign test -- an unmapped page inside a live
+    // span never reaches here because the prologue refused the task -- and no GM load while the
+    // span is inside the scalar cache.
+    __aicore__ inline uint32_t TilePhysical(const PipelineTask &task, const uint32_t absolute)
     {
-        if (block >= blockCacheBase_ && block - blockCacheBase_ < blockCacheCount_) {
-            return blockCache_[block - blockCacheBase_];
+        const uint32_t page = absolute >> task.pageShift;
+        if (page < blockCacheCount_) {
+            return static_cast<uint32_t>(blockCache_[page]);
         }
-        return blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + block);
-    }
-
-    __aicore__ inline uint32_t CountTiles(const uint32_t token, const uint32_t contextLen, const uint32_t blockStart,
-                                          const uint32_t blockEnd)
-    {
-        uint32_t tiles = 0;
-        for (uint32_t block = blockStart; block < blockEnd; ++block) {
-            if (probePage_ != UINT32_MAX && block != probePage_) continue;
-            const int32_t physical = BlockTableEntry(token, block);
-            if (physical < 0) {
-                continue;
-            }
-            uint32_t rows = blockSize_;
-            const uint32_t consumed = block * blockSize_;
-            if (consumed + rows > contextLen) {
-                rows = contextLen - consumed;
-            }
-            if (probePage_ == UINT32_MAX) tiles += CeilDiv(rows, kCubeTileRows);
-            else if (probeTile_ * kCubeTileRows < rows) ++tiles;
-        }
-        return tiles;
-    }
-
-    __aicore__ inline bool NextTile(TileCursor &cursor, const uint32_t token, const uint32_t contextLen,
-                                    const uint32_t blockEnd)
-    {
-        if (cursor.active) {
-            cursor.base += kCubeTileRows;
-            if (cursor.base < cursor.rows && probePage_ == UINT32_MAX) {
-                cursor.valid = cursor.rows - cursor.base;
-                if (cursor.valid > kCubeTileRows) {
-                    cursor.valid = kCubeTileRows;
-                }
-                return true;
-            }
-            cursor.active = false;
-            ++cursor.block;
-        }
-        while (cursor.block < blockEnd) {
-            if (probePage_ != UINT32_MAX && cursor.block != probePage_) { ++cursor.block; continue; }
-            const int32_t physical = BlockTableEntry(token, cursor.block);
-            if (physical >= 0) {
-                uint32_t rows = blockSize_;
-                const uint32_t consumed = cursor.block * blockSize_;
-                if (consumed + rows > contextLen) {
-                    rows = contextLen - consumed;
-                }
-                if (rows > 0) {
-                    cursor.physical = static_cast<uint32_t>(physical);
-                    cursor.rows = rows;
-                    cursor.base = probePage_ == UINT32_MAX ? 0 : probeTile_ * kCubeTileRows;
-                    cursor.valid = rows - cursor.base < kCubeTileRows ? rows - cursor.base : kCubeTileRows;
-                    cursor.active = true;
-                    return true;
-                }
-            }
-            ++cursor.block;
-        }
-        return false;
+        return static_cast<uint32_t>(blockTableGm_.GetValue(
+            static_cast<uint64_t>(task.token) * maxBlocksPerSeq_ + blockCacheBase_ + page));
     }
 
     // Short tasks exist in isolated probes and empty/short Split-K workers.
@@ -695,6 +748,35 @@ private:
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(static_cast<uint16_t>(kOptFlagContextReady));
     }
 
+    // THE SLOT'S FREE CREDIT. The FIX_S drain in front of the announcement is RETAINED, and
+    // this comment is why -- the audit found it redundant and the finding was not taken.
+    //
+    // A SyncEvent<FIX_S> stalls scalar ISSUE until the Fixpipe queue retires, which makes it the
+    // most expensive thing this operator can put on the AIC's instruction stream, and there are
+    // three per steady phase: CubeScores', CubeContext's, and this one. This one looks redundant
+    // at both of its call sites. In RunCubeSteadyPhase it is issued immediately after
+    // CubeContext<PHASE>, which has already drained FIX before setting kOptFlagContextReady, and
+    // nothing between the two issues a Fixpipe instruction; in RunCubePipeline's prologue it
+    // primes slot 2's credit before any Fixpipe work exists at all. Removing it would take one
+    // scalar-issue stall per tile off the core that must not stall.
+    //
+    // WHY IT STAYS. CrossCoreSetFlag issues on the FLOWCTRL/scalar unit in both modes -- mode 2
+    // lowers to ffts_cross_core_sync -- and the `pipe` template argument orders it behind
+    // nothing (MICROROUTINE_DESIGN_GUIDELINES.md 6.2a). So the argument for removal rests
+    // entirely on "the scalar stream is in order and CubeContext's drain is still in force",
+    // and section 6.2c records a measured case in this operator family where an announcement
+    // overtook its own un-drained pipeline by 1032 and 2179 cycles. That hazard is invisible to
+    // every gate this change can run: set/wait counts balance, the id census passes, the
+    // capacity-one model works on the schedule rather than the fence, and the output stays
+    // bit-exact while a panel is read one generation early.
+    //
+    // scripts/audit_cross_core_fences.py cannot settle it either. With the drain removed it
+    // accepts this announcement as a STRUCTURAL PRIMING SET -- nothing in the enclosing body
+    // issues work on the announced pipe -- which is true of the text and false of the steady
+    // loop, so the audit would pass for the wrong reason. The gate that would settle it is an
+    // A/B scripts/analyze_announce_overtake.py comparison at one geometry and one announcement
+    // ordinal, which needs a second full build of this operator; it is recorded as open in
+    // reports/fused_decode_host_tiling_audit_20261106.md rather than assumed either way.
     template <uint32_t PHASE>
     __aicore__ inline void ReleaseCubeSlot()
     {
@@ -708,8 +790,10 @@ private:
     __aicore__ inline void ReadPipelineTile(PipelineTask &task)
     {
         constexpr uint32_t kSlot = PHASE % kSlots;
-        NextTile(task.read, task.token, task.contextLen, task.blockEnd);
-        vector_.ReadTileToSlot(task.read.physical, task.read.base, task.kvHead, kSlot);
+        const uint32_t absolute = task.tileOrigin + task.readTile;
+        ++task.readTile;
+        vector_.ReadTileToSlot(TilePhysical(task, absolute),
+                               (absolute & task.pageMask) << fd::kDecodeTileRowsShift, task.kvHead, kSlot);
     }
 
     template <uint32_t PHASE>
@@ -717,9 +801,13 @@ private:
     {
         constexpr uint32_t kSlot = PHASE % kSlots;
         constexpr uint32_t kWindow = PHASE % kWindows;
-        NextTile(task.consume, task.token, task.contextLen, task.blockEnd);
+        // One compare and one select, no branch: every tile but the last has 64 live rows, and
+        // which one is last is a host-computed index rather than a page-boundary walk.
+        const uint32_t tile = task.consumeTile;
+        ++task.consumeTile;
+        const uint32_t valid = tile == task.lastTile ? task.lastValid : kCubeTileRows;
         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady + kWindow));
-        vector_.ComputeSoftmaxAndStageProbs(mm_, task.consume.valid, heads, kSlot, kWindow);
+        vector_.ComputeSoftmaxAndStageProbs(mm_, valid, heads, kSlot, kWindow);
         vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::MTE3_S>();
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(static_cast<uint16_t>(kOptFlagProbsReady));
     }
@@ -815,12 +903,19 @@ private:
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(static_cast<uint16_t>(kOptFlagSlotReady + slot));
     }
 
-    uint32_t probePage_ = UINT32_MAX, probeTile_ = 0;
-    // The prefetched block table of the task in flight. blockCacheCount_ == 0 means every
-    // lookup falls back to GM, which is what an empty or unmapped split leaves behind.
+    // The prefetched block table of the task in flight, over exactly the host-declared live
+    // span. blockCacheCount_ == 0 is an empty worker; pagesMapped_ is false when the span held a
+    // negative entry, which the closed-form cursor cannot express.
     int32_t blockCache_[kBlockCacheEntries] = {};
     uint32_t blockCacheBase_ = 0;
     uint32_t blockCacheCount_ = 0;
+    bool pagesMapped_ = true;
+    // The host tiling: descriptors first, then one dispatch record per grid block. Read-only, and
+    // read by BOTH roles -- the AIC needs the same words the AIV does, because num_tiles is the
+    // predicate the two of them have to agree on.
+    AscendC::GlobalTensor<uint32_t> tilingGm_;
+    TaskCursor taskStart_;
+    ReduceCursor reduceStart_[kVectorSubcoresPerBlock];
     AscendC::TPipe *pipe_;
     Mm mm_;
     Vector vector_;
@@ -874,7 +969,7 @@ private:
 // pool. include/turboquant_gemm_reduce.hpp carries the arithmetic and the static_assert that
 // the reducer fits inside that pool.
 #if defined(ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE) && ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE
-#include "fused_decode/cube/turboquant_gemm_reduce_service.h"
+#include "cube/turboquant_gemm_reduce_service.h"
 
 // OVERLAY SAFETY: what is checked here, and the one thing no compiler can check.
 //
@@ -909,7 +1004,6 @@ private:
 // phase breaks this SILENTLY, with no diagnostic and correct-looking output at geometries that
 // do not reduce. The gate that would catch it is a multi-split CAModel rung with its canary
 // and exact-comparison checks -- section 9 of
-// reports/gemm_batched_reduction_camodel_20261104.md -- not this translation unit.
 static_assert(ascend_micro::fused_decode_opt::kTransientPoolBytes ==
                   ascend_micro::gemm_reduce::kGemmSharedPoolBytes,
               "turboquant_gemm_reduce.hpp restates the transient pool's length; update "
@@ -972,7 +1066,8 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(
 #define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(NAME, MODE, TYPE)                                                      \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
-        GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, uint32_t numTokens,              \
+        GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, GM_ADDR tiling,                  \
+        uint32_t numTokens,                                                                                          \
         uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,      \
         uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,              \
         uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
@@ -982,8 +1077,8 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantFusedDecodeOpt<MODE, TYPE> op(&pipe);                                                               \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,  \
-                numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,       \
-                fusedContextLimit, scale, invSqrtLen);                                                                \
+                tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,             \
+                headsPerTask, fusedContextLimit, scale, invSqrtLen);                                                  \
         op.Process(tasksPerBlock);                                                                                    \
         if (op.NeedsReduction()) {                                                                                    \
             AscendC::SyncAll<false>();                                                                                \
@@ -998,7 +1093,8 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR h16, GM_ADDR gate, GM_ADDR queryRot,              \
         GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables, GM_ADDR contextLens,          \
-        GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, uint32_t numTokens, uint32_t numHeads,                \
+        GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, GM_ADDR tiling,                                       \
+        uint32_t numTokens, uint32_t numHeads,                                                                       \
         uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,     \
         uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,                                 \
         uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors, uint32_t outputStage,                   \
@@ -1009,8 +1105,8 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantFusedDecodeOpt<MODE, TYPE, false> op(&pipe);                                                        \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,  \
-                numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,       \
-                fusedContextLimit, scale, invSqrtLen);                                                                \
+                tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,             \
+                headsPerTask, fusedContextLimit, scale, invSqrtLen);                                                  \
         op.InitBasis(query, piSigns, rotTables, h16, gate, queryRot, prologueCubeChunkVectors, outputStage,           \
                      invSqrtLen);                                                                                     \
         op.RotateQuery(prologueVectorsPerBlock);                                                                       \
@@ -1032,12 +1128,12 @@ ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_r
 #include "kernel_operator.h"
 #include <stdexcept>
 extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_kv4fp8_half(
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
+    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
     uint32_t, uint32_t, uint32_t, float, float);
 extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half(
     GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
+    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float);
 
@@ -1046,12 +1142,17 @@ namespace vllm_ascend {
 void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
                                          void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
                                          void *blockTables, void *contextLens, void *modeTables, void *workspace,
-                                         void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                         void *output, void *tiling, uint32_t numTokens, uint32_t numHeads,
+                                         uint32_t numKvHeads,
                                          uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                          uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
                                          uint32_t reduceTasksPerBlock, uint32_t fusedContextLimit, float scale,
                                          float invSqrtLen)
 {
+    // No device fallback: a launch with no host tiling descriptors is the operator this change
+    // removed, and silently deriving the tiling again on the SPU is the one outcome that would
+    // look correct in a test and cost the Cube its prefetch on hardware.
+    if (!tiling) throw std::invalid_argument("fused decode launch without host tiling descriptors");
     if (!ascend_micro::fused_decode_opt::valid_launch(blockDim, numTokens, numHeads,
             numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
             headsPerTask, tasksPerBlock, reduceTasksPerBlock))
@@ -1062,19 +1163,21 @@ void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *st
     }
     turboquant_mm_fused_decode_opt_kv4fp8_half<<<blockDim, nullptr, stream>>>(
         queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
-        numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
+        tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
         tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
 }
 
 void turboquant_mm_fused_decode_opt_raw_query_impl(
     int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query, void *piSigns, void *rotTables,
     void *h16, void *gate, void *queryRot, void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
-    void *contextLens, void *modeTables, void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
+    void *contextLens, void *modeTables, void *workspace, void *output, void *tiling, uint32_t numTokens,
+    uint32_t numHeads,
     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
     uint32_t prologueCubeChunkVectors, uint32_t outputStage, uint32_t fusedContextLimit, float scale,
     float invSqrtLen)
 {
+    if (!tiling) throw std::invalid_argument("fused decode launch without host tiling descriptors");
     if (uint64_t{blockDim} * prologueVectorsPerBlock < uint64_t{numTokens} * numHeads ||
         (prologueCubeChunkVectors != 0 && prologueCubeChunkVectors != 16) || outputStage > 2)
         throw std::invalid_argument("unsupported raw query basis tiling");
@@ -1088,7 +1191,7 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
     }
     turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half<<<blockDim, nullptr, stream>>>(
         query, piSigns, rotTables, h16, gate, queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens,
-        modeTables, workspace, output, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq,
+        modeTables, workspace, output, tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq,
         numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock, prologueVectorsPerBlock,
         prologueCubeChunkVectors, outputStage, fusedContextLimit, scale, invSqrtLen);
 }
@@ -1107,6 +1210,7 @@ extern "C" void launch_fused_decode_opt_raw_query(void* stream,
         stream, c->grid, b->raw_query, b->pi_signs, b->rot_tables, b->h16, b->gate,
         b->decode.query, b->decode.key, b->decode.value, b->decode.scales, b->decode.block_table,
         b->decode.context_lengths, b->decode.mode_tables, b->decode.workspace, b->decode.output,
+        b->decode.tiling,
         c->tokens, c->heads, c->kv_heads, c->head_size, c->block_size, c->max_blocks, c->splits,
         c->heads_per_task, c->tasks_per_block, c->reduce_tasks_per_block,
         c->prologue_vectors_per_block, c->prologue_cube_chunk_vectors, c->output_stage,
@@ -1120,7 +1224,7 @@ extern "C" void launch_fused_decode_opt(void* stream,
     if (!c || !b) throw std::invalid_argument("null fused decode launch descriptor");
     vllm_ascend::turboquant_mm_fused_decode_opt_impl(4, vllm_ascend::AscendType::FP16,
         stream, c->grid, b->query, b->key, b->value, b->scales, b->block_table,
-        b->context_lengths, b->mode_tables, b->workspace, b->output, c->tokens,
+        b->context_lengths, b->mode_tables, b->workspace, b->output, b->tiling, c->tokens,
         c->heads, c->kv_heads, c->head_size, c->block_size, c->max_blocks, c->splits,
         c->heads_per_task, c->tasks_per_block, c->reduce_tasks_per_block,
         c->fused_context_limit, c->scale, c->inv_sqrt_len);

@@ -2,6 +2,7 @@
 // per KV head, followed by the production transposed Cube GEMM reducer.
 #include "camodel_common.hpp"
 #include "../../include/turboquant_fused_decode_opt.hpp"
+#include "../../include/turboquant_fused_decode.hpp"
 #include "../../kernels/ops/turboquant/fused_decode/common/turboquant_layout.h"
 #include "../../kernels/ops/turboquant/fused_decode/common/turboquant_mode.h"
 
@@ -131,18 +132,44 @@ int main()
             }
         }
 
-        std::vector<std::vector<std::uint32_t>> snapshots;
-        for (auto* b : {&query, &key, &value, &scales, &table, &lengths, &modes}) {
-            b->upload(); snapshots.push_back(b->host);
-        }
         fd::Launch config;
         config.grid = kGrid; config.tokens = 1; config.heads = kHeads; config.kv_heads = kKvHeads;
         config.head_size = kDim; config.block_size = kPageRows; config.max_blocks = kPages;
         config.splits = kSplits; config.heads_per_task = kRowsPerKv;
         config.tasks_per_block = 1; config.reduce_tasks_per_block = 2;
         config.fused_context_limit = 0; config.probe_page = kProbeSentinel;
+
+        // THE PROBE'S TILING. kProbeSentinel is this runner's dispatch key into
+        // launch_fused_decode_opt_sim and not a page index, so the descriptor request names the
+        // page and tile the probe actually runs -- the first 64-row tile of logical page zero --
+        // while the global context length stays full-sized so every block still takes the
+        // reduction. The device used to get this as a context-length override argument that
+        // ComputeTask clipped a page against; it is a host descriptor now, like every other
+        // tile bound in this operator.
+        camodel::GuardedDeviceBuffer tiling(
+            (ascend_micro::fused_decode::decode_tiling_bytes_for(config) + 31) / 32 * 32);
+        {
+            namespace fdt = ascend_micro::fused_decode;
+            auto request = fdt::decode_tiling_request(config);
+            request.probe_page = 0;
+            request.probe_tile = 0;
+            std::vector<std::uint32_t> image(
+                fdt::decode_tiling_words(config.tokens, config.splits, config.grid), 0);
+            const auto status = fdt::build_decode_tiling(
+                request, static_cast<const std::int32_t*>(lengths.host_payload()), nullptr,
+                image.data());
+            require(status == fdt::DecodeTilingStatus::kOk,
+                    fdt::decode_tiling_status_text(status));
+            std::memcpy(tiling.host_payload(), image.data(), image.size() * 4);
+        }
+
+        std::vector<std::vector<std::uint32_t>> snapshots;
+        for (auto* b : {&query, &key, &value, &scales, &table, &lengths, &modes, &tiling}) {
+            b->upload(); snapshots.push_back(b->host);
+        }
         fd::Buffers buffers{query.payload(), key.payload(), value.payload(), scales.payload(),
-            table.payload(), lengths.payload(), modes.payload(), workspace.payload(), output.payload()};
+            table.payload(), lengths.payload(), modes.payload(), workspace.payload(),
+            output.payload(), tiling.payload()};
         launch_fused_decode_opt_sim(session.stream, &config, &buffers);
         camodel::check(aclrtSynchronizeStream(session.stream), "reduction probe synchronize");
         output.download(); output.assert_guards(); workspace.download(); workspace.assert_guards();
@@ -206,14 +233,14 @@ int main()
             }
         }
         for (std::size_t i = 0; i < snapshots.size(); ++i) {
-            auto* b = std::array<camodel::GuardedDeviceBuffer*, 7>{
-                &query, &key, &value, &scales, &table, &lengths, &modes}[i];
+            auto* b = std::array<camodel::GuardedDeviceBuffer*, 8>{
+                &query, &key, &value, &scales, &table, &lengths, &modes, &tiling}[i];
             b->download();
             require(b->host == snapshots[i], "an input payload changed");
         }
         std::printf("PASS synthetic reduction probe: context=16384 pages=128 splits=8 kv_heads=4 "
                     "query_heads=64 grid=32 real_tiles=4 neutral_partials=%u max_ulp=%u "
-                    "guards=0x5A5A5A5A-intact\n", neutralChecks, maxUlp);
+                    "guards=0xDEADBEEF-intact\n", neutralChecks, maxUlp);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL synthetic reduction probe: %s\n", e.what());
         return 1;

@@ -28,6 +28,9 @@ run repeat-tasks --tiles 4 --heads 17 --repeats 2
 run empty --empty 1
 run workers --tiles 16 --splits 4
 run empty-worker --tiles 6 --splits 4
+# An unmapped logical page inside a live span is outside the closed-form cursor's contract:
+# the host builder refuses that geometry (Tier-1 gate), and this rung plants one behind the
+# builder's back and requires the kernel to skip the worker rather than index through it.
 run unmapped --tiles 12 --hole 2
 run varied --tiles 9 --varied 1
 printf 'PASS three-zone verification: %s\n' "$root"

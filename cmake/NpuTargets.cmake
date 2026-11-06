@@ -9,13 +9,25 @@ function(add_ascend_micro_npu_targets)
   # CMakeLists.txt so this leg gets the identical define the simulator leg does: the two
   # legs compile the same kernel source, and a reduction phase selected on one leg only is
   # a different operator on hardware than the one the CAModel evidence is about.
+  # THE ONE FUSED DECODE SOURCE. There used to be two copies of this kernel -- the original
+  # under kernels/ops/turboquant/ and a staging copy under vllm_integration_layer/ -- and the
+  # staged subtree's own targets compiled the second one. The optimizations now live once, in the
+  # subtree that is exported to vllm-ascend, and this leg, the simulator leg and the staged legs
+  # all compile that file. The kernel's own includes are relative to its directory, so the -I
+  # flags below are only for the service headers that reach for the subtree's include/ and
+  # routines/ roots by a shorter path.
+  set(TQ_FUSED_DECODE_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/vllm_integration_layer")
   ascendc_library(turboquant_fused_decode_opt_npu SHARED
-      kernels/ops/turboquant/turboquant_fused_decode_opt.cpp)
+      kernels/ops/turboquant/vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp)
   ascendc_compile_definitions(turboquant_fused_decode_opt_npu PRIVATE ASCEND_MICRO_CANN_LAUNCH)
   ascendc_compile_options(turboquant_fused_decode_opt_npu PRIVATE
       -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
       ${TQ_FUSED_DECODE_REDUCE_DEFINES}
-      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH
+      "-I${TQ_FUSED_DECODE_DIR}/op_kernel"
+      "-I${TQ_FUSED_DECODE_DIR}/include"
+      "-I${TQ_FUSED_DECODE_DIR}/routines")
   set(BASELINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/turboquant/baseline")
   set(BASELINE_SOURCE "${BASELINE_DIR}/turboquant_paged_attention.cpp")
   ascendc_library(turboquant_a8_npu SHARED

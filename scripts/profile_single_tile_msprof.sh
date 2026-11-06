@@ -150,7 +150,7 @@ cp "$work/run/application.sh" "$out/application.sh"
         "$toolkit" "$soc" "$kernel" "$work"
     printf 'LD_LIBRARY_PATH=%s\nCAMODEL_CONFIG_PATH=%s\n' "$LD_LIBRARY_PATH" "$CAMODEL_CONFIG_PATH"
     sha256sum "$bench" "$work/config/"*.json \
-        "$work/src/kernels/ops/turboquant/turboquant_fused_decode_opt.cpp"
+        "$work/src/kernels/ops/turboquant/vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp"
 } >"$out/environment.txt"
 
 cd "$work/run"

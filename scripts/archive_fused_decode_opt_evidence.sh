@@ -12,10 +12,15 @@ done
 printf '%s\n' "$root" > "$out/build-root.txt"
 (
     cd "$root/src"
-    find kernels/ops/turboquant/fused_decode -type f -print0
-    printf '%s\0' kernels/ops/turboquant/turboquant_fused_decode_opt.cpp \
+    # The operator and its service headers, which live once, in the subtree exported to
+    # vllm-ascend. kernels/ops/turboquant/fused_decode/ holds the pre-staging originals of those
+    # headers and the decode no longer reads them, so it is no longer archived as its source.
+    find kernels/ops/turboquant/vllm_integration_layer/op_kernel -type f -print0
+    find kernels/ops/turboquant/vllm_integration_layer/include -type f -print0
+    printf '%s\0' \
         routines/routine_vector_cube_softmax.hpp routines/routine_vector_online_softmax.hpp \
         routines/routine_turboquant_dequant4.hpp include/turboquant_fused_decode_opt.hpp \
+        include/turboquant_fused_decode.hpp \
         tests/sim/kernel/test_camodel_fused_decode_opt.cpp \
         tests/sim/kernel/fused_decode_opt_kernel.cpp \
         tests/sim/kernel/fused_decode_opt_sim_common.hpp
