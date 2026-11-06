@@ -79,6 +79,13 @@ __aicore__ inline constexpr uint16_t FlagProductReady(uint32_t slot)
 template <typename scalar_t, bool GEMV_DISABLED = kGemvDisabledDefault>
 class TurboQuantGemmReducer {
 public:
+    // The operator is instantiated at half and at bfloat16_t. Both are 16-bit and the UB map in
+    // ../include/turboquant_fused_decode_opt.hpp is pinned on that: a third element type has to go
+    // there first, not arrive here and silently move three cores' Fixpipe landings apart.
+    static_assert(sizeof(scalar_t) == 2,
+                  "turboquant_fused_decode_opt.hpp's kUbEnd/kBasisUbBytes/kReducerUbBytes assume a "
+                  "16-bit output element");
+
     __aicore__ inline explicit TurboQuantGemmReducer(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
     __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *output, const uint32_t numHeads,
@@ -592,6 +599,13 @@ private:
 template <typename scalar_t, bool GEMV_DISABLED = kGemvDisabledDefault>
 class TurboQuantBatchedGemmReducer {
 public:
+    // The operator is instantiated at half and at bfloat16_t. Both are 16-bit and the UB map in
+    // ../include/turboquant_fused_decode_opt.hpp is pinned on that: a third element type has to go
+    // there first, not arrive here and silently move three cores' Fixpipe landings apart.
+    static_assert(sizeof(scalar_t) == 2,
+                  "turboquant_fused_decode_opt.hpp's kUbEnd/kBasisUbBytes/kReducerUbBytes assume a "
+                  "16-bit output element");
+
     __aicore__ inline explicit TurboQuantBatchedGemmReducer(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
     // `sharedPool`, when given, is the attention phase's transient UB pool

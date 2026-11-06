@@ -23,11 +23,30 @@
 //
 // Block b's prologue share is vectors [b * vectorsPerBlock, (b + 1) * vectorsPerBlock). With a Cube chunk
 // size, the share's whole chunks rotate on the Cube: each vector subcore sign-flips its half of the chunk,
-// casts it to fp16 (exact for an fp16 query, since the signs and H16 are +-1) and stages it into its half of
-// one L1 tile; the AIC multiplies the tile by H16, which is the butterfly strides 1 to 8, and Fixpipes each
-// half back to its subcore (dualDstCtl = 0b01), which runs the strides from 16 up, scales by 1 / sqrt(D) and
-// flips the signs. The rest of the share rotates on the vector cores with ApplyPi, half per subcore. The
-// arithmetic is rotate_q's, stage for stage, on either path.
+// casts it back to the QUERY's own 16-bit type (exact, since the signs and H16 are +-1) and stages it into
+// its half of one L1 tile; the AIC multiplies the tile by H16, which is the butterfly strides 1 to 8, and
+// Fixpipes each half back to its subcore (dualDstCtl = 0b01), which runs the strides from 16 up, scales by
+// 1 / sqrt(D) and flips the signs. The rest of the share rotates on the vector cores with ApplyPi, half per
+// subcore. The arithmetic is rotate_q's, stage for stage, on either path.
+//
+// WHY THE CUBE CHUNK OPERAND IS scalar_t AND NOT ALWAYS half
+//
+// The chunk path's operand used to be fp16 unconditionally, and for an fp16 query that is exact: the sign
+// flip and H16 are +-1, so q -> fp32 -> +-q -> fp16 round-trips bit for bit. It is NOT exact for a bf16
+// query. bf16 has 8 significand bits against fp16's 11, so the MANTISSA always survives -- but the
+// exponent range does not: |q| above 65504 overflows fp16 to infinity and |q| below 2^-24 flushes to zero,
+// and a bf16 query carries values in both of those ranges. Staging a bf16 query through an fp16 operand
+// would therefore rotate a different vector than ApplyPi rotates from the same input, and the chunked and
+// unchunked halves of one launch's share would disagree -- silently, and only for the chunked half.
+//
+// So the operand follows scalar_t. The 950PR Cube takes bfloat16_t x bfloat16_t -> float as a listed Mmad
+// combination (mmad_compute/Mmad.md table 5), the arch-3510 fractal is 16 x (32B / sizeof(T)) so C0 is 16
+// elements for either 16-bit type (routine_stage_page_zn_bf16.hpp derives this for bf16), and every
+// L1/L0/UB extent below is sizeof-driven and therefore unchanged: that is what makes this one type
+// substitution rather than a second geometry. The H16 table in GM stays fp16 for both instances -- it is a
+// shared input and its entries are +-1 -- and is converted on ingest where scalar_t is not half, over the
+// listed half -> bfloat16_t pair (type_conversion/Cast.md). For scalar_t = half every instruction below is
+// unchanged, which is why the fp16 instance comes out of this byte-identical.
 //
 // Every core allocates the same UB list, after the decode's own buffers so those keep their offsets: the
 // AIC's Fixpipe names the subcores' product buffer by its own copy's offset. The output stage runs after
@@ -47,6 +66,12 @@ template <typename scalar_t, bool ENABLED>
 class TurboQuantQueryBasis {
 public:
     static constexpr bool kEnabled = true;
+    // The Cube chunk path's Mmad operand type: the query's own, for the reason in the header comment.
+    // Both instantiated types are 16-bit, so no extent in this service moves with it.
+    using OperandT = scalar_t;
+    static_assert(sizeof(OperandT) == 2,
+                  "the H16 chunk operand's C0, its L1/L0 extents and kBasisUbBytes in "
+                  "turboquant_fused_decode_opt.hpp all assume a 16-bit Cube operand");
 
     // Call after the decode's Init. cubeChunkVectors is 0 (vector cores only) or an even chunk of at most
     // kScratchRows * 2 vectors whose rows fill whole 16-row fractals; gate is read only for kGated.
@@ -72,17 +97,17 @@ public:
 
         pipe->InitBuffer(inBuf_, scratchElems * sizeof(scalar_t));
         pipe->InitBuffer(floatBuf_, scratchElems * sizeof(float));
-        pipe->InitBuffer(halfBuf_, scratchElems * sizeof(half));
+        pipe->InitBuffer(halfBuf_, scratchElems * sizeof(OperandT));
         pipe->InitBuffer(pairBuf_, scratchElems * sizeof(float));
         pipe->InitBuffer(signBuf_, headSize_ * sizeof(float));
         codec_.Init(pipe, headSize_, 1, invSqrtLen, rotTablesGm_);
 
         if (cubeChunk_ > 0) {
-            pipe->InitBuffer(tileL1Buf_, tileElems_ * sizeof(half));
-            pipe->InitBuffer(h16L1Buf_, kRotateQH16Elements * sizeof(half));
+            pipe->InitBuffer(tileL1Buf_, tileElems_ * sizeof(OperandT));
+            pipe->InitBuffer(h16L1Buf_, kRotateQH16Elements * sizeof(OperandT));
             if ASCEND_IS_AIC {
-                pipe->InitBuffer(tileL0aBuf_, tileElems_ * sizeof(half));
-                pipe->InitBuffer(h16L0bBuf_, kRotateQH16Elements * sizeof(half));
+                pipe->InitBuffer(tileL0aBuf_, tileElems_ * sizeof(OperandT));
+                pipe->InitBuffer(h16L0bBuf_, kRotateQH16Elements * sizeof(OperandT));
                 pipe->InitBuffer(productL0cBuf_, tileElems_ * sizeof(float));
             }
         }
@@ -93,8 +118,23 @@ public:
                 if (AscendC::GetSubBlockIdx() == 0) {
                     const AscendC::LocalTensor<half> stage = halfBuf_.Get<half>();
                     AscendC::DataCopy(stage, h16Gm_, kRotateQH16Elements);
-                    SyncEvent<AscendC::HardEvent::MTE2_MTE3>();
-                    AscendC::DataCopy(h16L1Buf_.Get<half>(), stage, kRotateQH16Elements);
+                    if constexpr (AscendC::IsSameType<OperandT, half>::value) {
+                        SyncEvent<AscendC::HardEvent::MTE2_MTE3>();
+                        AscendC::DataCopy(h16L1Buf_.Get<half>(), stage, kRotateQH16Elements);
+                    } else {
+                        // The table is +-1 in fp16 and the operand is not fp16: convert once, here, over
+                        // the listed half -> bfloat16_t pair. +-1 is exact in both, so this is a
+                        // representation change and not a rounding. The converted copy sits behind the
+                        // staged one inside the SAME scratch buffer, which holds
+                        // kScratchRows * headSize >= 8 * 256 elements against this tile's 2 * 256 --
+                        // disjoint, and no new allocation, so kBasisUbBytes does not move.
+                        const AscendC::LocalTensor<OperandT> table =
+                            halfBuf_.Get<OperandT>()[kRotateQH16Elements];
+                        SyncMte2ToVector();
+                        AscendC::Cast(table, stage, AscendC::RoundMode::CAST_RINT, kRotateQH16Elements);
+                        SyncVectorToMte3();
+                        AscendC::DataCopy(h16L1Buf_.Get<OperandT>(), table, kRotateQH16Elements);
+                    }
                 }
             }
         }
@@ -169,8 +209,10 @@ public:
 
 private:
     static constexpr uint32_t kScratchRows = kCubeTileM / kVectorSubcoresPerBlock;
-    // An fp16 operand's C0: one 16-element group per row of the H16 tile.
-    static constexpr uint32_t kHalfOperandC0 = 16;
+    // A 16-BIT operand's C0: the arch-3510 fractal is 16 x (32B / sizeof(T)), so 32B / 2 = 16 elements
+    // per group for fp16 and for bf16 alike (routine_stage_page_zn_bf16.hpp derives this for bf16 and the
+    // two agree). One 16-element group per row of the H16 tile.
+    static constexpr uint32_t kOperandC0 = 16;
     static constexpr uint8_t kDualDstSplitM = 0b01;
 
     // One chunk's AIV half: stage it, wait for its H16 product, finish the transform and write it.
@@ -182,7 +224,7 @@ private:
         const uint64_t firstElem = static_cast<uint64_t>(chunkBase + subcore * own) * headSize_;
         const AscendC::LocalTensor<scalar_t> queryIn = inBuf_.Get<scalar_t>();
         const AscendC::LocalTensor<float> query = floatBuf_.Get<float>();
-        const AscendC::LocalTensor<half> operand = halfBuf_.Get<half>();
+        const AscendC::LocalTensor<OperandT> operand = halfBuf_.Get<OperandT>();
         const AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
 
         AscendC::DataCopy(queryIn, queryGm_[firstElem], elems);
@@ -193,7 +235,7 @@ private:
         }
         AscendC::Cast(operand, query, AscendC::RoundMode::CAST_RINT, elems);
         SyncVectorToMte3();
-        AscendC::DataCopy(tileL1Buf_.Get<half>()[subcore * elems], operand, elems);
+        AscendC::DataCopy(tileL1Buf_.Get<OperandT>()[subcore * elems], operand, elems);
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(kFlagOperandsReady);
 
         AscendC::CrossCoreWaitFlag(kFlagProductReady);
@@ -230,7 +272,7 @@ private:
 
         SyncEvent<AscendC::HardEvent::FIX_M>();
         const AscendC::LocalTensor<float> product = productL0cBuf_.Get<float>();
-        AscendC::Mmad(product, tileL0aBuf_.Get<half>(), h16L0bBuf_.Get<half>(),
+        AscendC::Mmad(product, tileL0aBuf_.Get<OperandT>(), h16L0bBuf_.Get<OperandT>(),
                       AscendC::MmadParams(static_cast<uint16_t>(rows), static_cast<uint16_t>(kRotateQTile),
                                           static_cast<uint16_t>(kRotateQTile), 0, false, true));
         SyncMatrixToFixpipe();
@@ -252,21 +294,21 @@ private:
         tile.mStartPosition = 0;
         tile.kStartPosition = 0;
         tile.mStep = CeilDivU16(rows, kRotateQTile);
-        tile.kStep = CeilDivU16(kRotateQTile, kHalfOperandC0);
+        tile.kStep = CeilDivU16(kRotateQTile, kOperandC0);
         tile.srcStride = CeilDivU16(rows, kRotateQTile);
         tile.dstStride = CeilDivU16(rows, kRotateQTile);
         tile.ifTranspose = false;
-        AscendC::LoadData(tileL0aBuf_.Get<half>(), tileL1Buf_.Get<half>(), tile);
+        AscendC::LoadData(tileL0aBuf_.Get<OperandT>(), tileL1Buf_.Get<OperandT>(), tile);
 
         AscendC::LoadData2DParamsV2 h16;
         h16.mStartPosition = 0;
         h16.kStartPosition = 0;
         h16.mStep = CeilDivU16(kRotateQTile, kRotateQTile);
-        h16.kStep = CeilDivU16(kRotateQTile, kHalfOperandC0);
+        h16.kStep = CeilDivU16(kRotateQTile, kOperandC0);
         h16.srcStride = CeilDivU16(kRotateQTile, kRotateQTile);
         h16.dstStride = CeilDivU16(kRotateQTile, kRotateQTile);
         h16.ifTranspose = false;
-        AscendC::LoadData(h16L0bBuf_.Get<half>(), h16L1Buf_.Get<half>(), h16);
+        AscendC::LoadData(h16L0bBuf_.Get<OperandT>(), h16L1Buf_.Get<OperandT>(), h16);
     }
 
     // One vector on this subcore alone: read, ApplyPi, write.

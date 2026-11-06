@@ -4,14 +4,78 @@
 #include <cstring>
 #include <set>
 
-static void require(bool b) { if (!b) throw std::runtime_error("fused-opt fixture test"); }
+// Reports WHICH check failed. A gate that says only that it failed costs a bisect every time.
+static void require_at(bool b, int line, const char* text)
+{
+    if (b) return;
+    std::fprintf(stderr, "fused-opt fixture test failed at line %d: %s\n", line, text);
+    throw std::runtime_error("fused-opt fixture test");
+}
+#define require(expr) require_at((expr), __LINE__, #expr)
+
+// Byte-identical, not operator==. Two reasons, and both of them bite here: `scales` is flooded
+// with 0x7FC0BEEF, which is a quiet NaN, so == is false between two identical copies; and where
+// the claim is that an fp32 value did not move at all, "compares equal" is the weaker statement
+// (it would also accept +0 against -0).
+static bool same_bits(const std::vector<float>& a, const std::vector<float>& b)
+{
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        std::uint32_t x, y;
+        std::memcpy(&x, &a[i], 4);
+        std::memcpy(&y, &b[i], 4);
+        if (x != y) return false;
+    }
+    return true;
+}
 int main()
 {
+    using fused_decode_opt_test::Element;
     using fused_decode_opt_test::Fixture;
     require(fused_decode_opt_test::reference_half(1.9999f) == 0x4000);
     require(fused_decode_opt_test::reference_half(7.9999f) == 0x4800);
     require(fused_decode_opt_test::reference_half(1.00048828125f) == 0x3c00); // halfway, even
     require(fused_decode_opt_test::reference_half(1.00146484375f) == 0x3c02); // halfway, odd
+
+    // ------------------------------------------------- the bf16 gold rounder, pinned two ways
+    //
+    // reference_bfloat16 splits the fp32 word and decides the round half-to-even explicitly;
+    // ascend_micro::sim::float_to_bfloat16_rne does it by adding a bias and shifting. They are
+    // different code, so agreeing is evidence. Checked on the tie cases first -- where the two
+    // implementations would diverge if either had the half-to-even rule wrong -- and then over
+    // every oracle value the fixtures below produce.
+    //
+    // bf16 keeps 7 stored significand bits, so above 1.0 the quantum is 2^-7 = 0.0078125 and the
+    // tie sits at 2^-8 = 0.00390625.
+    require(fused_decode_opt_test::reference_bfloat16(1.0f) == 0x3f80);
+    require(fused_decode_opt_test::reference_bfloat16(2.0f) == 0x4000);
+    require(fused_decode_opt_test::reference_bfloat16(15.0f) == 0x4170);
+    require(fused_decode_opt_test::reference_bfloat16(1.00390625f) == 0x3f80);  // halfway, even
+    require(fused_decode_opt_test::reference_bfloat16(1.01171875f) == 0x3f82);  // halfway, odd
+    require(fused_decode_opt_test::reference_bfloat16(1.9999f) == 0x4000);      // carries into exp
+    for (int i = 0; i <= 1792; ++i) {
+        const float v = 1.0f + float(i) * (1.0f / 128.0f);  // 1 .. 15 on the bf16 grid and between
+        require(fused_decode_opt_test::reference_bfloat16(v) ==
+                ascend_micro::sim::float_to_bfloat16_rne(v));
+        // Widening a stored word is exact in both directions on the grid itself.
+        const auto bits = fused_decode_opt_test::reference_bfloat16(v);
+        require(fused_decode_opt_test::widen_bits(Element::kBf16, bits) ==
+                ascend_micro::sim::bfloat16_to_float(bits));
+    }
+    // ...and on the halfway points, where a wrong rule shows and a right one does not.
+    for (int i = 0; i < 1792; ++i) {
+        const float lo = 1.0f + float(i) * (1.0f / 128.0f);
+        const float mid = lo + 1.0f / 256.0f;
+        require(fused_decode_opt_test::reference_bfloat16(mid) ==
+                ascend_micro::sim::float_to_bfloat16_rne(mid));
+    }
+    // reference_bits selects between them and nothing else.
+    require(fused_decode_opt_test::reference_bits(Element::kFp16, 3.5f) ==
+            fused_decode_opt_test::reference_half(3.5f));
+    require(fused_decode_opt_test::reference_bits(Element::kBf16, 3.5f) ==
+            fused_decode_opt_test::reference_bfloat16(3.5f));
+    require(fused_decode_opt_test::element_mantissa_bits(Element::kBf16) == 7);
+    require(fused_decode_opt_test::element_mantissa_bits(Element::kFp16) == 10);
     Fixture f(192, 2, 2, 3, 64);
     std::set<int> physical;
     for (int i = 0; i < f.requests * f.pages; ++i)
@@ -211,9 +275,94 @@ int main()
                 std::uint64_t(r.requests) * rc.heads);
     }
 
+    // ================================================= the bf16 instance of the gold model
+    //
+    // The element type must change the 16-bit ENCODINGS and nothing else: every fp32 value in the
+    // fixture -- the query, the cache, the scales and `expected` -- is the same number for both
+    // instances, because the device's arithmetic is identical up to the final output cast. Pinned
+    // bitwise, so a future change that made `element` leak into the arithmetic is a failure here
+    // rather than a quiet divergence between the two ladders.
+    {
+        Fixture a(192, 2, 2, 3, 64, Element::kFp16);
+        Fixture b(192, 2, 2, 3, 64, Element::kBf16);
+        require(a.element == Element::kFp16 && b.element == Element::kBf16);
+        require(same_bits(a.query, b.query));
+        require(same_bits(a.scales, b.scales));
+        require(same_bits(a.expected, b.expected));  // bitwise, not "close"
+        require(a.key == b.key && a.value == b.value);
+        require(a.table == b.table && a.lengths == b.lengths);
+        // The launch descriptor carries the instance, so a fixture built for one cannot be
+        // launched at the other by accident.
+        require(a.launch(2).element_type == 0 && b.launch(2).element_type == 1);
+        require(a.launch_raw(2, 1, 0).element_type == 0);
+        require(b.launch_raw(2, 1, 0).element_type == 1);
+        // Both instances emit 16-bit elements, which is what holds the UB map still.
+        require(ascend_micro::fused_decode_opt::element_bytes(0) == 2);
+        require(ascend_micro::fused_decode_opt::element_bytes(1) == 2);
+        // Every oracle value is in reference_bfloat16's range and rounds without throwing.
+        for (float v : b.expected) (void)fused_decode_opt_test::reference_bfloat16(v);
+    }
+
+    // THE 16-BIT INPUTS THE DEVICE READS, in bf16. The raw query and the gate are the only two,
+    // and the gold model refuses to ROUND either: Pi(raw) has to reproduce the pre-rotated query
+    // bit for bit or the stage-0 oracle does not apply, and the kGated oracle has to divide by
+    // the logit the device actually read. raw_query/gate_logits therefore throw on an inexact
+    // value, and what this checks is that they DON'T have to -- that the fixture's own numbers
+    // land on the bf16 grid, which is a measured property of this basis and not a bound.
+    {
+        using fused_decode_opt_test::RawQueryBasis;
+        const RawQueryBasis pi;
+        Fixture r(1024, 1, 1, 16, 128, Element::kBf16);
+        const auto raw = r.raw_query(pi);          // throws if any entry is not bf16-exact
+        const auto gate = r.gate_logits();         // likewise
+        require(raw.size() == r.query.size() && gate.size() == r.query.size());
+
+        // The widest significand the raw query actually uses, reported rather than assumed: the
+        // margin against bf16's 7 stored bits is the whole reason this fixture works at bf16.
+        unsigned widest = 0;
+        for (std::size_t row = 0; row < r.query.size() / 256; ++row) {
+            const auto image = pi.apply(r.query.data() + row * 256);
+            for (int c = 0; c < 256; ++c) {
+                std::uint32_t bits;
+                std::memcpy(&bits, &image[std::size_t(c)], 4);
+                unsigned used = 23, m = bits & 0x7fffffu;
+                if (m == 0) used = 0;
+                else while (!(m & 1u)) { m >>= 1; --used; }
+                if (used > widest) widest = used;
+            }
+        }
+        std::printf("fused-opt bf16 gold model: raw query needs %u significand bits, bf16 stores "
+                    "%u\n", widest, fused_decode_opt_test::element_mantissa_bits(Element::kBf16));
+        require(widest <= fused_decode_opt_test::element_mantissa_bits(Element::kBf16));
+
+        // And the round trip the device's prologue has to reproduce: widen the bf16 raw query,
+        // rotate it, and land on the pre-rotated query BITWISE. This is the claim the stage-0
+        // oracle rests on, restated for bf16 exactly as the fp16 block above states it.
+        for (std::size_t row = 0; row < r.query.size() / 256; ++row) {
+            std::vector<float> back(256);
+            for (int c = 0; c < 256; ++c)
+                back[std::size_t(c)] = fused_decode_opt_test::widen_bits(
+                    Element::kBf16, raw[row * 256 + std::size_t(c)]);
+            const auto rotated = pi.apply(back.data());
+            for (int c = 0; c < 256; ++c)
+                require(rotated[std::size_t(c)] == r.query[row * 256 + std::size_t(c)]);
+        }
+        // The gate the oracle divides by IS the gate the device read.
+        for (std::size_t i = 0; i < 256; ++i)
+            require(r.gate_widened(i) == Fixture::gate_value(i));
+        // The gated stage still moves most channels, so stage 2 is not silently stage 1.
+        const auto s1 = r.expected_row(pi, 0, 1), s2 = r.expected_row(pi, 0, 2);
+        int gated = 0;
+        for (int c = 0; c < 256; ++c) if (s1[std::size_t(c)] != s2[std::size_t(c)]) ++gated;
+        require(gated > 200);
+    }
+
     std::puts("PASS fused-opt fixture: fragmented pages, independent NZ inverse, GQA/request "
               "variation, exact one-tile oracle, capped grid, ragged tile/page arithmetic, "
               "bit-identical aligned oracle, an independently recomputed ragged oracle, and a "
               "Pi basis that is an exact involution whose raw query rotates back to the "
-              "pre-rotated query bitwise");
+              "pre-rotated query bitwise; and the bf16 instance of the same gold model -- two "
+              "independent bf16 rounders agreeing on the grid and on every halfway point, fp32 "
+              "values bit-identical across instances, and a bf16 raw query that is exact and "
+              "rotates back to the pre-rotated query bitwise");
 }

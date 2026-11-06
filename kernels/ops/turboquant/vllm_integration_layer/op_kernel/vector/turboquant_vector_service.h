@@ -167,6 +167,14 @@ __aicore__ inline void NormalizeHeads(const AscendC::LocalTensor<float> &acc, co
 }
 
 // Casts `heads` fp32 rows to the output type in UB and writes them to GM in one burst.
+//
+// THE OPERATOR'S ONLY OUTPUT ROUNDING, and on the pre-rotated path the only place the element type
+// is used for arithmetic at all: the query arrives as fp32 (the rotated image), the scores, the
+// online-softmax recurrence, the probabilities, the accumulator and the Split-K merge are all fp32,
+// and the result meets the element type exactly here. `float -> half` and `float -> bfloat16_t` are
+// both listed CAST_RINT pairs on 950PR (type_conversion/Cast.md), so the same call serves both
+// instances and the bf16 instance differs from the fp16 one by this rounding and nothing else.
+// bf16's 8 significand bits against fp16's 11 make the step coarser, not the arithmetic different.
 template <typename scalar_t>
 __aicore__ inline void WriteHeads(const AscendC::LocalTensor<float> &acc, const uint32_t heads, const uint32_t headSize,
                                   const AscendC::LocalTensor<scalar_t> &out, AscendC::GlobalTensor<scalar_t> &outputGm,
@@ -214,6 +222,13 @@ struct TurboQuantRotatedOutput {
 template <typename scalar_t>
 class TurboQuantPartialReducer {
 public:
+    // The operator is instantiated at half and at bfloat16_t. Both are 16-bit and the UB map in
+    // ../include/turboquant_fused_decode_opt.hpp is pinned on that: a third element type has to go
+    // there first, not arrive here and silently move three cores' Fixpipe landings apart.
+    static_assert(sizeof(scalar_t) == 2,
+                  "turboquant_fused_decode_opt.hpp's kUbEnd/kBasisUbBytes/kReducerUbBytes assume a "
+                  "16-bit output element");
+
     __aicore__ inline explicit TurboQuantPartialReducer(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
     __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *output, const uint32_t numHeads,
@@ -385,6 +400,12 @@ public:
     static_assert(kGatherUnpack == Codec::kGatherLut, "the service and its codec disagree on the expand");
     static_assert(kLloydMaxUnpack == Codec::kLloydMaxLut, "the service and its codec disagree on the codebook");
     static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
+    // scalar_t is the OUTPUT element type only. The Cube operands are OperandT, which comes from MODE
+    // (KV4/FP8) and not from scalar_t, so the ring ingest, the dequant expand, the score and context
+    // GEMMs and every tile descriptor are identical in the half and bfloat16_t instances. The width,
+    // though, is pinned: see ../include/turboquant_fused_decode_opt.hpp.
+    static_assert(sizeof(scalar_t) == 2,
+                  "turboquant_fused_decode_opt.hpp's UB map assumes a 16-bit output element");
     // Ring slots of the tile ingest. Tile t reads into slot t % kIngestSlots, the slot of its L1 operands.
     static constexpr uint32_t kIngestSlots = kBatched ? RING_SLOTS : 1;
     // Fixpipe score windows. Tile t's scores land in window t % kScoreWindows.

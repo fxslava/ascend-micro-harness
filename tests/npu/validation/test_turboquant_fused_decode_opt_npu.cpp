@@ -272,23 +272,31 @@ OracleResult check_output(const std::vector<std::uint8_t>& image, const Fixture&
     for (std::size_t i = 0; i < live; ++i) {
         std::uint16_t bits;
         std::memcpy(&bits, image.data() + kGuard + 2 * i, 2);
-        const std::uint16_t reference = fused_decode_opt_test::reference_half(f.expected[i]);
-        // The fixture's results are positive finite normals, so the fp16 bit distance IS the
-        // ULP distance -- no sign or subnormal case to fold in.
+        // The oracle word in THIS FIXTURE'S element format, compared against the stored 16-bit
+        // word at its original position -- which is what REFINEMENT_OF_COMBAT_KERNELS.md section 3
+        // asks for on bf16, and the reason nothing here widens the device's word before comparing.
+        const std::uint16_t reference =
+            fused_decode_opt_test::reference_bits(f.element, f.expected[i]);
+        // The fixture's results are positive finite normals in both formats, so the bit distance
+        // IS the ULP distance -- no sign or subnormal case to fold in.
         const int ulp = std::abs(int(bits) - int(reference));
-        const double got = ascend_micro::sim::half_to_float(bits);
+        const double got = fused_decode_opt_test::widen_bits(f.element, bits);
         const double absolute = std::fabs(got - double(f.expected[i]));
         if (ulp > result.worst_ulp) result.worst_ulp = ulp;
         if (absolute > result.worst_abs) result.worst_abs = absolute;
         if (ulp > kUlpBudget) {
             std::fprintf(stderr,
                          "oracle mismatch at channel %zu: got %g (%04x) expected %g (%04x), "
-                         "%d fp16 ULP over a budget of %d\n",
-                         i, got, bits, double(f.expected[i]), reference, ulp, kUlpBudget);
+                         "%d %s ULP over a budget of %d\n",
+                         i, got, bits, double(f.expected[i]), reference, ulp,
+                         fused_decode_opt_test::element_name(f.element), kUlpBudget);
             require(false, "fused-opt NPU validation: output disagrees with the FP64 oracle");
         }
     }
-    for (std::size_t i = 2 * live; i < payload_bytes; ++i)
+    // Both instances emit 16-bit elements, so the output tail starts at the same byte.
+    for (std::size_t i = ascend_micro::fused_decode_opt::element_bytes(
+                             static_cast<std::uint32_t>(f.element)) * live;
+         i < payload_bytes; ++i)
         if (image[kGuard + i] != kGuardByte) {
             std::fprintf(stderr, "output tail byte %zu past the last live channel is %02x\n", i,
                          image[kGuard + i]);
@@ -336,10 +344,22 @@ int run()
     long long canary_pages = 0, canary_pad_floats = 0;
     std::set<int> splits_seen, kv_heads_seen;
 
+    // BOTH INSTANCES. `scalar_t` reaches the output GM tensor, the UB row cast into it and the
+    // same pair inside the Split-K reducer, so the fp16 leg establishes nothing about the bf16
+    // rounding or the bf16 reducer write. The fp32 arithmetic ahead of that cast is identical, so
+    // the FIXTURE is the same object for both legs apart from the format it encodes and compares
+    // in -- tests/cpu/test_fused_decode_opt_fixture.cpp pins that bitwise -- and the two legs are
+    // therefore the same ladder answered in two formats rather than two different ladders.
+    static constexpr fused_decode_opt_test::Element kElements[] = {
+        fused_decode_opt_test::Element::kFp16, fused_decode_opt_test::Element::kBf16};
+
+    for (const fused_decode_opt_test::Element element : kElements) {
+    std::printf("\n--- element type: %s\n", fused_decode_opt_test::element_name(element));
     for (const Rung& rung : ladder) {
         // One fixture per rung: the oracle is the expensive part and the split count changes
         // only how the work is partitioned, never the answer.
-        const Fixture f(rung.context, rung.requests, rung.kv_heads, rung.group_heads, kPageTokens);
+        const Fixture f(rung.context, rung.requests, rung.kv_heads, rung.group_heads, kPageTokens,
+                        element);
         CanaryPlan plan = plan_canaries(f);
         const int tail = f.context % 64;
         if (tail != 0) {
@@ -463,9 +483,16 @@ int run()
         std::printf("  rung N %5d tok %d kvh %d: %s\n", rung.context, rung.requests,
                     rung.kv_heads, rung.note);
     }
+    }  // element
 
-    require(ragged_rungs >= 3, "fused-opt NPU validation: the ragged rungs went missing");
+    // The ladder-shape requirements below count ACROSS both legs, so each bound is per leg times
+    // the number of legs where the counter accumulates per launch, and unchanged where the
+    // counter is a set or a minimum. `ragged_rungs` and `canary_pad_floats` accumulate.
+    constexpr int kElementLegs = int(sizeof kElements / sizeof kElements[0]);
+    require(ragged_rungs >= 3 * kElementLegs,
+            "fused-opt NPU validation: the ragged rungs went missing");
     require(narrowest_tail == 1, "fused-opt NPU validation: no single-row tail was exercised");
+    require(worst_ulp <= kUlpBudget, "fused-opt NPU validation: worst ULP over the budget");
     require(kv_heads_seen.count(4) == 1, "fused-opt NPU validation: no multi-KV-head rung ran");
     for (const int k : {3, 5, 7})
         require(splits_seen.count(k) == 1,
@@ -478,8 +505,10 @@ int run()
     std::printf("PASS fused decode opt NPU validation: %d launches over %zu rungs, S in {%s}, "
                 "1 and 4 KV heads, 16 query heads per KV head, D=%d, %d-token pages. %d rungs "
                 "are RAGGED (context divides neither the page nor the 64-row tile), the "
-                "narrowest live tail being %d row. Worst fp16 ULP %d against a budget of %d; "
-                "worst absolute residual %.3e (the fp16 quantisation of the oracle). 0x%08X "
+                "narrowest live tail being %d row, at EACH of the two element types (fp16 and "
+                "bf16, the operator's two instances). Worst ULP %d in the output format of the "
+                "leg that produced it, against a budget of %d; worst absolute residual %.3e "
+                "(the output-format quantisation of the oracle). 0x%08X "
                 "canaries held: %lld unmapped physical KV pages, %lld inter-head scale padding "
                 "floats, both guard bands of every allocation, the output tail and the "
                 "workspace outside the live partial extent. Every input allocation "

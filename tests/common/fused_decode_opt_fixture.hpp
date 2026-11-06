@@ -3,6 +3,7 @@
 #include "../../include/sim_micro_testbed.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -11,6 +12,40 @@ namespace fused_decode_opt_test {
 namespace fd = ascend_micro::fused_decode_opt;
 namespace tq = vllm_ascend::turboquant;
 inline std::size_t aligned(std::size_t n) { return (n + 31) / 32 * 32; }
+
+// ------------------------------------------------------------- the element format, in the gold model
+//
+// The operator is instantiated at fp16 and at bf16, and `scalar_t` is the QUERY/OUTPUT element type,
+// not the cache format. For the oracle below to be a comparison rather than a coincidence, EVERY
+// value the device holds in 16 bits has to be held in 16 bits here too -- and in the SAME 16 bits.
+// Rounding an fp32 oracle at the very end is only the right model where the device's own rounding is
+// also at the very end, and on this operator that is true of exactly one value (the output) and
+// false of two others:
+//
+//   output      the device accumulates the context in fp32 and casts ONCE, at the final GM burst
+//               (WriteHeads). So the gold model computes in fp64, narrows to fp32, and rounds to
+//               the element format here -- one rounding, in the same place.
+//
+//   raw query   the device READS bf16 (or fp16) from GM and widens it to fp32. So the gold model
+//               must build the raw query in the element format and then feed the WIDENED value to
+//               the rest of the oracle -- not the fp32 ideal it rounded from. `raw_query` below
+//               therefore refuses a value the format cannot hold exactly instead of rounding it,
+//               because the whole reason this fixture can hold the raw-query entry to the
+//               pre-rotated entry's oracle is that Pi(raw) reproduces `query` BIT FOR BIT.
+//
+//   gate        same: the device reads the gate in the element format and widens it, so
+//               `expected_row`'s kGated stage divides by 1 + exp(-widened), never by
+//               1 + exp(-gate_value), and `gate_logits` refuses an inexact logit.
+//
+// The intervening arithmetic -- scores, the online softmax, the probabilities, the accumulator, the
+// Split-K partials and their merge, and the Pi basis itself -- is fp32 on the device for both
+// instances, so it stays fp64-then-fp32 here for both. Carrying it in 16 bits would model a kernel
+// this is not.
+enum class Element : std::uint32_t { kFp16 = 0, kBf16 = 1 };
+
+inline const char* element_name(Element e) { return e == Element::kBf16 ? "bf16" : "fp16"; }
+inline unsigned element_mantissa_bits(Element e) { return e == Element::kBf16 ? 7u : 10u; }
+
 // Positive normal results are in [1,15]. Round the FP32 significand before
 // rebiasing, so a mantissa carry correctly increments the FP16 exponent.
 inline std::uint16_t reference_half(float value)
@@ -19,6 +54,54 @@ inline std::uint16_t reference_half(float value)
     std::uint32_t bits;
     std::memcpy(&bits, &value, 4);
     return static_cast<std::uint16_t>(((bits + 0xfffu + ((bits >> 13) & 1u)) >> 13) - (112u << 10));
+}
+
+// The same for bf16, and deliberately NOT by the add-and-shift that
+// ascend_micro::sim::float_to_bfloat16_rne uses: this one splits the word, decides the round
+// half-to-even explicitly and reassembles, so the two implementations agree only if both are right.
+// tests/cpu/test_fused_decode_opt_fixture.cpp pins that agreement over the fixture's own values and
+// over the tie cases. A carry out of the 7-bit significand lands in the exponent field by
+// construction, exactly as it does for fp16 above, because the fields are adjacent.
+inline std::uint16_t reference_bfloat16(float value)
+{
+    if (!(value >= 1 && value <= 15)) throw std::runtime_error("oracle result outside fixture range");
+    std::uint32_t bits;
+    std::memcpy(&bits, &value, 4);
+    const std::uint32_t keep = bits >> 16;             // sign | exponent | 7 significand bits
+    const std::uint32_t dropped = bits & 0xffffu;      // the 16 bits bf16 does not store
+    const bool round_up = dropped > 0x8000u || (dropped == 0x8000u && (keep & 1u));
+    return static_cast<std::uint16_t>(keep + (round_up ? 1u : 0u));
+}
+
+// The correctly-rounded 16-bit word of an fp32 oracle value, in the instance's own format.
+inline std::uint16_t reference_bits(Element e, float value)
+{
+    return e == Element::kBf16 ? reference_bfloat16(value) : reference_half(value);
+}
+
+// The value the DEVICE sees after widening a stored word: exact for both formats, since fp32 holds
+// every fp16 and every bf16 value. This is what an oracle downstream of a 16-bit input must use.
+inline float widen_bits(Element e, std::uint16_t bits)
+{
+    return e == Element::kBf16 ? ascend_micro::sim::bfloat16_to_float(bits)
+                               : ascend_micro::sim::half_to_float(bits);
+}
+
+// Encode an INPUT the device will read in the element format, refusing anything the format cannot
+// hold exactly. An input the fixture had to round would make `expected` an approximation of a
+// different kernel's answer, and the exact-boundary rungs would then be measuring the fixture.
+inline std::uint16_t exact_input_bits(Element e, float value, const char* what)
+{
+    const std::uint16_t bits = e == Element::kBf16 ? ascend_micro::sim::float_to_bfloat16_rne(value)
+                                                  : ascend_micro::sim::float_to_half_rne(value);
+    if (widen_bits(e, bits) != value) {
+        char message[160];
+        std::snprintf(message, sizeof message,
+                      "fused-opt fixture: %s is not exactly representable in %s", what,
+                      element_name(e));
+        throw std::runtime_error(message);
+    }
+    return bits;
 }
 
 // ---------------------------------------------------------------- the raw-query Pi basis
@@ -161,12 +244,19 @@ struct RawQueryBasis {
 // pins that.
 struct Fixture {
     int context, requests, kv_heads, group_heads, page_tokens, pages, physical_pages;
+    // The instance this fixture is the gold model for. It changes NO fp32 value below -- the query,
+    // the cache, the scales and `expected` are identical for both instances, because the device's
+    // arithmetic up to the output cast is identical -- and it selects (a) the format every 16-bit
+    // input is encoded in and every 16-bit output is compared in, and (b) Launch::element_type, so
+    // one fixture cannot be built for one instance and launched at the other.
+    Element element;
     std::vector<float> query, scales, expected;
     std::vector<std::uint8_t> key, value;
     std::vector<std::int32_t> table, lengths;
-    Fixture(int n, int b, int h, int g, int block)
+    Fixture(int n, int b, int h, int g, int block, Element e = Element::kFp16)
         : context(n), requests(b), kv_heads(h), group_heads(g), page_tokens(block),
-          pages(block > 0 && n > 0 ? (n + block - 1) / block : 0), physical_pages(2 * b * pages + 2)
+          pages(block > 0 && n > 0 ? (n + block - 1) / block : 0), physical_pages(2 * b * pages + 2),
+          element(e)
     {
         // n is no longer required to divide the page: see RAGGED CONTEXTS above. The page size
         // still has to be 64 or 128, because that is what valid_launch admits and what the
@@ -246,10 +336,19 @@ struct Fixture {
         return (tile + 3 * request + 5 * head + col) % 8;
     }
     // The raw-query inputs. `raw_query` is the ORIGINAL-basis query whose rotation is the
-    // pre-rotated `query` above: Pi is an involution, so that is simply Pi(query). It is
-    // fp16-exact and this throws rather than rounding, because the whole point of building it
-    // this way is that the device's prologue reproduces `query` bit for bit and the attention
-    // oracle therefore still applies at output stage 0.
+    // pre-rotated `query` above: Pi is an involution, so that is simply Pi(query). It is encoded in
+    // THIS FIXTURE'S element format and this throws rather than rounding, because the whole point
+    // of building it this way is that the device's prologue reproduces `query` bit for bit and the
+    // attention oracle therefore still applies at output stage 0.
+    //
+    // IT IS EXACT IN BOTH FORMATS, and that is a measured property of this basis rather than a
+    // lucky margin: `query` is the constant vector (coefficient / 256) * 1 with coefficient in
+    // {1,2,3}, and Pi of a constant vector is +-coefficient * k / 2048 for integer k = (H s)_i / 2,
+    // so the entries are small integers over a power of two. Over the fixture's own sign vector the
+    // widest significand that actually occurs is 7 bits -- which bf16's 7 stored bits hold exactly,
+    // as fp16's 10 already did. 7 is the MEASURED width, not a bound on it: a different sign
+    // function or a non-constant query could push it to 9 and break bf16 while leaving fp16 intact,
+    // which is exactly why this check is an assertion in the gold model and not a comment.
     std::vector<std::uint16_t> raw_query(const RawQueryBasis& basis) const
     {
         if (basis.dim != static_cast<int>(fd::kHeadSize))
@@ -258,28 +357,32 @@ struct Fixture {
         const std::size_t rows = query.size() / fd::kHeadSize;
         for (std::size_t row = 0; row < rows; ++row) {
             const std::vector<float> image = basis.apply(query.data() + row * fd::kHeadSize);
-            for (std::size_t c = 0; c < fd::kHeadSize; ++c) {
-                const std::uint16_t bits = ascend_micro::sim::float_to_half_rne(image[c]);
-                if (ascend_micro::sim::half_to_float(bits) != image[c])
-                    throw std::runtime_error("the raw query is not fp16-exact");
-                out[row * fd::kHeadSize + c] = bits;
-            }
+            for (std::size_t c = 0; c < fd::kHeadSize; ++c)
+                out[row * fd::kHeadSize + c] = exact_input_bits(element, image[c], "the raw query");
         }
         return out;
     }
 
-    // Gate logits for TurboQuantOutputStage::kGated, fp16 and exactly representable. Spread
+    // Gate logits for TurboQuantOutputStage::kGated, exactly representable in both formats. Spread
     // over [-2, 2] in quarters so the sigmoid is neither saturated nor constant, and nowhere
-    // near kGateLogitFloor, which is a clamp this fixture is not trying to exercise.
+    // near kGateLogitFloor, which is a clamp this fixture is not trying to exercise. A quarter-step
+    // in [-2, 2] needs at most 3 significand bits, so both formats hold every logit exactly and
+    // `gate_widened` below is the same number as `gate_value` -- asserted, not assumed.
     static float gate_value(std::size_t index)
     { return static_cast<float>(static_cast<int>(index % 17) - 8) * 0.25f; }
     std::vector<std::uint16_t> gate_logits() const
     {
         std::vector<std::uint16_t> out(query.size(), 0);
         for (std::size_t i = 0; i < out.size(); ++i)
-            out[i] = ascend_micro::sim::float_to_half_rne(gate_value(i));
+            out[i] = exact_input_bits(element, gate_value(i), "a gate logit");
         return out;
     }
+    // The gate logit AS THE DEVICE SEES IT: the stored word of this fixture's format, widened. The
+    // kGated oracle divides by 1 + exp(-this), not by 1 + exp(-gate_value), so that a format which
+    // could not hold a logit exactly would produce a wrong oracle rather than a silently different
+    // one. (With the quarter-step logits above the two coincide, and exact_input_bits enforces it.)
+    float gate_widened(std::size_t index) const
+    { return widen_bits(element, exact_input_bits(element, gate_value(index), "a gate logit")); }
 
     // The expected output for one (token, query head) row under a given output stage.
     //   0 kRotatedBasis: the context as the pre-rotated entry emits it
@@ -293,7 +396,7 @@ struct Fixture {
         std::vector<float> out = basis.apply(source);
         if (output_stage == 1) return out;
         for (std::size_t c = 0; c < fd::kHeadSize; ++c) {
-            const float g = gate_value(row * fd::kHeadSize + c);
+            const float g = gate_widened(row * fd::kHeadSize + c);
             out[c] = static_cast<float>(static_cast<double>(out[c]) /
                                         (1.0 + std::exp(-static_cast<double>(g))));
         }
@@ -318,6 +421,7 @@ struct Fixture {
     {
         if (splits < 1 || splits > 8) throw std::invalid_argument("fused-opt splits must be 1..8");
         fd::Launch c;
+        c.element_type = static_cast<std::uint32_t>(element);
         c.tokens = requests; c.kv_heads = kv_heads; c.heads = kv_heads * group_heads;
         c.block_size = page_tokens; c.max_blocks = pages; c.splits = splits;
         c.heads_per_task = group_heads; c.fused_context_limit = 0;

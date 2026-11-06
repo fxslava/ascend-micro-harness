@@ -83,6 +83,21 @@ struct FusedOptRig {
     static constexpr int kUlpBudgetRotatedBasis = 1;
     static constexpr int kUlpBudgetRestaged = 8;
 
+    // THE SAME RESIDUAL, IN THE OTHER FORMAT'S UNIT. A budget in ULPs is a budget in the output
+    // format's own quantum, and bf16's quantum is 8x fp16's (7 stored significand bits against
+    // 10). So the restaged budget above, which bounds an ABSOLUTE fp32 residual coming out of a
+    // 256-term rotation, is 8 fp16 ULPs and therefore 1 bf16 ULP of the same residual -- not 8.
+    // Carrying 8 across would silently widen the bf16 gate eightfold. Stage 0 cannot go below 1,
+    // which is the correctly-rounded-or-adjacent claim, so it stays 1 in both.
+    //
+    // Both numbers are still FIRST-RUN budgets on both formats, for the same reason: there is no
+    // NPU on the host this was written on, so neither has been measured on hardware. The rig
+    // prints the worst ULP it saw on every raw-query launch, in the format it saw it in.
+    static constexpr int kBudgetRestagedFor(fused_decode_opt_test::Element e)
+    {
+        return e == fused_decode_opt_test::Element::kBf16 ? 1 : kUlpBudgetRestaged;
+    }
+
     const fused_decode_opt_test::Fixture& f;
     FusedOptMode mode;
     fused_decode_opt_test::RawQueryBasis basis;
@@ -185,7 +200,8 @@ struct FusedOptRig {
 
         // 2. The context, against the oracle for this output stage.
         const auto image = out.Download();
-        const int budget = mode.post_rotate == 0 ? kUlpBudgetRotatedBasis : kUlpBudgetRestaged;
+        const int budget =
+            mode.post_rotate == 0 ? kUlpBudgetRotatedBasis : kBudgetRestagedFor(f.element);
         const std::size_t rows = f.query.size() / 256;
         for (std::size_t row = 0; row < rows; ++row) {
             const std::vector<float> want = f.expected_row(basis, row, mode.post_rotate);
@@ -193,22 +209,31 @@ struct FusedOptRig {
                 const std::size_t i = row * 256 + c;
                 std::uint16_t bits;
                 std::memcpy(&bits, image.data() + FusedOptBuffer::guard + 2 * i, 2);
-                const auto expected = ascend_micro::sim::float_to_half_rne(want[c]);
+                // The oracle word in the INSTANCE'S OWN FORMAT, compared against the stored
+                // 16-bit word at its original position. REFINEMENT_OF_COMBAT_KERNELS.md section 3
+                // asks for exactly that on bf16: nothing here widens the device's word before
+                // comparing, so a halfword swap cannot pass by presenting a plausible half.
+                const auto expected = fused_decode_opt_test::reference_bits(f.element, want[c]);
                 // Both are positive finite normals at stage 0; at stages 1 and 2 the sign can
                 // differ, so compare the rounded images rather than the raw bit distance.
                 const int ulp = std::abs(int(bits) - int(expected));
                 if (ulp > worst_ulp) worst_ulp = ulp;
                 if (ulp > budget) {
                     std::fprintf(stderr,
-                        "fused-opt mismatch element=%zu stage=%u got=%g expected=%g bits=%04x "
-                        "ref=%04x (%d ULP over %d)\n", i, mode.post_rotate,
-                        ascend_micro::sim::half_to_float(bits), double(want[c]), bits, expected,
-                        ulp, budget);
+                        "fused-opt mismatch %s element=%zu stage=%u got=%g expected=%g bits=%04x "
+                        "ref=%04x (%d ULP over %d)\n",
+                        fused_decode_opt_test::element_name(f.element), i, mode.post_rotate,
+                        fused_decode_opt_test::widen_bits(f.element, bits), double(want[c]), bits,
+                        expected, ulp, budget);
                     throw std::runtime_error("fused-opt CPU attention reference failed");
                 }
             }
         }
-        for (std::size_t i = f.query.size() * 2; i < out.bytes; ++i)
+        // Both instances emit 16-bit elements (fd::element_bytes), so the inactive-output
+        // window starts at the same byte for both.
+        for (std::size_t i = f.query.size() * ascend_micro::fused_decode_opt::element_bytes(
+                                 static_cast<std::uint32_t>(f.element));
+             i < out.bytes; ++i)
             tq_npu::require(image[FusedOptBuffer::guard + i] == 0xAA,
                             "fused-opt inactive output changed");
 
@@ -219,9 +244,9 @@ struct FusedOptRig {
         if (!mode.pre_rotate)
             std::fprintf(stderr,
                          "fused-opt basis: raw-query entry, prologue %s, output stage %u, "
-                         "worst fp16 ULP %d against a budget of %d\n",
+                         "worst %s ULP %d against a budget of %d\n",
                          mode.cube_chunk ? "Cube chunk" : "vector cores", mode.post_rotate,
-                         worst_ulp, budget);
+                         fused_decode_opt_test::element_name(f.element), worst_ulp, budget);
 
         const auto partials = workspace.Download();
         if (config.splits > 1) {

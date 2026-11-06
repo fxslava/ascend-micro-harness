@@ -14,6 +14,28 @@ namespace fd = ascend_micro::fused_decode_opt;
 namespace tq = vllm_ascend::turboquant;
 namespace tq_tiling = ascend_micro::fused_decode;
 
+// The output element format, as the pair of functions the oracle comparison needs: the
+// correctly-rounded 16-bit word of an fp32 expectation, and the widening used ONLY to print what
+// the device produced.
+//
+// REFINEMENT_OF_COMBAT_KERNELS.md section 3: the bf16 check is on the 16-bit word AT ITS ORIGINAL
+// POSITION. That is what the comparison below does for both formats -- `actual[h * dim + d]`
+// against `encode(expected)` -- and it is why neither branch widens the device's word first. A
+// check that compared floats after widening, or that accepted either half of an fp32 word, would
+// pass on a halfword-swapped output; comparing the stored word cannot.
+//
+// For both formats the fixture's results are positive finite normals, so the unsigned bit distance
+// between two words IS their ULP distance: no sign wrap and no subnormal case to fold in.
+struct OutputFormat {
+    const char* name;
+    std::uint16_t (*encode)(float);
+    float (*decode)(std::uint16_t);
+};
+constexpr OutputFormat kFp16Output{"fp16", &ascend_micro::sim::float_to_half_rne,
+                                   &ascend_micro::sim::half_to_float};
+constexpr OutputFormat kBf16Output{"bf16", &ascend_micro::sim::float_to_bfloat16_rne,
+                                   &ascend_micro::sim::bfloat16_to_float};
+
 int main(int argc, char** argv)
 {
     try {
@@ -23,6 +45,15 @@ int main(int argc, char** argv)
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (i + 1 >= argc) throw std::runtime_error("missing CLI value");
+            // --dtype takes a NAME, not a number, so a rung cannot select the wrong element type
+            // by an off-by-one in the ladder script.
+            if (arg == "--dtype") {
+                const std::string value = argv[++i];
+                if (value == "fp16") c.element_type = 0;
+                else if (value == "bf16") c.element_type = 1;
+                else throw std::runtime_error("unknown --dtype (want fp16 or bf16)");
+                continue;
+            }
             const auto n = static_cast<unsigned>(std::stoul(argv[++i]));
             if (arg == "--tiles") tiles = n;
             else if (arg == "--tail-rows") tail_rows = n;
@@ -36,6 +67,7 @@ int main(int argc, char** argv)
             else if (arg == "--varied") varied = n != 0;
             else throw std::runtime_error("unknown CLI option");
         }
+        const OutputFormat& out_format = c.element_type == 1 ? kBf16Output : kFp16Output;
         if (!tail_rows || tail_rows > 64 || (hole != UINT32_MAX && hole >= (tiles + 1) / 2) ||
             !tiles || tiles > 16 || !repeats || (c.probe_page >= 8 && c.probe_page != UINT32_MAX) ||
             c.probe_tile >= 2 || !c.heads || c.heads > 32)
@@ -55,8 +87,11 @@ int main(int argc, char** argv)
         camodel::GuardedDeviceBuffer scales(pages * page_rows * scale_slot * 4);
         camodel::GuardedDeviceBuffer table(32), lengths(32), modes(32);
         camodel::GuardedDeviceBuffer workspace(round32(c.heads * c.splits * (dim + 16) * 4 + 4096));
-        // Extra inactive rows are an output-canary gate.
-        camodel::GuardedDeviceBuffer output(round32((c.heads + 2) * dim * 2));
+        // Extra inactive rows are an output-canary gate. Both element types are 16-bit
+        // (fd::element_bytes), so one size serves both -- stated through the header's own
+        // accessor rather than a literal 2, so a third type would have to move both together.
+        camodel::GuardedDeviceBuffer output(
+            round32((c.heads + 2) * dim * fd::element_bytes(c.element_type)));
         // The host tiling descriptors. An input like any other: guard-banded, canary-flooded
         // outside its payload, snapshotted before upload and compared bitwise after the run.
         camodel::GuardedDeviceBuffer tiling(round32(tq_tiling::decode_tiling_bytes_for(c)));
@@ -144,13 +179,33 @@ int main(int argc, char** argv)
                     }
                 }
                 const float expected = denominator ? static_cast<float>(numerator / denominator) : 0;
-                // Compare the independently rounded FP16 oracle, including
+                // Compare the independently rounded oracle in the OUTPUT's own format, including
                 // odd tile counts whose rational average is not representable.
+                //
+                // THE BUDGET IS THE SAME FOR BOTH FORMATS, and it is not relaxed for bf16. The
+                // exact rungs demand 0 ULP of the output format; only --varied, whose Exp and
+                // reductions carry their own documented tolerance, allows 1.
+                //
+                // bf16's 7 stored significand bits against fp16's 10 make the grid coarser, so
+                // the question is whether these rungs' exact rationals still land where the
+                // device's fp32 result rounds to the same word. They do, and with MORE room than
+                // fp16 has, not less: tiles=1 and every isolated page canary are the integers
+                // 1..15, exact in both formats, and the worst ragged rung sits 2074 fp32 ULPs
+                // from the nearest bf16 rounding midpoint against 80 fp32 ULPs from the nearest
+                // fp16 one -- a coarser grid puts the midpoints further apart, which is the right
+                // way round. The fp16 leg of this same comparison already passes at 0 ULP on
+                // CAModel, so bf16 is the easier of the two and a failure here would be a real
+                // defect rather than a quantisation artefact.
+                //
+                // scripts/check_fused_decode_bf16_margins.py derives those margins per rung and
+                // is the thing to re-run if either fixture's arithmetic changes.
                 const auto bits = actual[h * dim + d];
-                const float got = ascend_micro::sim::half_to_float(bits);
-                const int ulp = std::abs(int(bits) - int(ascend_micro::sim::float_to_half_rne(expected)));
+                const std::uint16_t reference = out_format.encode(expected);
+                const int ulp = std::abs(int(bits) - int(reference));
                 if (ulp > (varied ? 1 : 0)) {
-                    std::fprintf(stderr, "mismatch h=%u d=%u got=%g expected=%g bits=%04x\n", h, d, got, expected, bits);
+                    std::fprintf(stderr,
+                        "mismatch %s h=%u d=%u got=%g expected=%g bits=%04x ref=%04x (%d ULP)\n",
+                        out_format.name, h, d, out_format.decode(bits), expected, bits, reference, ulp);
                     throw std::runtime_error("exact context oracle failed");
                 }
             }
@@ -162,9 +217,10 @@ int main(int argc, char** argv)
                 if (inputs[i]->host != snapshots[i]) throw std::runtime_error("input bytes changed");
             }
         }
-        std::printf("PASS fused_decode_opt tiles=%u page=%u tile=%u heads=%u splits=%u grid=%u repeats=%u elements=%u tail_rows=%u hole=%u comparison=%s inputs=unchanged guards=0x7FC0BEEF-intact\n",
-            tiles, c.probe_page, c.probe_tile, c.heads, c.splits, c.grid, repeats, c.heads * dim,
-            tail_rows, hole, varied ? "fp16_1ulp" : "exact");
+        std::printf("PASS fused_decode_opt dtype=%s tiles=%u page=%u tile=%u heads=%u splits=%u grid=%u repeats=%u elements=%u tail_rows=%u hole=%u comparison=%s inputs=unchanged guards=0x7FC0BEEF-intact\n",
+            out_format.name, tiles, c.probe_page, c.probe_tile, c.heads, c.splits, c.grid, repeats,
+            c.heads * dim, tail_rows, hole,
+            varied ? "1ulp_of_output_format" : "exact_0ulp_at_stored_word");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL fused_decode_opt: %s\n", e.what()); return 1;
     }

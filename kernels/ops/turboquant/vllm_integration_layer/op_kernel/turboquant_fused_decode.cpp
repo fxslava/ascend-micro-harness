@@ -1120,9 +1120,27 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(
 
 // kv4fp8 only: the NZ-tiled ring ingest the schedule is built on, and the one mode the fused decode is
 // validated in at all (TURBOQUANT_TESTS.md 13.25).
+//
+// TWO ELEMENT TYPES, ONE MODE. The template's `scalar_t` is the QUERY and OUTPUT element type, not the
+// cache format: the cache stays KV4/FP8 in both instances, so MODE, the codec, the ring ingest, the
+// Cube's score and context operands and every tile descriptor are the same objects in both. What
+// scalar_t reaches is (a) the output GM tensor and the one UB row that is cast into it before the burst
+// (WriteHeads, vector/turboquant_vector_service.h), (b) the same pair in both Split-K reducers, and (c)
+// the raw query and gate the basis service reads, plus its Cube chunk operand
+// (cube/turboquant_query_basis.h, which documents why that operand follows scalar_t rather than staying
+// fp16). The intervening arithmetic -- scores, the online softmax recurrence, the probabilities, the
+// accumulator, the Split-K partials and their merge -- is fp32 in both, so the bf16 instance is the fp16
+// instance with a different final rounding and a different input rounding, not a different schedule.
+// That is also why the UB map does not move: both types are 16-bit
+// (../include/turboquant_fused_decode_opt.hpp pins kUbEnd, kBasisUbBytes and kReducerUbBytes, and the
+// sizeof(scalar_t) == 2 static_asserts on both services hold it).
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(turboquant_mm_fused_decode_opt_kv4fp8_half, TurboQuantMode::KV4_FP8, half)
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half,
                                                 TurboQuantMode::KV4_FP8, half)
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(turboquant_mm_fused_decode_opt_kv4fp8_bf16, TurboQuantMode::KV4_FP8,
+                                      bfloat16_t)
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16,
+                                                TurboQuantMode::KV4_FP8, bfloat16_t)
 
 #elif defined(ASCEND_MICRO_CANN_LAUNCH)
 #include "kernel_operator.h"
@@ -1132,6 +1150,17 @@ extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_kv4fp8_half
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
     uint32_t, uint32_t, uint32_t, float, float);
 extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half(
+    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
+    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float);
+// The bf16 instances. Same signature, same tiling, same cache format: only the query/output
+// element type differs, so a caller swaps one symbol for the other and changes nothing else.
+extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_kv4fp8_bf16(
+    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, float, float);
+extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16(
     GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
     GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
@@ -1157,14 +1186,23 @@ void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *st
             numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
             headsPerTask, tasksPerBlock, reduceTasksPerBlock))
         throw std::invalid_argument("unsupported fused decode geometry or incomplete task coverage");
-    if (type != AscendType::FP16 || blockDim == 0 ||
+    if (blockDim == 0 ||
         static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
         return;
     }
-    turboquant_mm_fused_decode_opt_kv4fp8_half<<<blockDim, nullptr, stream>>>(
-        queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
-        tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
-        tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+    // Both element types reach the device through this one dispatch. The tiling, the geometry
+    // guards above and the cache format are shared; only the kernel symbol differs.
+    if (type == AscendType::FP16) {
+        turboquant_mm_fused_decode_opt_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+            queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
+            tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
+            tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+    } else if (type == AscendType::BF16) {
+        turboquant_mm_fused_decode_opt_kv4fp8_bf16<<<blockDim, nullptr, stream>>>(
+            queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
+            tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
+            tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+    }
 }
 
 void turboquant_mm_fused_decode_opt_raw_query_impl(
@@ -1185,15 +1223,26 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
             numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
             headsPerTask, tasksPerBlock, reduceTasksPerBlock))
         throw std::invalid_argument("unsupported fused decode geometry or incomplete task coverage");
-    if (type != AscendType::FP16 || blockDim == 0 ||
+    if (blockDim == 0 ||
         static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
         return;
     }
-    turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half<<<blockDim, nullptr, stream>>>(
-        query, piSigns, rotTables, h16, gate, queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens,
-        modeTables, workspace, output, tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq,
-        numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock, prologueVectorsPerBlock,
-        prologueCubeChunkVectors, outputStage, fusedContextLimit, scale, invSqrtLen);
+    // `query` and `gate` are scalar_t and `queryRot` is the fp32 image the prologue writes, in both
+    // instances: the basis service's Cube chunk operand follows scalar_t but the H16 table in GM stays
+    // fp16 for both, so the raw-query ABI is element-type agnostic apart from the query and gate buffers.
+    if (type == AscendType::FP16) {
+        turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+            query, piSigns, rotTables, h16, gate, queryRot, keyCache, valueCache, scaleCache, blockTables,
+            contextLens, modeTables, workspace, output, tiling, numTokens, numHeads, numKvHeads, headSize,
+            blockSize, maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
+            prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale, invSqrtLen);
+    } else if (type == AscendType::BF16) {
+        turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16<<<blockDim, nullptr, stream>>>(
+            query, piSigns, rotTables, h16, gate, queryRot, keyCache, valueCache, scaleCache, blockTables,
+            contextLens, modeTables, workspace, output, tiling, numTokens, numHeads, numKvHeads, headSize,
+            blockSize, maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
+            prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale, invSqrtLen);
+    }
 }
 
 }
@@ -1206,7 +1255,8 @@ extern "C" void launch_fused_decode_opt_raw_query(void* stream,
     const ascend_micro::fused_decode_opt::RawQueryBuffers* b)
 {
     if (!c || !b) throw std::invalid_argument("null fused decode raw-query launch descriptor");
-    vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl(4, vllm_ascend::AscendType::FP16,
+    vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl(4,
+        ascend_micro::fused_decode_opt::ascend_type_of(c->element_type),
         stream, c->grid, b->raw_query, b->pi_signs, b->rot_tables, b->h16, b->gate,
         b->decode.query, b->decode.key, b->decode.value, b->decode.scales, b->decode.block_table,
         b->decode.context_lengths, b->decode.mode_tables, b->decode.workspace, b->decode.output,
@@ -1222,7 +1272,8 @@ extern "C" void launch_fused_decode_opt(void* stream,
     const ascend_micro::fused_decode_opt::Buffers* b)
 {
     if (!c || !b) throw std::invalid_argument("null fused decode launch descriptor");
-    vllm_ascend::turboquant_mm_fused_decode_opt_impl(4, vllm_ascend::AscendType::FP16,
+    vllm_ascend::turboquant_mm_fused_decode_opt_impl(4,
+        ascend_micro::fused_decode_opt::ascend_type_of(c->element_type),
         stream, c->grid, b->query, b->key, b->value, b->scales, b->block_table,
         b->context_lengths, b->mode_tables, b->workspace, b->output, b->tiling, c->tokens,
         c->heads, c->kv_heads, c->head_size, c->block_size, c->max_blocks, c->splits,

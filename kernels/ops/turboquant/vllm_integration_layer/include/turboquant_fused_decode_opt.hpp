@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <stdexcept>
 #include "turboquant_fused_decode.hpp"
 #include "../op_kernel/common/types.h"
 #include "../op_kernel/common/turboquant_layout.h"
@@ -52,6 +53,16 @@ constexpr std::uint32_t kUbEnd = ub_end();
 // that they agree.
 constexpr std::uint32_t kTransientPoolBytes = kUbSizes[15] + kUbSizes[16] + kUbSizes[17];
 static_assert(kTransientPoolBytes == 32768, "the transient pool, pinned on both sides");
+// NONE OF THESE MOVE WITH THE ELEMENT TYPE, and that is the whole reason the bf16 instance of the
+// operator is a type substitution rather than a second UB map. Every `2` below is a 16-bit extent:
+// in kBasisUbBytes, the basis service's raw-query/gate staging buffer and its Cube chunk operand
+// (`8 * 256 * (2 + 4 + 2 + 4)` is inBuf_, floatBuf_, halfBuf_, pairBuf_ over kScratchRows * headSize);
+// in kReducerUbBytes, the reducer's `256 * 2` output row. sizeof(half) == sizeof(bfloat16_t) == 2, so
+// both instances allocate the identical list at the identical offsets -- which matters more here than
+// it looks, because the Cube's dual-destination Fixpipe names the vector cores' landings by OFFSET on
+// three cores and nothing in the toolchain checks that the three agree. Both services carry a
+// `sizeof(scalar_t) == 2` / `sizeof(OperandT) == 2` static_assert so a third element type cannot
+// quietly reach this map; it would have to come here first.
 constexpr std::uint32_t kBasisUbBytes = 8 * 256 * (2 + 4 + 2 + 4) + 256 * 4 +
     (7 * 256 + 2 * 256 + 16) * 4 + (2 * 256 + 256 + 64 + 8 + 8 * 256) * 4;
 constexpr std::uint32_t kReducerUbBytes = (2 * 256 + 16) * 4 + 5 * 8 * 4 +
@@ -109,9 +120,32 @@ struct Launch {
     //                               1 + exp(-gate). Only 1 and 2 read the gate buffer.
     std::uint32_t prologue_vectors_per_block = 0, prologue_cube_chunk_vectors = 0;
     std::uint32_t output_stage = 0;
+    // The QUERY and OUTPUT element type, as vllm_ascend::AscendType: 0 = FP16, 1 = BF16. It does NOT
+    // name the cache format, which is the launch's MODE and stays KV4/FP8 either way, and it does not
+    // change the tiling: the descriptors `build_decode_tiling` produces are counts, page indices and
+    // row bases, so one tiling buffer serves both instances of the operator. What it selects is which
+    // kernel symbol the launcher dispatches to, and with it the type of `Buffers::output`, and of
+    // `RawQueryBuffers::raw_query` and `::gate` on the raw-query entry. Default 0, so a caller that
+    // predates this field keeps the fp16 behaviour it had.
+    std::uint32_t element_type = 0;
     // Diagnostic ABI only: production launcher never receives these fields.
     std::uint32_t probe_page = UINT32_MAX, probe_tile = 0;
 };
+
+// The element type as the operator's own enum, refusing anything the kernel has no instance for
+// rather than returning a value the `_impl` dispatch would silently drop on the floor. A launch that
+// quietly computes nothing is the exact failure this operator's audit trail exists to prevent.
+inline vllm_ascend::AscendType ascend_type_of(std::uint32_t element_type)
+{
+    switch (element_type) {
+    case 0: return vllm_ascend::AscendType::FP16;
+    case 1: return vllm_ascend::AscendType::BF16;
+    default: throw std::invalid_argument("fused decode launch with no kernel instance for its element type");
+    }
+}
+// How wide one output element is, for a caller sizing its output or gate buffer. Both instances are
+// 16-bit; see the kBasisUbBytes note above for why that is load-bearing rather than incidental.
+constexpr std::uint32_t element_bytes(std::uint32_t) { return 2; }
 struct Buffers {
     void *query, *key, *value, *scales, *block_table, *context_lengths;
     void *mode_tables, *workspace, *output;
@@ -124,9 +158,11 @@ struct Buffers {
 };
 
 // The raw-query entry's inputs: the pre-rotated entry's buffers plus the original-basis query
-// and the basis tables. `raw_query` is scalar_t -- fp16 for the kv4fp8 instance -- while
-// `decode.query` is the fp32 rotated image the prologue WRITES and the decode then reads, so a
-// raw-query launch needs both and they are not interchangeable.
+// and the basis tables. `raw_query` and `gate` are scalar_t -- fp16 or bf16, as Launch::element_type
+// says -- while `decode.query` is the fp32 rotated image the prologue WRITES and the decode then
+// reads, so a raw-query launch needs both and they are not interchangeable. `h16` is fp16 for BOTH
+// element types: its entries are +-1, it is a shared input, and the kernel converts it on ingest
+// where the Cube chunk operand is not fp16 (op_kernel/cube/turboquant_query_basis.h).
 struct RawQueryBuffers {
     void *raw_query, *pi_signs, *rot_tables, *h16, *gate;
     Buffers decode;

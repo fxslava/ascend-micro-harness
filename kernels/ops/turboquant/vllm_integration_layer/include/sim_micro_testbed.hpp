@@ -162,6 +162,21 @@ inline std::uint16_t float_to_bfloat16_rne(float value)
     return std::uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
 
+// bf16 is the TOP half of the fp32 word, so widening is a shift and nothing else: no exponent
+// rebias, no subnormal loop, and every bf16 value -- subnormals and NaN payloads included -- is
+// an exact fp32 value. The asymmetry with half_to_float above is the format's, not an omission.
+//
+// REFINEMENT_OF_COMBAT_KERNELS.md section 3 asks that a bf16 output be checked at its original
+// WORD POSITION, which is why callers compare the device's std::uint16_t against
+// float_to_bfloat16_rne(expected) directly and use this only to print what they got: a comparison
+// that widened both sides first would accept a halfword swap, since the low half of a correct
+// fp32 result is not the value and would not round-trip -- but a comparison that accepted either
+// half would. The bit distance between two bf16 words of the same sign IS their ULP distance.
+inline float bfloat16_to_float(std::uint16_t b)
+{
+    return bits_float(std::uint32_t(b) << 16);
+}
+
 // Independent scalar oracle: row-major X and canonical Sylvester H16.
 inline std::array<float, 256> golden_hadamard16(const std::uint16_t* x)
 {
