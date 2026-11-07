@@ -1,0 +1,86 @@
+ok   check 0: the audited core issued Reg-vector instructions
+ok   check 0: the audited core issued MTE2 bursts
+ok   check 0: the audited core issued MTE3 bursts
+ok   check 1: no cross-core flag instruction was issued (none)
+ok   check 2: SET_FLAG == WAIT_FLAG per (pipe, trigger, id) ([])
+     routes: [(('MTE2', 'VEC', 0), 3), (('MTE2', 'VEC', 1), 1), (('MTE3', 'MTE2', 0), 2), (('MTE3', 'SCALAR', 0), 2), (('MTE3', 'VEC', 0), 3), (('VEC', 'MTE2', 0), 3), (('VEC', 'MTE3', 0), 2), (('VEC', 'MTE3', 1), 1)]
+ok   check 2: no reserved flag id 6 or 7 is used ([])
+ok   check 2b: every intra-core SET precedes its WAIT in program order ([])
+ok   check 3: the companion Vector core issued no Reg-vector work (0)
+ok   check 3: the companion Vector core issued no outflow (0)
+     companion core census: empty
+ok   check 4: RV_VMULA 48 == 6 stages x 4 regs x 2 planes x 1 rows = 48
+ok   check 4: RV_VSELR 60 == 48 butterfly + 12 absmax = 60
+ok   check 5: the core both read and wrote Global Memory
+ok   check 5: every re-written Global Memory address was read first ([])
+     4 GM->UB loads, 5 UB->GM stores, 1 address(es) both read and written
+       id    211 tick    1861 MTE3  UB->OUT gm 0x164b90c40
+       id    225 tick    2432 MTE2  OUT->UB gm 0x164b90440
+       id    649 tick    3486 MTE2  OUT->UB gm 0x164b6d840
+       id   1155 tick    4823 MTE2  OUT->UB gm 0x164b6e240
+       id   1169 tick    4825 MTE2  OUT->UB gm 0x164b84e40
+       id    800 tick    4906 MTE3  UB->OUT gm 0x164b74c40
+       id   1106 tick    4907 MTE3  UB->OUT gm 0x164b8f340
+       id   1523 tick    5872 MTE3  UB->OUT gm 0x164b84e40
+       id   1556 tick    5873 MTE3  UB->OUT gm 0x164b8fb40
+ok   check 5: 4 loads == 1 pi_signs + 3 x 1 (key rows, value rows, strip) = 4
+ok   check 5: 5 stores == 1 probe + 2 x 1 (key page, strip) + 2 x 1 (one scale DataCopyPad per token per plane) = 5
+
+engine        instr      first       last       span
+SCALAR          698        739       6724       5985
+RVECEX          379       1777       5845       4068
+RVECST           77       1783       5854       4071
+RVECLD           61       1791       5819       4028
+FLOWCTRL         53       1231       6727       5496
+PUSHQ            29       1227       5766       4539
+RVECSU           27       1774       5818       4044
+MTE3             16       1229       5873       4644
+MTE2             14       1230       5275       4045
+VEC              13       1292       5274       3982
+RVECLP           13       1773       5801       4028
+
+Reg-vector and DMA mnemonic census (dispatch):
+  RV_VSELR                 60
+  RV_SEND                  50
+  RV_VMULA                 48
+  RV_VST                   36
+  RV_VAND                  34
+  RV_VLD                   30
+  RV_VBR                   30
+  RV_PLT                   26
+  RV_VLDI                  20
+  RV_VOR                   20
+  RV_VMUL                  18
+  RV_VMAX                  18
+  SET_FLAG                 17
+  WAIT_FLAG                17
+  RV_VLOOP                 13
+  RV_VXOR                  13
+  RV_VCVT_F2F              12
+  RV_VSHLI                 12
+  RV_VSUB                  12
+  RV_VMULS                 12
+  VF                       10
+  RV_VCVT_F2I              10
+  MOV_SRC_TO_DST_ALIGN      9
+  RV_SMOV                   9
+  RV_VADD                   8
+  RV_VABS_FP                8
+  RV_VMINS                  8
+  RV_VSTI                   8
+  RV_PSET                   7
+  RV_SMOVI                  6
+  RV_VINTLV                 5
+  RV_VDUPS                  4
+  RV_SMEM_BAR               4
+  RV_VCVT_I2F               4
+  RV_VSHLS                  4
+  RV_VCI                    2
+  RV_VCMP_EQ                2
+  RV_VSEL                   2
+  RV_SMOVK                  2
+
+whole-dump dispatch span: 5988 model ticks -- fill plus drain over every launch, NOT a throughput figure
+completed-log instructions: 1359
+
+scatter trace audit: PASS

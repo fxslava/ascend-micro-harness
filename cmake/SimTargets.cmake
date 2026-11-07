@@ -259,6 +259,17 @@ function(add_ascend_micro_sim_targets)
   add_executable(test_reshape_scatter_probe tests/cpu/test_reshape_scatter_probe.cpp)
   target_compile_options(test_reshape_scatter_probe PRIVATE -Wall -Wextra -Werror)
 
+  # Whether an ingress store can be read back by the fused decode AT ALL. Maps every
+  # (block, kv head, token, channel) through both address functions -- the ingress
+  # writers STRIP contract (tests/common/turboquant_scatter_oracle.hpp) and the fused
+  # decode NZ-TILED NzTiledPackedByte (common/turboquant_layout.h) -- and holds the
+  # finding that they name different bytes, with co-byte matchings that share not one
+  # pair. It PASSES on the layouts disagreeing: see reports/turboquant_e2e_roundtrip.md
+  # for why that is the gate and not a defect, and what would have to change for a real
+  # round trip to exist.
+  add_executable(test_turboquant_kv_layout_bridge tests/cpu/test_turboquant_kv_layout_bridge.cpp)
+  target_compile_options(test_turboquant_kv_layout_bridge PRIVATE -Wall -Wextra -Werror)
+
   # The host oracle that USED to be the AIV-only single-token decode operator's. That
   # operator is deleted -- kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp
   # and its split-K sibling -- and its CAModel probe, boundary runner and unaligned
