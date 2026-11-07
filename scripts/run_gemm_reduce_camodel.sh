@@ -20,7 +20,11 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 toolkit="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.2.0-beta.2}"
 soc="${SOC_VERSION:-Ascend950PR_9599}"
-root="${GEMM_REDUCE_ROOT:-$(mktemp -d /tmp/gemm-reduce.XXXXXX)}"
+# The work root. Persistent and on a local filesystem, not /tmp, which a WSL restart
+# or systemd-tmpfiles deletes along with however many hours went into it.
+# ASCEND_MICRO_WORK_ROOT overrides it; scripts/lib/work_root.sh has the reasoning.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/work_root.sh"
+root="${GEMM_REDUCE_ROOT:-$(ascend_micro_work_dir gemm-reduce)}"
 mkdir -p "$root"
 printf 'Evidence/build root: %s\n' "$root"
 set +u

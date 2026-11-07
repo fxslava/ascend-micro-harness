@@ -54,12 +54,19 @@
 #   bash scripts/run_fused_decode_canary_ladder.sh            # build, then run both legs
 #   bash scripts/run_fused_decode_canary_ladder.sh reuse      # reuse $FUSED_DECODE_OPT_ROOT
 #
-# FUSED_DECODE_OPT_ROOT   evidence/build root (a fresh ext4 mktemp dir by default)
+# FUSED_DECODE_OPT_ROOT   evidence/build root. Defaults to a PERSISTENT directory under
+#                         the work root (scripts/lib/work_root.sh), so a ladder that is
+#                         interrupted can be resumed by running this again with the same
+#                         root: every case that already has its PASS line is skipped.
 # FUSED_DECODE_OPT_RUNNER an already-built runner to drive instead of building one
 # FUSED_DECODE_OPT_DTYPES element types to run; default "fp16 bf16"
 set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-root="${FUSED_DECODE_OPT_ROOT:-$(mktemp -d /tmp/fused-decode-canary.XXXXXX)}"
+# The work root. Persistent and on a local filesystem, not /tmp, which a WSL restart
+# or systemd-tmpfiles deletes along with however many hours went into it.
+# ASCEND_MICRO_WORK_ROOT overrides it; scripts/lib/work_root.sh has the reasoning.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/work_root.sh"
+root="${FUSED_DECODE_OPT_ROOT:-$(ascend_micro_work_dir fused-decode-canary)}"
 export FUSED_DECODE_OPT_ROOT="$root"
 mkdir -p "$root"
 printf 'canary ladder evidence root: %s\n' "$root"

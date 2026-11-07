@@ -13,7 +13,20 @@ set -u
 sim="$toolkit/tools/simulator/${SOC_VERSION:-Ascend950PR_9599}/lib"
 export LD_LIBRARY_PATH="$root/build/lib:$sim:$toolkit/lib64:$toolkit/devlib:${LD_LIBRARY_PATH:-}"
 runner="${FUSED_DECODE_OPT_RUNNER:-$root/build/lib/test_camodel_fused_decode_opt_updated}"
-mkdir "$root/$tag"
+# RESUMABLE, because the full ladder is hours of model time and a dropped shell used to
+# cost all of it. A case whose directory already holds its PASS line is skipped; a case
+# whose directory exists WITHOUT one is an interrupted launch, so it is discarded and
+# redone. FUSED_DECODE_OPT_FORCE=1 re-runs every case regardless.
+#
+# This is what turns a second run of scripts/run_fused_decode_canary_ladder.sh against
+# the same FUSED_DECODE_OPT_ROOT into a resume rather than a restart.
+if [[ -z "${FUSED_DECODE_OPT_FORCE:-}" && -f "$root/$tag/run.log" ]] &&
+        grep -q '^PASS fused_decode_opt' "$root/$tag/run.log"; then
+    printf 'SKIP %s: already passed, see %s/run.log\n' "$tag" "$root/$tag"
+    exit 0
+fi
+rm -rf "$root/$tag"
+mkdir -p "$root/$tag"
 printf '%q ' "$runner" "$@" >"$root/$tag/command.txt"
 printf '\n' >>"$root/$tag/command.txt"
 status=0

@@ -3,7 +3,11 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 toolkit="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.2.0-beta.2}"
 soc="${SOC_VERSION:-Ascend950PR_9599}"
-root="${FUSED_DECODE_OPT_ROOT:-$(mktemp -d /tmp/ascend-fused-decode-opt.XXXXXX)}"
+# The work root. Persistent and on a local filesystem, not /tmp, which a WSL restart
+# or systemd-tmpfiles deletes along with however many hours went into it.
+# ASCEND_MICRO_WORK_ROOT overrides it; scripts/lib/work_root.sh has the reasoning.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/work_root.sh"
+root="${FUSED_DECODE_OPT_ROOT:-$(ascend_micro_work_dir ascend-fused-decode-opt)}"
 mkdir -p "$root"
 printf 'Evidence/build root: %s\n' "$root"
 set +u
@@ -22,7 +26,8 @@ if [[ "${1:-}" != reuse ]]; then
     #
     # The THIRD model, tests/cpu/test_gemm_reduce_model.py for the Cube GEMM reduction that
     # TQ_GEMM_REDUCE=ON selects by default, is deliberately NOT run here. Its batched legs
-    # explore 15 M states and take over half an hour, and it already has its own driver,
+    # explore 15 388 101 states on the deepest rung alone and overran a 1800 s cap when
+    # this ladder's host leg was timed with it in, and it already has its own driver,
     # scripts/run_gemm_reduce_camodel.sh, which is where that operator's evidence lives. Run
     # that ladder when the reduction phase changes; putting it inline here would add half an
     # hour to every canary run for a gate nothing in this ladder can invalidate.

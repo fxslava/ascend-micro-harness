@@ -91,9 +91,10 @@ python3 tests/cpu/test_decode_ring_model.py        # the vector partial reducer
 ```
 
 The first and third are in `scripts/run_fused_decode_opt_camodel.sh`'s host leg, so the
-canary ladder runs them. The second is not: its batched legs explore 15 M states and take
-over half an hour, and it has its own driver, `scripts/run_gemm_reduce_camodel.sh`. Run
-that one whenever the reduction phase changes.
+canary ladder runs them. The second is not: its batched legs explore 15 388 101 states on
+the deepest rung alone and overran a 1800 s cap when the ladder's host leg was timed with
+it in, and it has its own driver, `scripts/run_gemm_reduce_camodel.sh`. Run that one
+whenever the reduction phase changes.
 
 ### 1a. An operator with an outer loop needs the outer loop modelled too
 

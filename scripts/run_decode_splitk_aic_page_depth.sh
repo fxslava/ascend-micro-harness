@@ -21,8 +21,12 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 toolkit="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.2.0-beta.2}"
 soc="${SOC_VERSION:-Ascend950PR_9599}"
-src_dir="${AIC_DEPTH_SRC_DIR:-/tmp/ascend-aic-depth-src}"
-build_dir="${AIC_DEPTH_BUILD_DIR:-/tmp/ascend-aic-depth-build}"
+# The work root. Persistent and on a local filesystem, not /tmp, which a WSL restart
+# or systemd-tmpfiles deletes along with however many hours went into it.
+# ASCEND_MICRO_WORK_ROOT overrides it; scripts/lib/work_root.sh has the reasoning.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/work_root.sh"
+src_dir="${AIC_DEPTH_SRC_DIR:-$(ascend_micro_work_dir ascend-aic-depth-src)}"
+build_dir="${AIC_DEPTH_BUILD_DIR:-$(ascend_micro_work_dir ascend-aic-depth-build)}"
 out_dir="${AIC_DEPTH_OUT:-${repo_dir}/reports/decode_splitk_aic_page_depth}"
 run_timeout="${AIC_DEPTH_TIMEOUT:-3600s}"
 mode="${1:-all}"
