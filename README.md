@@ -350,23 +350,32 @@ is not needed. It is printed by the kernel rather than assumed. Details, the
 trace audit's six checks and what the runs do **not** establish are in
 [`reports/reshape_scatter_aiv.md`](reports/reshape_scatter_aiv.md).
 
-The **single-token decode** operator in
-[`kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp`](kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp)
-is the other one with no Cube at all: `KERNEL_TYPE_AIV_ONLY`, a grid of
-`(request, kv_head)` with one task per physical AIV, and 6 query rows — `H_q /
-H_kv` at `query_tokens_per_req == 1`, which is every decode step whatever the
-batch size, because `B` scales the grid and not the row count. It is the 6-row
-kernel, not the `B = 1` kernel. No L1, no `Mmad`, no `Fixpipe`, no CV transfer,
-no mode-4 flag, no modulo ring: its marked graph is a line, and the trace audit
-asserts that as a **positive** property rather than as an absence of findings.
+The **single-token decode** operator — `turboquant_single_token_decode_aiv.cpp` and
+its Split-K sibling `turboquant_single_token_decode_splitk_aiv.cpp` — is
+**deleted**. It was the other kernel with no Cube at all: `KERNEL_TYPE_AIV_ONLY`, a
+grid of `(request, kv_head)` with one task per physical AIV, and 6 query rows. The
+fused decode operator
+([`kernels/ops/turboquant/vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp`](kernels/ops/turboquant/vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp))
+is the only decode this harness ships now, and every gate the AIV runners carried —
+the isolated logical-page canaries, the exact boundary fixture, the bounded sequence
+sweep, the multi-page block-table loop, the unaligned contexts and the Split-K
+workers — is a rung of its ladder:
 
 ```sh
-bash scripts/run_single_token_decode_camodel.sh         # the spatial sweep, H = 0, 2, 3
-bash scripts/run_single_token_decode_camodel.sh smoke   # one strip, to time a run
-bash scripts/run_single_token_decode_camodel.sh ladder  # every rung
+bash scripts/run_fused_decode_canary_ladder.sh          # every rung, fp16 and bf16
+FUSED_DECODE_OPT_DTYPES=fp16 \
+  bash scripts/run_fused_decode_canary_ladder.sh        # one element type
+bash scripts/run_fused_decode_opt_camodel.sh ladder     # the shorter iteration ladder
 ```
 
-Its score GEMV is **not** the two instructions the roadmap sketched, and the
+What follows is kept because it is about the **microroutine library and the host
+oracle**, both of which survive the operator: `routines/routine_vector_decode_gemv.hpp`
+is still part of the routine catalogue, and
+`tests/common/single_token_decode_oracle.hpp` is still the shared decode geometry and
+FP64 reference that `tests/common/splitk_decode_fixture.hpp` — and through it the AIC
+Split-K probes, the decode tail probe and the decode benchmark — is built on.
+
+That score GEMV was **not** the two instructions the roadmap sketched, and the
 reason is worth carrying here because the failure would have been silent. Both
 sketched lines need a 256-lane operand, and `SIMD_compute/mask.md` bounds a
 32-bit continuous-mode mask at 64 — one 256-byte vector register — then adds
@@ -408,27 +417,34 @@ sharing a scalar maximum is an expected coincidence. The gate is now panel
 inequality, which is what "no two strips are interchangeable" actually means.
 
 ```sh
+# Still a target (cmake/SimTargets.cmake) and still the only test of the shared
+# decode oracle header, now that the kernel it was written for is gone.
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
     tests/cpu/test_single_token_decode_probe.cpp \
     -o bin/test_single_token_decode_probe
 bin/test_single_token_decode_probe
 ```
 
-Its canary protocol floods the inputs as well as the outputs and uploads only
-the active head's **query** rows, which is stronger than the Cube operator's:
-there, head separation comes only from the cache slice and the gate, so a task
-reading another head's query rows would be invisible. `m` is checked
-bit-exactly — a maximum of exactly representable score columns never passes
-through a transcendental — while `l`, `acc` and the egress are bounded in ULP
-and relative terms, because they do. The trace audit also caught its own first
+Its canary protocol — the inputs flooded as well as the outputs, only the active
+head's **query** rows uploaded, `m` checked bit-exactly because a maximum of exactly
+representable score columns never passes through a transcendental, and `l`, `acc` and
+the egress bounded in ULP and relative terms because they do — is now the fused
+decode runner's: `tests/sim/kernel/test_camodel_fused_decode_opt.cpp` floods every GM
+payload with `0x7FC0BEEF`, asserts both exterior guard bands, compares every input
+bitwise after synchronisation, prints the unassigned-byte census as
+`ASSERT_CANARY_INTACT <n> bytes`, and holds the active rows to 0 ULP of the output
+format's stored word at fp16 and at bf16. The trace audit also caught its own first
 prediction being wrong: `RV_VMULA` came back at 288 against 144, and grouping
 by program counter separates the fully unrolled butterfly body from six other
 PCs retiring once per 64-lane register, flanked by an `RV_VMULS` against
 `0xbf800000` and an `RV_VABS_FP` — the 0-ULP FP32 `Div`, three fused
 multiply-adds per register, twice in the epilogue. Details, the per-engine
-census against a pre-registered budget, and what the runs do **not** establish
-— no silicon, no grid past the physical AIV count, no ragged tail, no MTP — are
-in [`reports/single_token_decode_aiv.md`](reports/single_token_decode_aiv.md).
+census against a pre-registered budget, and what those runs did **not** establish
+— no silicon, no grid past the physical AIV count, no ragged tail, no MTP — are in
+[`reports/single_token_decode_aiv.md`](reports/single_token_decode_aiv.md), which is
+retained as the evidence record of a kernel that no longer exists. The deprecation
+itself, and where each of its gates went, is
+[`reports/aiv_decode_deprecation.md`](reports/aiv_decode_deprecation.md).
 
 The **Split-K synchronisation probe** in
 [`kernels/camodel/l2_atomic_synthetic.cpp`](kernels/camodel/l2_atomic_synthetic.cpp)

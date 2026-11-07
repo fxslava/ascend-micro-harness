@@ -48,7 +48,7 @@ if [[ "${1:-}" != reuse ]]; then
     cmake -S "$root/src" -B "$root/build" -DASCEND_HOME_PATH="$toolkit" -DSOC_VERSION="$soc" \
         >"$root/configure.log" 2>&1 || { tail -60 "$root/configure.log"; exit 1; }
     cmake --build "$root/build" --target camodel_gemm_reduce_kernel test_camodel_gemm_reduce \
-        -j4 >"$root/build.log" 2>&1 || { tail -120 "$root/build.log"; exit 1; }
+        -j"${JOBS:-$(nproc)}" >"$root/build.log" 2>&1 || { tail -120 "$root/build.log"; exit 1; }
     printf 'PASS strict device build (-Wall -Werror, %s)\n' "$soc"
 else
     shift

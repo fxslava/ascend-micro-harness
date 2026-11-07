@@ -9,7 +9,7 @@ constexpr int kHeads = 4, kRows = 6, kChannels = 256, kPageTokens = 128;
 
 // The pattern written into every cache slot at or past `seq_len`: 0x7FC0BEEF,
 // the quiet NaN the isolated-canary protocol in
-// tests/camodel/test_camodel_single_token_decode_aiv.cpp already uses. It is
+// the deleted tests/camodel/test_camodel_single_token_decode_aiv.cpp used. It is
 // not decoration. A kernel that masks the dead lanes by MULTIPLYING them by
 // zero still produces NaN, because 0 * NaN is NaN, and the NaN then reaches m,
 // l, Acc and the context. So this constant is what separates a mask that

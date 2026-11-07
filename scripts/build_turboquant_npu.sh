@@ -16,7 +16,7 @@ export ASCEND_HOME_PATH="${toolkit}"
 cmake -S "${repo}" -B "${build}" -G "Unix Makefiles" \
     -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION=Ascend950PR_9599 \
     -DASCEND_HOME_PATH="${toolkit}"
-cmake --build "${build}" --target turboquant_npu_all -j 4
+cmake --build "${build}" --target turboquant_npu_all -j"${JOBS:-$(nproc)}"
 echo "NPU binaries built at: ${build}"
 echo "Hardware only: ${build}/lib/test_turboquant_a8_validation"
 echo "Hardware only: ${build}/lib/bench_turboquant_reshape_and_cache"

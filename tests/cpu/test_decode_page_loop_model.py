@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Explore every engine interleaving of the AIC decode operator's STRIP STREAM.
 
-`test_decode_ring_model.py` covers one page of the two-slot ring on the fused
-AIV kernel and the Split-K reduction. It does not cover
+The fused decode's own structures are modelled elsewhere -- the attention ring in
+`test_fused_decode_opt_model.py`, the Cube GEMM reduction in
+`test_gemm_reduce_model.py` and the vector partial reducer in
+`test_decode_ring_model.py`. None of them covers
 `turboquant_paged_decode_splitk_aic`, where one worker carries (m, l, Acc)
-across page boundaries and three cores rendezvous once per strip.
+across page boundaries and three cores rendezvous once per strip, which is the
+operator this file is about and which the AIV decode deprecation did not touch.
 
 This model is the token/queue gate for the CONTINUOUS strip pipeline that
 replaced the per-page prime/drain schedule. What changed, and why the model had

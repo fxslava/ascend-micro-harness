@@ -31,7 +31,7 @@ if [[ "${1:-all}" != "run-only" ]]; then
     fi
     cmake -S "${repo}" -B "${build}" -DSOC_VERSION=Ascend950PR_9599 \
         -DASCEND_HOME_PATH="${toolkit}"
-    cmake --build "${build}" --target test_micro_layout_bf16 -j4
+    cmake --build "${build}" --target test_micro_layout_bf16 -j"${JOBS:-$(nproc)}"
 fi
 
 dir="${build}/run"

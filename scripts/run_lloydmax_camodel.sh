@@ -16,7 +16,7 @@ if [[ "${1:-all}" != run-only ]]; then
     source "$toolkit/set_env.sh"
     set -u
     cmake -S "$src" -B "$build" -DSOC_VERSION=Ascend950PR_9599 -DASCEND_HOME_PATH="$toolkit" > "$report/configure.log" 2>&1
-    cmake --build "$build" --target test_lloydmax_probe test_icdf_quantize_probe test_camodel_lloydmax_quantize -j4 > "$report/build.log" 2>&1
+    cmake --build "$build" --target test_lloydmax_probe test_icdf_quantize_probe test_camodel_lloydmax_quantize -j"${JOBS:-$(nproc)}" > "$report/build.log" 2>&1
     "$build/lib/test_lloydmax_probe" | tee "$report/tier1.log"
     "$build/lib/test_icdf_quantize_probe" | tee "$report/original_tier1.log"
 fi

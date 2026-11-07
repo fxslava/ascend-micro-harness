@@ -10,8 +10,8 @@ soc="${SOC_VERSION:-Ascend950PR_9599}"
 mode="${2:-fused-opt}"
 context="${3:-384}"
 case "$mode" in
-    fused-opt) kernel=turboquant_mm_fused_decode_opt_kv4fp8_half; rows=16; expected='AIV=0 AIC=0 OPT=1'; library=libcamodel_fused_decode_opt_kernel.so;;
-    aic) kernel=turboquant_paged_decode_splitk_aic; rows=1; expected='AIV=0 AIC=1 OPT=0'; library=libcamodel_paged_decode_attention_kernel.so;;
+    fused-opt) kernel=turboquant_mm_fused_decode_opt_kv4fp8_half; rows=16; expected='AIC=0 OPT=1'; library=libcamodel_fused_decode_opt_kernel.so;;
+    aic) kernel=turboquant_paged_decode_splitk_aic; rows=1; expected='AIC=1 OPT=0'; library=libcamodel_paged_decode_attention_kernel.so;;
     *) printf 'Expected fused-opt or aic\n' >&2; exit 2;;
 esac
 [[ "$context" =~ ^[0-9]+$ && "$context" -ge 128 && "$((context % 128))" == 0 ]]

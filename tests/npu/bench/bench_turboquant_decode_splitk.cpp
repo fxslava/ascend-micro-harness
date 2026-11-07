@@ -4,17 +4,23 @@
 //
 // KERNEL ISOLATION. By default this executable benchmarks ONE kernel: the fused decode
 // operator, turboquant_mm_fused_decode_opt_kv4fp8_half, with the Cube GEMM reduction that
-// TQ_GEMM_REDUCE=ON selects for its reduction phase. The legacy decoders -- the AIV-only
-// split-K decoder and the AIC M=16 lock-step partial-state model -- are compiled OUT, so
-// nothing else launches, nothing else is timed and the two legacy kernel libraries are not
-// even linked (cmake/NpuTargets.cmake drops them from the link in this configuration). That is
-// what makes an msprof capture of this binary a capture of the operator and not of a sweep
-// that happens to contain it.
+// TQ_GEMM_REDUCE=ON selects for its reduction phase. The AIC M=16 lock-step partial-state
+// model is compiled OUT, so nothing else launches, nothing else is timed and its kernel
+// library is not even linked (cmake/NpuTargets.cmake and cmake/SimTargets.cmake drop it from
+// the link in this configuration). That is what makes an msprof capture of this binary a
+// capture of the operator and not of a sweep that happens to contain it.
 //
-// They are not deleted. Configure with -DTQ_BENCH_LEGACY_DECODERS=ON and the comparison
-// columns, the modeled AIC crossover and --impl aiv|aic|both|all all come back exactly as they
-// were; the CSV schema is the same either way, with NA in the columns a given build cannot
-// fill. Everything under TQ_BENCH_FUSED_OPT_ONLY below is that switch and nothing else.
+// The AIC decoder is not deleted. Configure with -DTQ_BENCH_LEGACY_DECODERS=ON and its
+// comparison columns and --impl aic|all come back exactly as they were; the CSV schema is the
+// same either way, with NA in the columns a given build cannot fill. Everything under
+// TQ_BENCH_FUSED_OPT_ONLY below is that switch and nothing else.
+//
+// THE AIV COLUMNS ARE GONE AS A DISPATCH, NOT AS A SWITCH. The AIV-only split-K decoder
+// (kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp) is deleted, so
+// --impl aiv and --impl both no longer exist and the aiv_* CSV columns are permanently NA.
+// They are KEPT in the schema, blank, because reports/ carries runs in it and a reader has to
+// be able to line an old CSV up with a new one. The modeled AIV-against-AIC crossover is gone
+// with the kernel it was relative to: a crossover against a deleted baseline is not a number.
 #if defined(TQ_BENCH_LEGACY_DECODERS) && TQ_BENCH_LEGACY_DECODERS
 #define TQ_BENCH_FUSED_OPT_ONLY 0
 #else
@@ -47,10 +53,8 @@ namespace contract = turboquant_splitk;
 using splitk_decode_test::Fixture;
 using splitk_decode_test::kChannels;
 
-// The rigs themselves now live in turboquant_splitk_rigs.hpp, shared with the
-// NPU and simulator validation tests. These aliases keep the benchmark's own
-// names.
-using Device = tq_splitk_rig::AivRig;
+// The rig itself now lives in turboquant_splitk_rigs.hpp, shared with the NPU
+// and simulator validation tests. This alias keeps the benchmark's own name.
 using AicDevice = tq_splitk_rig::AicRig;
 
 struct Options {
@@ -73,7 +77,7 @@ struct Options {
 #if TQ_BENCH_FUSED_OPT_ONLY
     std::string impl = "fused-opt", csv_out;
 #else
-    std::string impl = "aiv", csv_out;
+    std::string impl = "aic", csv_out;
 #endif
     int page_begin = 0, page_count = -1;
     bool zone_report = false;
@@ -82,8 +86,7 @@ struct Options {
     // 0 leaves the context in the rotated basis, 1 rotates it back, 2 also applies the gate.
     bool pre_rotate = true;
     unsigned post_rotate = 0, prologue_cube = 0;
-    bool Aiv() const { return impl == "aiv" || impl == "both" || impl == "all"; }
-    bool Aic() const { return impl == "aic" || impl == "both" || impl == "all"; }
+    bool Aic() const { return impl == "aic" || impl == "all"; }
     // `three-zone` is an alias, not a second kernel: the three-zone schedule
     // IS the production fused-opt kernel after the schedule refactor, so both
     // spellings dispatch the same symbol. The alias exists so a sweep can ask
@@ -201,17 +204,19 @@ Options parse(int argc, char** argv)
         if (arg == "--help") {
 #if TQ_BENCH_FUSED_OPT_ONLY
             std::puts("Fused decode operator only. Configure -DTQ_BENCH_LEGACY_DECODERS=ON for\n"
-                      "the AIV/AIC comparison columns and --impl aiv|aic|both|all.\n"
+                      "the AIC comparison columns and --impl aic|all.\n"
                       "Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8;\n"
                       "          --heads 1 --rows 16 (16 query heads over one KV head), D=256,\n"
                       "          --page-tokens 128.");
 #endif
             std::puts("--context N[,N...] --splitk K[,K...] --warmup N --iters N "
                       "--requests N --heads N --rows N --page-tokens N\n"
-                      "--impl aiv|aic|both|fused-opt|three-zone|all --single --csv-out PATH --page-begin P --page-count P\n"
+                      "--impl aic|fused-opt|three-zone|all --single --csv-out PATH --page-begin P --page-count P\n"
                       "--zone-report: per-worker three-zone decomposition and zone-class coverage.\n"
                       "three-zone is an alias for fused-opt: one kernel, the refactored schedule.\n"
                       "Defaults: contexts 1024,2048,4096,8192,16384; K 1,2,4,8,12,16.\n"
+                      "There is no --impl aiv or both: that decoder is deleted and the aiv_*\n"
+                      "  CSV columns are permanently NA.\n"
                       "fused-opt: separate KV4/FP8 fixture; --rows is GQA query heads per KV head; K 1..8.\n"
                       "Its default K sweep is 1,2,4,8. --impl all leaves opt columns NA at K>8.\n"
                       "fused-opt accepts --rows 1..16; legacy/all accepts --rows 1..8.\n"
@@ -259,17 +264,16 @@ Options parse(int argc, char** argv)
 #if TQ_BENCH_FUSED_OPT_ONLY
     require(o.OptOnly(), "this build benchmarks the fused decode operator alone: --impl must be "
                          "fused-opt or three-zone. Configure -DTQ_BENCH_LEGACY_DECODERS=ON to "
-                         "restore aiv, aic, both and all");
+                         "restore aic and all");
 #else
-    require(o.Aiv() || o.Aic() || o.Opt(),
-            "impl must be aiv, aic, both, fused-opt, three-zone or all");
+    require(o.Aic() || o.Opt(), "impl must be aic, fused-opt, three-zone or all");
 #endif
     require(!o.zone_report || o.Opt(), "--zone-report needs fused-opt, three-zone or all");
     if (o.OptOnly() && !explicit_splits) o.splits = {1, 2, 4, 8};
     require(o.page_begin >= 0 && o.page_count >= -1, "invalid AIC page window");
     require(o.Opt() ? (o.page_tokens == 64 || o.page_tokens == 128) :
             (o.page_tokens == 16 || o.page_tokens == 128), "unsupported page-tokens for implementation");
-    if (o.Aiv() || o.Aic()) require(o.page_tokens != 64,
+    if (o.Aic()) require(o.page_tokens != 64,
             "64-token pages require --impl fused-opt or three-zone");
     require(o.heads > 0 && o.heads <= 4 && o.rows > 0 &&
             o.rows <= (o.OptOnly() ? 16 : 8),
@@ -286,7 +290,7 @@ Options parse(int argc, char** argv)
         require(o.page_begin <= pages && (o.page_count < 0 || o.page_count <= pages - o.page_begin),
                 "AIC page window exceeds context");
         if (o.impl != "aic") require(o.page_begin == 0 && (o.page_count == -1 || o.page_count == pages),
-                "partial page windows require --impl aic; both compares full contexts");
+                "partial page windows require --impl aic; all compares full contexts");
     }
     for (int k : o.splits) require(k >= 1 && k <= (o.OptOnly() ? 8 : 16),
                                  "splitk must be 1..8 for fused-opt, otherwise 1..16");
@@ -478,7 +482,8 @@ int main(int argc, char** argv)
 #if defined(ASCEND_MICRO_BENCH_SIM)
         std::puts("CAModel functional run: event times/speedups are unavailable; completion deltas are model ticks.");
 #else
-        std::puts("Ascend950PR decode benchmark: fused AIV Split-K and AIC M=16 partial-state model.");
+        std::puts("Ascend950PR decode benchmark: the fused decode operator, and the AIC M=16 "
+                  "partial-state model where this build links it.");
 #endif
         std::ofstream csv;
         if (!o.csv_out.empty()) {
@@ -488,12 +493,12 @@ int main(int argc, char** argv)
         }
         if (o.single) std::puts("[PROFILING MODE] Single launch mode active for msprof op.");
 #if TQ_BENCH_FUSED_OPT_ONLY
-        std::puts("ISOLATED: the fused decode operator is the only kernel in this binary. The AIV and AIC");
-        std::puts("columns are NA by construction, not by a missing device; so is the modeled crossover.");
-        std::puts("Configure -DTQ_BENCH_LEGACY_DECODERS=ON to benchmark them alongside it again.");
+        std::puts("ISOLATED: the fused decode operator is the only kernel in this binary. The AIC");
+        std::puts("columns are NA by construction, not by a missing device.");
+        std::puts("Configure -DTQ_BENCH_LEGACY_DECODERS=ON to benchmark the AIC decoder alongside it.");
 #else
         std::puts("AIC model: 16 valid shared-KV query rows per head; raw batch time / 16. Model GB/s includes 16x reuse.");
-        std::puts("AIC exports partials; its timing excludes external combine/egress. Crossover is a modeled lower bound.");
+        std::puts("AIC exports partials; its timing excludes external combine/egress.");
 #endif
         if (o.Opt()) {
             std::puts("OPT: KV4/FP8, FP32 pre-rotated GQA queries, FP16 rotated-basis output; complete in-launch Split-K combine.");
@@ -525,19 +530,16 @@ int main(int argc, char** argv)
         std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
         tq_npu::Session session;
         Events events;
-        struct Comparison { int n, k; double aiv, aic; };
-        std::vector<Comparison> comparisons;
         struct ZoneRow { int n, k; std::vector<ZoneShape> workers; };
         std::vector<ZoneRow> zone_rows;
         std::map<std::string, int> zone_classes;
-        std::uint64_t aiv_launches = 0, aic_launches = 0, opt_launches = 0;
+        std::uint64_t aic_launches = 0, opt_launches = 0;
         for (int n : o.contexts) {
 #if !TQ_BENCH_FUSED_OPT_ONLY
-            std::unique_ptr<Fixture> av, ac;
+            std::unique_ptr<Fixture> ac;
 #endif
             std::unique_ptr<fused_decode_opt_test::Fixture> opt_fixture;
 #if !TQ_BENCH_FUSED_OPT_ONLY
-            if (o.Aiv()) av.reset(new Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
             if (o.Aic()) ac.reset(new Fixture(n, o.requests, o.heads, 16, o.page_tokens));
 #endif
             if (o.Opt()) opt_fixture.reset(new fused_decode_opt_test::Fixture(n, o.requests, o.heads, o.rows, o.page_tokens));
@@ -545,23 +547,20 @@ int main(int argc, char** argv)
 #if TQ_BENCH_FUSED_OPT_ONLY
             if (!o.single && opt_fixture) sweep.push_back(1);
 #else
-            if (!o.single && (av || opt_fixture)) sweep.push_back(1);
+            if (!o.single && (ac || opt_fixture)) sweep.push_back(1);
 #endif
             for (int k : o.splits)
                 if (std::find(sweep.begin(), sweep.end(), k) == sweep.end()) sweep.push_back(k);
             double baseline = 0, opt_baseline = 0;
             for (int k : sweep) {
+                // `aiv` stays default-constructed for the whole run: no AIV kernel exists any
+                // more, so its columns are NA and `baseline` -- the AIV K=1 time every AIV
+                // speedup was against -- stays zero, which `field()` also renders NA. The
+                // variables are kept so the table and the CSV schema do not move.
                 Measurement aiv, aic, opt;
                 double aiv_bytes = 0, aic_bytes = 0, opt_bytes = 0;
                 int opt_grid = 0;
 #if !TQ_BENCH_FUSED_OPT_ONLY
-                if (av) {
-                    Device d(*av, k);
-                    aiv = measure(d, o, k, session.stream, events);
-                    aiv_launches += aiv.launches;
-                    if (k == 1 && aiv.timed) baseline = aiv.us;
-                    aiv_bytes = static_cast<double>(av->key.size() + av->value.size() + av->scales.size() * 4);
-                }
                 if (ac) {
                     const int pages = o.page_count < 0 ? ac->pages - o.page_begin : o.page_count;
                     AicDevice d(*ac, k, o.page_begin, pages);
@@ -592,8 +591,6 @@ int main(int argc, char** argv)
                 }
                 row(n, k, o.requests * o.heads * k, aiv, aic, opt, opt_grid,
                     baseline, opt_baseline, aiv_bytes, aic_bytes, opt_bytes, csv);
-                if (aiv.timed && aic.timed)
-                    comparisons.push_back({n, k, aiv.us, aic.us / 16});
             }
         }
         std::puts("+-------------+------------+--------+--------------+-------------+-------------+-------------------+------------------------+----------------+--------------+------------------+----------+---------------+-------------+-------------+");
@@ -632,24 +629,14 @@ int main(int argc, char** argv)
                 if (!zone_classes.count(kind))
                     std::printf("NOTE: zone class %s not covered by this sweep.\n", kind);
         }
-        for (const auto& c : comparisons)
-            std::printf("Modeled comparison N=%d K=%d: AIC %.3f us/row vs AIV %.3f us/decode (%s).\n",
-                        c.n, c.k, c.aic, c.aiv, c.aic < c.aiv ? "AIC amortized model lower" : "AIV lower");
-        std::map<int, int> crossover;
-        for (const auto& c : comparisons) {
-            if (!crossover.count(c.k)) crossover[c.k] = 0;
-            if (c.aic < c.aiv && (crossover[c.k] == 0 || c.n < crossover[c.k])) crossover[c.k] = c.n;
-        }
-        for (const auto& entry : crossover) {
-            if (entry.second)
-                std::printf("Modeled crossover K=%d: first tested N=%d (partial-only amortized lower bound).\n",
-                            entry.first, entry.second);
-            else std::printf("Modeled crossover K=%d: not observed in the tested contexts.\n", entry.first);
-        }
-        if (o.Aiv() && o.Aic() && comparisons.empty())
-            std::puts("Modeled crossover unavailable: device event timing is unavailable.");
-        std::printf("PASS: CPU references matched. Kernel launches: AIV=%llu AIC=%llu OPT=%llu.\n",
-                    static_cast<unsigned long long>(aiv_launches), static_cast<unsigned long long>(aic_launches),
+        // The modeled AIC-against-AIV crossover used to be printed here. It was a comparison
+        // against the AIV-only decoder's K=1 time, and that kernel is deleted, so there is no
+        // baseline left for it to be a crossover of. Nothing replaces it: the fused operator's
+        // own speedup column is against its own K=1 launch, which is a measurement rather than
+        // a model, and reports/ keeps the AIV figures that were taken while the kernel existed.
+        std::printf("PASS: CPU references matched. Kernel launches: AIC=%llu OPT=%llu "
+                    "(AIV: kernel deleted).\n",
+                    static_cast<unsigned long long>(aic_launches),
                     static_cast<unsigned long long>(opt_launches));
         return 0;
     } catch (const std::exception& error) {

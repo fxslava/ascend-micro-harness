@@ -56,7 +56,7 @@ if [[ "${1:-all}" != "run-only" ]]; then
     cmake -S "${repo}" -B "${build}" -DSOC_VERSION=Ascend950PR_9599 \
         -DASCEND_HOME_PATH="${toolkit}"
     cmake --build "${build}" \
-        --target test_camodel_turboquant_reshape_and_cache_bf16 -j4
+        --target test_camodel_turboquant_reshape_and_cache_bf16 -j"${JOBS:-$(nproc)}"
 fi
 
 for n in ${slices}; do

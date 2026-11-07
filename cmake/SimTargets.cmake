@@ -259,25 +259,21 @@ function(add_ascend_micro_sim_targets)
   add_executable(test_reshape_scatter_probe tests/cpu/test_reshape_scatter_probe.cpp)
   target_compile_options(test_reshape_scatter_probe PRIVATE -Wall -Wextra -Werror)
 
-  # The AIV-only single-token decode operator (roadmap No.3): 6 query rows,
-  # d = 256, a grid of (request, kv_head) with one task per physical AIV, and
-  # no Cube, no L1 and no cross-core flag of any kind. Its runner takes
-  # --head/--pages/--strips/--rows at runtime, so one binary covers the
-  # single-head canary sweep, the multi-page rung and the row sweep; no build
-  # parameter is needed.
+  # The host oracle that USED to be the AIV-only single-token decode operator's. That
+  # operator is deleted -- kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp
+  # and its split-K sibling -- and its CAModel probe, boundary runner and unaligned
+  # ladder went with it. The fused decode carries those gates now
+  # (tests/sim/kernel/test_camodel_fused_decode_opt.cpp,
+  # scripts/run_fused_decode_canary_ladder.sh).
   #
-  # Run the canary coordinates AND the multi-page rung. A single-page run
-  # cannot tell a kernel that walks the block table from one that ignores it,
-  # because with one page there is only one page to read -- it takes --pages 4
-  # to make a wrong page observable, and the oracle's nibble generator had to
-  # be extended before even that was true (tests/common/single_token_decode
-  # _oracle.hpp).
-  add_micro_camodel_probe(single_token_decode_aiv
-      kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp)
-  # Its Tier-1 host oracle. The GEMV's repeat-stride arithmetic, the
-  # order-independence the bit-exact panel gate rests on, the egress stage
-  # order against the dense rotation and every fixture property are settled
-  # here, with no device and no simulator.
+  # This target stays because it is no longer about that kernel.
+  # tests/common/single_token_decode_oracle.hpp survives as the shared decode geometry
+  # and FP64 reference that tests/common/splitk_decode_fixture.hpp is built on, and
+  # through it the AIC Split-K probes, the decode tail probe and the decode benchmark.
+  # The GEMV repeat-stride arithmetic, the order-independence those bit-exact panel
+  # gates rest on, the egress stage order against the dense rotation and every fixture
+  # property are settled here, with no device and no simulator, and nothing else checks
+  # them.
   add_executable(test_single_token_decode_probe
       tests/cpu/test_single_token_decode_probe.cpp)
   target_compile_options(test_single_token_decode_probe PRIVATE -Wall -Wextra -Werror)
@@ -345,34 +341,19 @@ function(add_ascend_micro_sim_targets)
   ascendc_compile_options(camodel_splitk_reduce_kernel PRIVATE
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
 
-  ascendc_library(camodel_single_token_decode_splitk_kernel SHARED
-      kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp)
   # Keep warnings strict in our source while classifying CANN's own headers as
   # system headers, matching the physical-device target -- the same list, from
   # the top-level CMakeLists.txt, so "matching" is now by construction.
   set(splitk_system_options ${ASCEND_MICRO_CANN_SYSTEM_OPTIONS})
-  ascendc_compile_definitions(camodel_single_token_decode_splitk_kernel PRIVATE
-      ASCEND_MICRO_CANN_LAUNCH)
-  ascendc_compile_options(camodel_single_token_decode_splitk_kernel PRIVATE
-      -std=c++17 -Wall -Werror ${splitk_system_options}
-      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
-  ascendc_compile_options(camodel_single_token_decode_aiv_kernel PRIVATE
-      -std=c++17 -Wall -Werror ${splitk_system_options}
-      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
   ascendc_compile_options(camodel_paged_decode_attention_kernel PRIVATE
       -std=c++17 -Wall -Werror ${splitk_system_options}
       -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
 
-  add_executable(test_camodel_decode_splitk_boundary tests/camodel/test_camodel_decode_splitk_boundary.cpp)
-  target_include_directories(test_camodel_decode_splitk_boundary PRIVATE "${ASCEND_HOME_PATH}/include")
-  target_compile_options(test_camodel_decode_splitk_boundary PRIVATE -Wall -Wextra -Werror)
-  target_link_libraries(test_camodel_decode_splitk_boundary PRIVATE
-      camodel_single_token_decode_splitk_kernel ascendcl
-      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
-  target_link_options(test_camodel_decode_splitk_boundary PRIVATE
-      "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
-  set_target_properties(test_camodel_decode_splitk_boundary PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-      INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+  # test_camodel_decode_splitk_boundary went with the AIV split-K kernel it launched. Its
+  # gate -- a byte-exact context against an independent scalar oracle, with every
+  # unassigned byte and both exterior guard bands held to 0x7FC0BEEF -- is the fused
+  # decode runner's now, and that runner prints the same ASSERT_CANARY_INTACT byte census
+  # (tests/sim/kernel/test_camodel_fused_decode_opt.cpp).
 
   add_executable(bench_decode_splitk_sim
       tests/npu/bench/bench_turboquant_decode_splitk.cpp)
@@ -382,23 +363,32 @@ function(add_ascend_micro_sim_targets)
   target_compile_options(test_aic_splitk_decode_probe PRIVATE -Wall -Wextra -Werror)
   add_executable(test_aic_splitk_acc_error_model tests/cpu/test_aic_splitk_acc_error_model.cpp)
   target_compile_options(test_aic_splitk_acc_error_model PRIVATE -Wall -Wextra -Werror)
-  # ASCEND_MICRO_BENCH_SIM says this is the simulator leg. TQ_BENCH_LEGACY_DECODERS keeps the
-  # AIV and AIC decoders compiled IN on this leg only: the physical benchmark is now isolated to
-  # the fused operator (cmake/NpuTargets.cmake), but the simulator twin is what
-  # scripts/profile_camodel_trace.sh, scripts/capture_fused_decode_opt_camodel_json.sh and
-  # scripts/check_decode_splitk_bench_cli.sh drive with --impl aiv, aic and all, and those are
-  # the existing CAModel evidence paths for the OTHER two kernels. Isolating this leg too would
-  # make an msprof capture of the AIC decoder impossible to reproduce, which is not what
-  # isolating the hardware benchmark was for. The CLI, the validation and the CSV schema are
-  # identical on both legs; only which kernels a given binary can launch differs.
-  target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM
-      TQ_BENCH_LEGACY_DECODERS=1)
+  # ASCEND_MICRO_BENCH_SIM says this is the simulator leg. Like the physical target in
+  # cmake/NpuTargets.cmake, this one benchmarks the FUSED operator and nothing else by
+  # default now: the AIV split-K decoder it used to compare against is deleted, and the
+  # AIV-only dispatches went out of the driver with it.
+  #
+  # TQ_BENCH_LEGACY_DECODERS -- declared in the top-level CMakeLists.txt, so this leg and
+  # the physical leg cannot disagree about it -- restores the AIC paged-decode comparison
+  # columns. That is what scripts/profile_camodel_trace.sh,
+  # scripts/run_decode_splitk_aic_page_depth.sh, scripts/run_decode_splitk_aic_page_race.sh
+  # and scripts/run_decode_splitk_strip_ladder.sh drive with --impl aic, and the AIC
+  # operator is not what this deprecation removed, so those scripts configure with
+  # -DTQ_BENCH_LEGACY_DECODERS=ON. The CLI, the validation and the CSV schema are identical
+  # either way; only which kernels a given binary can launch differs.
+  target_compile_definitions(bench_decode_splitk_sim PRIVATE ASCEND_MICRO_BENCH_SIM)
   target_include_directories(bench_decode_splitk_sim PRIVATE
       "${ASCEND_HOME_PATH}/include")
-  target_link_libraries(bench_decode_splitk_sim PRIVATE
-      camodel_single_token_decode_splitk_kernel camodel_paged_decode_attention_kernel
-      camodel_fused_decode_opt_kernel ascendcl
-      "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  if(TQ_BENCH_LEGACY_DECODERS)
+    target_compile_definitions(bench_decode_splitk_sim PRIVATE TQ_BENCH_LEGACY_DECODERS=1)
+    target_link_libraries(bench_decode_splitk_sim PRIVATE
+        camodel_paged_decode_attention_kernel camodel_fused_decode_opt_kernel ascendcl
+        "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  else()
+    target_link_libraries(bench_decode_splitk_sim PRIVATE
+        camodel_fused_decode_opt_kernel ascendcl
+        "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
+  endif()
   target_link_options(bench_decode_splitk_sim PRIVATE
       "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
   target_compile_options(bench_decode_splitk_sim PRIVATE -Wall -Wextra -Werror)
@@ -406,83 +396,56 @@ function(add_ascend_micro_sim_targets)
       BUILD_WITH_INSTALL_RPATH TRUE
       INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
 
-  # ------------------------ split-K decode validation twins, on CAModel
-  # The simulator legs of NpuTargets.cmake's test_npu_decode_splitk_aic and
-  # test_npu_decode_splitk_aiv. These matter more than most sim twins here:
-  # the NPU legs need a 950PR this harness's development host does not have, so
-  # for anyone without one these are the only place the two split-K ladders
-  # actually run rather than merely compile. They are slow -- every rung is a
-  # real launch on the model -- so run them with a narrowed matrix when
-  # iterating, and read reports/decode_splitk_validation.md for which rungs
-  # have been executed on which leg.
-  # One kernel library per leg, not both to both. The two drivers share their
-  # rigs through tests/npu/turboquant_splitk_rigs.hpp, which DECLARES both
-  # launchers, but a declaration is not a reference: each rig's `Launch` is an
-  # implicitly inline member that is only emitted when that rig is used, and
-  # each driver uses exactly one. `nm -u` on their objects says so --
-  # test_decode_splitk_aic_sim needs only launch_turboquant_paged_decode_splitk_aic
-  # and test_decode_splitk_aiv_sim only
-  # launch_turboquant_single_token_decode_splitk_aiv.
+  # ------------------------ split-K decode validation twin, on CAModel
+  # The simulator leg of NpuTargets.cmake's test_npu_decode_splitk_aic. It matters more
+  # than most sim twins here: the NPU leg needs a 950PR this harness's development host
+  # does not have, so for anyone without one this is the only place the AIC split-K
+  # ladder actually runs rather than merely compiles. It is slow -- every rung is a real
+  # launch on the model -- so run it with a narrowed matrix when iterating, and read
+  # reports/decode_splitk_validation.md for which rungs have been executed on which leg.
   #
-  # Linking both cost a whole extra ascendc_library build per driver, and
-  # because CannRebuild.cmake keeps CANN's BUILD_ALWAYS it cost it on EVERY
-  # build: a no-op rebuild of the paged-decode library alone is 54 s and 17
-  # compile invocations here. So building the AIV ladder pulled the AIC
-  # operator through BiSheng for a symbol it never calls. If a ladder later
-  # does reach across, the link error names the missing symbol immediately and
-  # the library goes back in one line.
-  set(camodel_splitk_leg_aic camodel_paged_decode_attention_kernel)
-  set(camodel_splitk_leg_aiv camodel_single_token_decode_splitk_kernel)
-  foreach(leg aic aiv)
-    add_executable(test_decode_splitk_${leg}_sim
-        tests/npu/validation/test_turboquant_decode_splitk_${leg}_validation.cpp)
-    target_compile_definitions(test_decode_splitk_${leg}_sim PRIVATE
-        ASCEND_MICRO_DECODE_SPLITK_SIM)
-    target_include_directories(test_decode_splitk_${leg}_sim PRIVATE
-        "${ASCEND_HOME_PATH}/include")
-    target_link_libraries(test_decode_splitk_${leg}_sim PRIVATE
-        ${camodel_splitk_leg_${leg}} ascendcl
-        "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
-    target_link_options(test_decode_splitk_${leg}_sim PRIVATE
-        "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
-    target_compile_options(test_decode_splitk_${leg}_sim PRIVATE
-        -Wall -Wextra -Werror)
-    set_target_properties(test_decode_splitk_${leg}_sim PROPERTIES
-        BUILD_WITH_INSTALL_RPATH TRUE
-        INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
-  endforeach()
-
-  # ------------------------ unaligned context lengths, on CAModel
-  # The simulator twin of NpuTargets.cmake's
-  # test_npu_decode_single_token_unaligned, and the only leg that can RUN the
-  # unaligned ladder without a 950PR. It links both AIV decode kernels because
-  # the harness launches both: the plain operator through its arbitrary-context
-  # entry point, and the split-K operator at four split counts, where the
-  # partial strip lands in whichever split owns the last live page and the
-  # splits beyond it must contribute the neutral element.
+  # There used to be an `aiv` leg beside this one, over
+  # tests/npu/validation/test_turboquant_decode_splitk_aiv_validation.cpp and the deleted
+  # AIV split-K kernel. Both are gone; the fused operator's Split-K workers, including an
+  # empty one, are a rung of scripts/run_fused_decode_canary_ladder.sh at both element
+  # types, and its hardware ladder is test_npu_fused_decode_opt.
   #
-  # Both AIV kernels, and no more. This used to link the AIC paged-decode
-  # library too, which the comment above never claimed and which `nm -u` on
-  # the driver's object refutes: it needs
-  # launch_turboquant_single_token_decode_tail_aiv and
-  # launch_turboquant_single_token_decode_splitk_aiv, and nothing else.
-  add_executable(test_decode_single_token_unaligned_sim
-      tests/npu/test_npu_decode_single_token_unaligned.cpp)
-  target_compile_definitions(test_decode_single_token_unaligned_sim PRIVATE
+  # It links the ONE kernel library its driver calls into.
+  # tests/npu/turboquant_splitk_rigs.hpp declares the launchers the rigs use, but a
+  # declaration is not a reference: each rig's `Launch` is an implicitly inline member
+  # emitted only where that rig is used, and this driver uses exactly one. `nm -u` on its
+  # object says so -- test_decode_splitk_aic_sim needs only
+  # launch_turboquant_paged_decode_splitk_aic.
+  #
+  # A spare link cost a whole extra ascendc_library build, and because CannRebuild.cmake
+  # keeps CANN's BUILD_ALWAYS it cost it on EVERY build: a no-op rebuild of the
+  # paged-decode library alone is 54 s and 17 compile invocations here. If a ladder later
+  # does reach across, the link error names the missing symbol immediately and the library
+  # goes back in one line.
+  add_executable(test_decode_splitk_aic_sim
+      tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp)
+  target_compile_definitions(test_decode_splitk_aic_sim PRIVATE
       ASCEND_MICRO_DECODE_SPLITK_SIM)
-  target_include_directories(test_decode_single_token_unaligned_sim PRIVATE
+  target_include_directories(test_decode_splitk_aic_sim PRIVATE
       "${ASCEND_HOME_PATH}/include")
-  target_link_libraries(test_decode_single_token_unaligned_sim PRIVATE
-      camodel_single_token_decode_aiv_kernel
-      camodel_single_token_decode_splitk_kernel ascendcl
+  target_link_libraries(test_decode_splitk_aic_sim PRIVATE
+      camodel_paged_decode_attention_kernel ascendcl
       "${SIM_LIB_DIR}/libnpu_drv_camodel.so" "${SIM_LIB_DIR}/libmodel_top.so")
-  target_link_options(test_decode_single_token_unaligned_sim PRIVATE
+  target_link_options(test_decode_splitk_aic_sim PRIVATE
       "-Wl,-rpath-link,${SIM_LIB_DIR}" "-Wl,--disable-new-dtags")
-  target_compile_options(test_decode_single_token_unaligned_sim PRIVATE
+  target_compile_options(test_decode_splitk_aic_sim PRIVATE
       -Wall -Wextra -Werror)
-  set_target_properties(test_decode_single_token_unaligned_sim PROPERTIES
+  set_target_properties(test_decode_splitk_aic_sim PROPERTIES
       BUILD_WITH_INSTALL_RPATH TRUE
       INSTALL_RPATH "$ORIGIN;${SIM_LIB_DIR};${ASCEND_HOME_PATH}/lib64")
+
+  # ------------------------ unaligned context lengths, on CAModel
+  # test_decode_single_token_unaligned_sim is gone with the two AIV decode kernels it
+  # launched. The unaligned ladder it drove -- S = 1, 7, 15, 17, 31, 33, 127, 129, 255,
+  # 257, 1023, none of them a multiple of the strip and most not of the page, with a
+  # quiet-NaN canary in every cache slot past seq_len -- is the fused decode runner's
+  # --tail-rows dimension now: rungs 2, 3 and 8 of scripts/run_fused_decode_canary_ladder.sh
+  # end a context inside a tile, and rung 8 does it over the whole eight-page block table.
 
   # ------------------------------------------- mode-4 research probe, on CAModel
   # The simulator twin of NpuTargets.cmake's test_cluster_sync_probe: the same

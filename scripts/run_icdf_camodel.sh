@@ -22,7 +22,7 @@ if [[ "${1:-all}" != "run-only" ]]; then
     cmake -S "${repo}" -B "${build}" -DSOC_VERSION=Ascend950PR_9599 \
         -DASCEND_HOME_PATH="${toolkit}"
     cmake --build "${build}" --target test_icdf_quantize_probe \
-        test_camodel_icdf_quantize -j4
+        test_camodel_icdf_quantize -j"${JOBS:-$(nproc)}"
     "${build}/lib/test_icdf_quantize_probe" | tee "${build}/tier1.log"
 fi
 

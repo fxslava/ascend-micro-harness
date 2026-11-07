@@ -59,7 +59,7 @@ rm -rf "${build_dir}"
 cmake -S "${src_dir}" -B "${build_dir}" -G "Unix Makefiles" \
     -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION="${soc}" \
     -DASCEND_HOME_PATH="${toolkit}"
-cmake --build "${build_dir}" --target test_cluster_sync_probe_sim -j 4
+cmake --build "${build_dir}" --target test_cluster_sync_probe_sim -j"${JOBS:-$(nproc)}"
 
 export LD_LIBRARY_PATH="${build_dir}/lib:${sim_lib_dir}:${toolkit}/lib64:${toolkit}/devlib:${LD_LIBRARY_PATH:-}"
 

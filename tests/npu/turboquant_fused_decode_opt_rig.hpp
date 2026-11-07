@@ -178,7 +178,7 @@ struct FusedOptRig {
         launch_fused_decode_opt_raw_query(stream, &config, &r);
     }
 
-    AivRig::Census Validate(int)
+    Census Validate(int)
     {
         // 1. The prologue, on its own: the rotated query the kernel wrote against the host's
         // own Pi image of the same raw query. Bit-exact is the claim -- every value in this

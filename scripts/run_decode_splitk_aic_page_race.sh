@@ -39,7 +39,10 @@ host_models() {
 build_sim() {
     SPLITK_SRC_DIR="${work}/src" SPLITK_BUILD_DIR="${work}/build" \
         ASCEND_HOME_PATH="${toolkit}" SOC_VERSION="${soc}" \
-        bash "${repo_dir}/scripts/run_decode_splitk_bench.sh" sim --help >"${work}/build.log" 2>&1
+        # SPLITK_LEGACY_DECODERS=ON: this ladder drives --impl aic, and the AIC decoder is
+        # only in the benchmark when TQ_BENCH_LEGACY_DECODERS is ON.
+        SPLITK_LEGACY_DECODERS=ON \
+            bash "${repo_dir}/scripts/run_decode_splitk_bench.sh" sim --help >"${work}/build.log" 2>&1
     local status=$?
     if (( status != 0 )); then
         echo "sim build failed; see ${work}/build.log" >&2

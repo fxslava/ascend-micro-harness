@@ -2,10 +2,17 @@
 //
 // Why this exists, and what the device test cannot do without it
 // -------------------------------------------------------------
-// `tests/npu/test_npu_decode_single_token_unaligned.cpp` compares a kernel
-// against `splitk_decode_test::Fixture::expected` at an unaligned `seq_len`.
-// That comparison is only evidence if two things are true of the fixture
-// itself, and neither is visible from the device side:
+// A device test compares a kernel against `splitk_decode_test::Fixture::expected`
+// at an unaligned `seq_len`. That comparison is only evidence if two things are
+// true of the fixture itself, and neither is visible from the device side:
+//
+// The driver this was written for, tests/npu/test_npu_decode_single_token
+// _unaligned.cpp, went with the two AIV decode kernels it launched. The fixture
+// did not: tests/common/splitk_decode_fixture.hpp is still what the AIC Split-K
+// rig, the benchmark and tests/cpu/test_aic_splitk_decode_probe.cpp build on, at
+// unaligned seq_len included, so both properties below still have to hold and
+// nothing else checks them. (The fused decode operator has its own fixture and
+// its own unaligned rungs: scripts/run_fused_decode_canary_ladder.sh.)
 //
 //   1. The oracle does not read the dead slots. They hold 0x7FC0BEEF, a quiet
 //      NaN, so if the reference touched them `expected` would be NaN and the

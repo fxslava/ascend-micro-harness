@@ -120,7 +120,15 @@ int main(int argc, char** argv)
                 for (unsigned col = 0; col < dim / 2; ++col) {
                     const auto off = physical * page_rows * dim / 2 +
                         tq::NzTiledPackedByte(row, 0, col, 1, dim / 2);
-                    const unsigned kn = varied ? tile % 8 : 0;
+                    // REFINEMENT_OF_COMBAT_KERNELS.md section 3's exact fixture, as the deleted
+                    // AIV boundary runners carried it: query = 1/256, scales = 1 * gain and a
+                    // UNIFORM key nibble of 3 over every live token, so every score is the same
+                    // number and exp(score - m) = exp(0) = 1 exactly. Nibble 3 rather than 0 so
+                    // the fixture is the documented one and the packed key plane's CONTENT reaches
+                    // the score GEMM; the weights are 1 either way, so the oracle below is
+                    // unchanged by the choice. --varied replaces it with a per-tile nibble and
+                    // takes the documented Exp/reduction tolerance instead.
+                    const unsigned kn = varied ? tile % 8 : 3;
                     kp[off] = static_cast<std::uint8_t>(kn | (kn << 4));
                     const unsigned lo = (tile + col % 128) % 8;
                     const unsigned hi = (tile + (col + 3) % 128) % 8;
@@ -152,14 +160,22 @@ int main(int argc, char** argv)
         fd::Buffers b{query.payload(), key.payload(), value.payload(), scales.payload(),
             table.payload(), lengths.payload(), modes.payload(), workspace.payload(),
             output.payload(), tiling.payload()};
+        // The unassigned-byte census this run holds to the canary, printed in the PASS line.
+        // Section 3 asks for every unassigned output slot and both exterior guards; counting them
+        // is what makes a rung that quietly stopped checking visible in its own log, and it is the
+        // property the deleted Split-K boundary runner's "ASSERT_CANARY_INTACT <n> bytes" carried.
+        std::size_t intact = 0;
         for (unsigned repeat = 0; repeat < repeats; ++repeat) {
+            intact = 0;
             launch_fused_decode_opt_sim(session.stream, &c, &b);
             camodel::check(aclrtSynchronizeStream(session.stream), "fused decode synchronize");
             output.download(); output.assert_guards(); workspace.download(); workspace.assert_guards();
+            intact += 4 * camodel::kGuardBytes;  // the output's and the workspace's exterior guards
             if (c.splits == 1) {
                 const auto* words = static_cast<const std::uint32_t*>(workspace.host_payload());
                 for (unsigned i = 0; i < workspace.payload_bytes / 4; ++i)
                     if (words[i] != camodel::kCanary) throw std::runtime_error("inactive workspace changed");
+                intact += workspace.payload_bytes;
             }
             const auto* actual = static_cast<const std::uint16_t*>(output.host_payload());
             for (unsigned h = 0; h < c.heads; ++h) for (unsigned d = 0; d < dim; ++d) {
@@ -212,15 +228,21 @@ int main(int argc, char** argv)
             const auto* raw = static_cast<const std::uint32_t*>(output.host_payload());
             for (unsigned i = c.heads * dim / 2; i < output.payload_bytes / 4; ++i)
                 if (raw[i] != camodel::kCanary) throw std::runtime_error("inactive output changed");
+            intact += output.payload_bytes -
+                static_cast<std::size_t>(c.heads) * dim * fd::element_bytes(c.element_type);
             for (unsigned i = 0; i < inputs.size(); ++i) {
                 inputs[i]->download();
+                // assert_guards() first, so a burst that ran off either end of an INPUT is named
+                // as a guard-band hit rather than as an anonymous "input bytes changed".
+                inputs[i]->assert_guards();
                 if (inputs[i]->host != snapshots[i]) throw std::runtime_error("input bytes changed");
+                intact += inputs[i]->host.size() * 4;
             }
         }
-        std::printf("PASS fused_decode_opt dtype=%s tiles=%u page=%u tile=%u heads=%u splits=%u grid=%u repeats=%u elements=%u tail_rows=%u hole=%u comparison=%s inputs=unchanged guards=0x7FC0BEEF-intact\n",
+        std::printf("PASS fused_decode_opt dtype=%s tiles=%u page=%u tile=%u heads=%u splits=%u grid=%u repeats=%u elements=%u tail_rows=%u hole=%u comparison=%s inputs=unchanged guards=0x7FC0BEEF-intact ASSERT_CANARY_INTACT %zu bytes\n",
             out_format.name, tiles, c.probe_page, c.probe_tile, c.heads, c.splits, c.grid, repeats,
             c.heads * dim, tail_rows, hole,
-            varied ? "1ulp_of_output_format" : "exact_0ulp_at_stored_word");
+            varied ? "1ulp_of_output_format" : "exact_0ulp_at_stored_word", intact);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL fused_decode_opt: %s\n", e.what()); return 1;
     }

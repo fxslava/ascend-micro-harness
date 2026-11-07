@@ -20,6 +20,19 @@ transition and one consuming transition. Pair routes and IDs exactly, use IDs
 including credits for slots unused by short or empty workers. A second SET
 before consumption loses a token even if aggregate SET/WAIT counts match.
 
+The worked example below is the two-slot decode ring of the AIV single-token decode
+kernels. **Those kernels are deleted**; the ring is kept here because it is the
+smallest instance of the method, and the shapes the method has to cover are listed
+after it. The operator this section applies to now is the fused decode
+(`kernels/ops/turboquant/vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp`),
+whose three bounded structures have one model each:
+
+| Structure | Model |
+| --- | --- |
+| the attention ring: 3 ingest slots, 2 score windows, 5 queues, carried across tasks | `tests/cpu/test_fused_decode_opt_model.py` |
+| the Cube GEMM reduction (`TQ_GEMM_REDUCE=ON`, the default) | `tests/cpu/test_gemm_reduce_model.py` |
+| the vector partial reducer (`-DTQ_GEMM_REDUCE=OFF`) | `tests/cpu/test_decode_ring_model.py` |
+
 For the two-slot decode ring (`kStageDepth = 2`), for each slot `s`:
 
 | Place | Route/ID | Initial marking | Producer → consumer |
@@ -63,20 +76,36 @@ contains no wait for a transition that will never be emitted. Exhaustive engine
 interleaving exploration additionally checks bounded instances and ownership;
 it is not a claim of exhaustive verification for every possible sequence length.
 
-Run `python3 tests/cpu/test_decode_ring_model.py`. It explores every interleaving
-for both kernels at N=0,1,2,3,4,5,8,16,64, rejects double SETs, unprimed cycles
-and early scale release, and requires ordered recurrence and an empty final
-marking. Keep model transitions consistent with the actual loop when editing it.
+Run all three models of the table above. Each explores every reachable engine
+interleaving of its own structure over a bounded set of geometries, rejects double
+SETs, unprimed cycles and buffer reuse ahead of the fence that protects it, and
+requires an empty final marking; each also carries a set of negative controls that
+must still be rejected. Keep model transitions consistent with the actual loop when
+editing it -- a model that no longer matches the kernel is worse than no model,
+because it reports PASS.
+
+```bash
+python3 tests/cpu/test_fused_decode_opt_model.py   # the attention ring, two tasks
+python3 tests/cpu/test_gemm_reduce_model.py        # the Cube GEMM reduction
+python3 tests/cpu/test_decode_ring_model.py        # the vector partial reducer
+```
+
+The first and third are in `scripts/run_fused_decode_opt_camodel.sh`'s host leg, so the
+canary ladder runs them. The second is not: its batched legs explore 15 M states and take
+over half an hour, and it has its own driver, `scripts/run_gemm_reduce_camodel.sh`. Run
+that one whenever the reduction phase changes.
 
 ### 1a. An operator with an outer loop needs the outer loop modelled too
 
-The ring model above covers ONE pass of the ring on one core. An operator that
+Each ring model covers ONE pass of its ring on one core. An operator that
 primes and drains that ring once per iteration of an outer loop -- a page loop,
 a wave loop, a tile-row loop -- has places that only exist at an iteration
 boundary, and they are invisible to a model that stops at one pass. Run
 `python3 tests/cpu/test_decode_page_loop_model.py` for
 `turboquant_paged_decode_splitk_aic`'s page loop, and write the equivalent for
-any other outer loop a refactor adds.
+any other outer loop a refactor adds. On the fused decode the outer loops are the
+task loop, which `test_fused_decode_opt_model.py` carries the marking across, and
+the reduce-task loop, which `test_decode_ring_model.py` does.
 
 Two rules that only bite at such a boundary, both learned from this operator:
 
@@ -169,8 +198,12 @@ counts must nevertheless match dispatch counts exactly. At N strips, slot s
 must have `1 + floor((N+1-s)/2)` SET/WAIT pairs on each packed/scale feedback
 route; the leading one is the prologue/epilogue credit, even for unused slots.
 
-Run `scripts/analyze_decode_ring_trace.py`, the AIV instruction/traffic census,
-and the Split-K batched lock audit. Report engine counts and actual intersecting
+Run `scripts/analyze_fused_decode_opt_trace.py` on each case's evidence directory
+(`scripts/run_fused_decode_opt_case.sh` already does), and the Split-K batched lock
+audit. `scripts/analyze_decode_ring_trace.py` is the same audit keyed by operand
+route and ID with no operator-specific expectations, kept for a structure whose
+analyzer does not exist yet; its negative controls are
+`tests/cpu/test_decode_ring_trace_audit.py`. Report engine counts and actual intersecting
 MTE2/Vector intervals for an overlap claim; source order and balanced events
 alone do not establish overlap. Do not interpret simulator ticks as silicon
 throughput. Keep commands, logs, counts, canary totals, numerical results and
@@ -179,33 +212,45 @@ limitations in a report under `reports/`.
 The reproducible boundary baseline is:
 
 ```bash
-bash scripts/run_decode_pipeline_camodel.sh
+bash scripts/run_fused_decode_canary_ladder.sh
 ```
 
 It creates a fresh ext4 source/build/evidence directory under `/tmp`, prints its
-path, runs host probes and strict compilation, then tests both kernels at the
-three boundaries, depth=2 and wrap=4. The existing varied-score and production
-Split-K runners provide the subsequent full-sequence regressions.
+path, runs the Tier-1 host gates (the launch/tiling contract, the attention ring and
+vector-reducer capacity-one models, the trace-auditor controls and the three-zone
+schedule extraction) and the strict CAModel compile, and then, at fp16 AND at bf16, runs the
+isolated logical-page canaries (pages 0, K/2, K-1 and the final 64-row tile of the
+final page, on a non-identity block table with the full cache allocation kept), the
+bounded sequence sweep N = 1, 2, 3, 4, 16 including the ring depth and its wrap,
+and real Split-K workers with an empty one among them. Three cursor and flag rungs --
+an unmapped interior page, an empty worker, and repeated launches over one ragged
+task -- plus the ragged full-block-table rung run once, at fp16, for the reasons the
+script's header gives. Every rung holds every unassigned GM byte and both exterior
+guard bands to `0x7FC0BEEF`, compares every input bitwise after synchronisation, and
+compares the active rows at 0 ULP of the output format's stored word.
+
+`scripts/run_decode_pipeline_camodel.sh`, `scripts/run_decode_pipeline_regressions.sh`
+and `scripts/verify_decode_pipeline_evidence.py` were the equivalent for the two
+deleted AIV decode kernels and went with them.
 
 For the subsequent varied-score regressions, build the existing
 `bench_decode_splitk_sim` target in a fresh CMake build with the same toolkit
-and SoC, then run:
+and SoC, then run its smoke case:
 
 ```bash
 # Build the simulator benchmark from current sources without launching it.
 decode_bench_dir=$(mktemp -d /tmp/ascend-decode-bench.XXXXXX)
 SPLITK_SRC_DIR="$decode_bench_dir/src" SPLITK_BUILD_DIR="$decode_bench_dir/build" \
   bash scripts/run_decode_splitk_bench.sh sim --help
-bash scripts/run_decode_pipeline_regressions.sh BASELINE_DIR "$decode_bench_dir/build"
-python3 scripts/verify_decode_pipeline_evidence.py BASELINE_DIR
+# Three 64-token pages: K=2 carries state across a page boundary, K=4 leaves one
+# worker empty. Both are single launches against the fixture's own FP64 oracle.
+SPLITK_SRC_DIR="$decode_bench_dir/src" SPLITK_BUILD_DIR="$decode_bench_dir/build" \
+  bash scripts/run_decode_splitk_bench.sh smoke
+bash scripts/run_fused_decode_opt_bench_smoke.sh
 ```
 
-`BASELINE_DIR` is the printed `/tmp/ascend-decode-ring.*` directory. The script
-requires all ten baseline passes before running the six-row, two-page, odd-tail,
-K=2 wrap/merge and K=4 empty-worker cases. It uses the baseline kernel libraries
-with the current benchmark ABI, checks model errors/exception dumps and audits
-each case's own traces. Full varied-score arithmetic uses its existing documented
-numerical budgets; exact boundary outputs remain a bitwise gate.
+Full varied-score arithmetic uses its existing documented numerical budgets (the
+runner's `--varied` rungs); exact boundary outputs remain a bitwise gate.
 
 ## 6. Inter-wave gates for a MIX_AIC_1_2 grid
 

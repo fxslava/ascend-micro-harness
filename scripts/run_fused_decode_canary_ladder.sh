@@ -13,13 +13,22 @@
 #   rung 3  tiles = 5, tail = 1    one live row in the final tile, across page boundaries
 #   rung 4  tiles = 3 = kSlots     the ring's priming depth exactly
 #   rung 5  tiles = 6 = 2*kSlots   slot reuse and drain: wrap
+#   rung 6  tiles = 4 = kSlots+1   the first refill after the prologue, one tile past the depth
+#   rung 7  tiles = 16             every logical page of the 8-entry block table, in one launch
+#
+# Rungs 1, 2, 4, 6 and 7 are the bounded sequence sweep N = 1, 2, 3, 4, 16 that the deleted AIV
+# runners drove through --strips; rung 7 is also the multi-page block-table loop, because 16 tiles
+# of 64 rows is 1024 tokens and the fixture's table maps eight logical pages (logical p -> physical
+# 2p + 1), so a cursor that walked the table wrongly lands on a canary page. Rung 8 repeats rung 7
+# with an unaligned context, which is what the deleted test_npu_decode_single_token_unaligned
+# ladder established for the two AIV kernels.
 #
 # It deliberately runs NO long-context case. The simulator is cycle-accurate and a 16k-token
 # context is hours of model time with nothing in it the wrap rung does not already exercise; the
 # depth/wrap pair plus the three boundaries are the inductive argument (section 4), and the
 # full-sequence regressions belong on silicon.
 #
-# Beyond the five rungs it also runs the isolated logical-page canaries (page 0, K/2, K-1 and the
+# Beyond those rungs it also runs the isolated logical-page canaries (page 0, K/2, K-1 and the
 # final 64-row tile of the final page) and the unmapped-page degradation rung, because those are
 # the gates that would catch the closed-form cursor addressing the wrong page rather than the
 # wrong number of rows.
@@ -82,12 +91,14 @@ run isolated-middle --canary 4
 run isolated-last --canary 7
 run isolated-last-tile --canary 7 --tile 1
 
-# ------------------------------------------------------- the five bounded rungs, in order
+# ------------------------------------------------------ the seven bounded rungs, in order
 run rung1-single-tile --tiles 1 --tail-rows 64
 run rung2-ragged-tail --tiles 2 --tail-rows 15
 run rung3-single-row-tail --tiles 5 --tail-rows 1
 run rung4-ring-depth --tiles 3 --tail-rows 64
 run rung5-ring-wrap --tiles 6 --tail-rows 64
+run rung6-depth-plus-one --tiles 4 --tail-rows 64
+run rung7-full-block-table --tiles 16 --tail-rows 64
 
 # Real Split-K workers, including an empty one. Not among the five rungs, and required at BOTH
 # element types anyway: a single-worker probe does not prove the tail worker's merge path, and
@@ -105,11 +116,17 @@ run_fp16() { bash "$repo/scripts/run_fused_decode_opt_case.sh" "$root" "$1" --dt
 # behind the builder's back and requires the kernel to skip the whole worker -- defined zero
 # output, canaries intact, no deadlock on the cross-core flags -- rather than index through it.
 run_fp16 unmapped-degrades --tiles 12 --hole 2
+# An unaligned context over the WHOLE block table: 15 full tiles plus 17 live rows of the
+# sixteenth, so neither a page boundary nor a tile boundary falls on the end of the context. fp16
+# only, for the reason in the header note: the ragged-tail arithmetic already runs at both element
+# types in rungs 2 and 3, and what this rung adds over rung 7 is block-table depth against a
+# partial final tile -- descriptor words and ring indices, with no scalar_t in them.
+run_fp16 rung8-full-table-ragged --tiles 16 --tail-rows 17
 # An empty worker: both roles must bypass the pipeline without touching a flag.
 run_fp16 empty-worker --empty 1
 # Repeated launches over one ragged task: boundary isolation does not prove slot reuse across
 # tasks.
 run_fp16 repeat-tasks --tiles 4 --heads 17 --repeats 2
 
-printf 'PASS fused decode canary ladder for [%s] (5 rungs + isolated canaries + Split-K workers '\
-'each, cursor/flag rungs once): %s\n' "$dtypes" "$root"
+printf 'PASS fused decode canary ladder for [%s] (7 rungs + isolated canaries + Split-K workers '\
+'each, cursor/flag and ragged-table rungs once): %s\n' "$dtypes" "$root"

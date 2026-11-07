@@ -50,8 +50,12 @@ set +u
 source "${toolkit}/set_env.sh"
 set -u
 export ASCEND_HOME_PATH="${toolkit}"
+# This script profiles the AIC decoder (--impl aic below), which the benchmark only
+# contains when TQ_BENCH_LEGACY_DECODERS is ON. OFF is the default now that the AIV
+# decoder is deleted and both benchmark targets isolate the fused operator.
 cmake -S "${work}/src" -B "${work}/build" -G 'Unix Makefiles' \
     -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION="${soc}" -DASCEND_HOME_PATH="${toolkit}" \
+    -DTQ_BENCH_LEGACY_DECODERS=ON \
     >"${out}/configure.log" 2>&1
 cmake --build "${work}/build" --target bench_decode_splitk_sim bench_turboquant_decode_splitk \
     -j "${BUILD_JOBS:-4}" >"${out}/build.log" 2>&1

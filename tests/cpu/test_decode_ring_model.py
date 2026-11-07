@@ -1,282 +1,192 @@
 #!/usr/bin/env python3
-"""Explore every engine interleaving of the decode ring's bounded marked graph.
+"""Explore every engine interleaving of the fused decode's VECTOR REDUCTION ring.
 
-Flags are one-bit places, never counting semaphores. State includes queue PCs,
-the marking and the owner of every live landing/page. SET into an occupied
-place is an error, not a disabled transition (hardware would lose that token).
-WAIT at zero blocks its destination engine. Scalar emission order constructs
-three FIFO queues, matching the device's prefill/prepare/retire/refill loop.
+REFINEMENT_OF_COMBAT_KERNELS.md sections 1 and 1a, for the reduction phase of
+`kernels/ops/turboquant/vllm_integration_layer/op_kernel/turboquant_fused_decode.cpp`.
+
+WHICH PART OF THE OPERATOR THIS IS, AND WHICH PARTS IT IS NOT
+
+The fused decode has three bounded token/queue structures and one model each:
+
+  * the attention ring -- three ingest slots, two score windows, five queues, carried
+    across consecutive tasks:        tests/cpu/test_fused_decode_opt_model.py
+  * the Cube GEMM reduction, which `TQ_GEMM_REDUCE=ON` (the default) selects:
+                                     tests/cpu/test_gemm_reduce_model.py
+  * the VECTOR partial reducer, which `-DTQ_GEMM_REDUCE=OFF` selects instead and which
+    `ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE` reaches through `op.Reduce()`:
+                                     THIS FILE.
+
+It used to model the two deleted AIV single-token decode kernels -- that operator's
+two-slot strip ring with its MTE3 archive edge, and its own Split-K record ring. Those
+kernels are gone and the fused operator is the only decode left, so what this file
+carries forward is the gate rather than the schedule: the one reduction leg a
+`TQ_GEMM_REDUCE` build can select that no other model covers.
+
+THE SCHEDULE, AS `TurboQuantPartialReducer::Reduce` ISSUES IT
+
+One AIV subcore, three queues (V, MTE2, MTE3), from
+`op_kernel/vector/turboquant_vector_service.h`:
+
+    V       zero the accumulator and the running (max, sum), then -inf into runMax
+    per split s = 0 .. S-1:
+      V        SetFlag<V_MTE2>     SyncVectorToMte2(): the WAR fence that stops the next
+      MTE2     WaitFlag<V_MTE2>    burst landing on a record still being merged
+      MTE2     DataCopy(partAcc, workspace[token, head, s], headSize + kPartialTail)
+      MTE2     SetFlag<MTE2_V>     SyncMte2ToVector(): the RAW fence in front of the
+      V        WaitFlag<MTE2_V>    merge
+      V        Max/Sub/Exp/Mul/Add/BroadcastMul/Add/Adds -- the online merge of record s
+    V       NormalizeHeads, the finisher, then Cast into outBuf_
+    V       SetFlag<V_MTE3>        WriteHeads()'s SyncVectorToMte3()
+    MTE3    WaitFlag<V_MTE3>
+    MTE3    DataCopy(outputGm[token, head], outBuf_, headSize)
+    MTE3    SetFlag<MTE3_V>        WriteHeads()'s SyncMte3ToVector(): the WAR fence that
+    V       WaitFlag<MTE3_V>       makes outBuf_ reusable by the NEXT reduction task
+
+There is ONE landing (`partAcc`/`partState` inside `accBuf_`) and ONE output row
+(`outBuf_`), not a ring of two: every split reuses the same bytes, so each of the four
+fences above is load-bearing and none of them is a convenience barrier.
+
+SECTION 1a: THE OUTER LOOP IS THE REDUCE-TASK LOOP
+
+`Reduce()` runs once per (token, head) the block owns, so the reused bytes have a WAR
+edge at the TASK boundary as well as inside the split loop -- `outBuf_` is the one that
+exists only there, because its reader is MTE3 and its next writer is the next task's
+Cast on V. A model that stopped at one call could not see it. Every run below therefore
+carries the marking and every owner across consecutive tasks, and `no_mte3_v` is the
+negative control for exactly that edge.
+
+Flags are one-bit places, never counting semaphores: a SET into an occupied place is an
+error here, because hardware would drop that token. A WAIT at zero blocks its
+destination engine. Every SET is routed to the queue of the pipe that ISSUES it and
+every WAIT to the queue of the pipe that CONSUMES it (section 1a), which for
+`SyncEvent<V_MTE2>` puts the SET on V and the WAIT on MTE2.
+
+WHAT THIS BOUNDED ABSTRACTION DOES NOT ESTABLISH
+
+`Init()`'s `PipeBarrier<PIPE_ALL>` is not modelled as a transition; the model instead
+STARTS from the empty marking with no live owner, which is the state that barrier
+establishes, so what is left unproven is the barrier itself rather than anything after
+it. Scalar issue, fence lowering, UB addresses and arithmetic are not here either:
+those are the compile-time checks of section 2 and the CAModel gates of sections 3-5.
 """
 from collections import Counter, deque
 
+QUEUES = ("V", "MTE2", "MTE3")
+# SyncEvent<ROUTE>() issues its SetFlag into the producer's pipe and its WaitFlag into
+# the consumer's. turboquant_common.h: SyncVectorToMte2, SyncMte2ToVector,
+# SyncVectorToMte3, SyncMte3ToVector.
+PRODUCER = {"V_MTE2": "V", "MTE2_V": "MTE2", "V_MTE3": "V", "MTE3_V": "MTE3"}
+CONSUMER = {"V_MTE2": "MTE2", "MTE2_V": "V", "V_MTE3": "MTE3", "MTE3_V": "V"}
 
-def schedule(count, archive=True, unprime=False, duplicate=False, early_scale=False):
-    queues = {p: [] for p in ("MTE2", "V", "MTE3")}
+
+def schedule(tasks, drop_v_mte2=False, drop_mte2_v=False, drop_v_mte3=False,
+             drop_mte3_v=False, duplicate_v_mte2=False):
+    """`tasks` holds the split count of each consecutive reduce task on one block."""
+    queues = {pipe: [] for pipe in QUEUES}
 
     def emit(pipe, op, *args):
-        queues[pipe].append((op, *args))
+        queues[pipe].append((op,) + args)
 
-    def flag(op, route, slot):
-        source, target = route.split("_")[:2] if route not in ("SCALE", "PACKED") else ("V", "MTE2")
-        # Packed and scale feedback have different IDs (0/1 vs 2/3).
-        if route == "PACKED":
-            source, target = "V", "MTE2"
-        emit(source if op == "set" else target, op, route, slot)
+    def fence(route, dropped=False, twice=False):
+        if dropped:
+            return
+        repeats = 2 if twice else 1
+        for _ in range(repeats):
+            emit(PRODUCER[route], "set", route)
+        for _ in range(repeats):
+            emit(CONSUMER[route], "wait", route)
 
-    def load(i):
-        slot = i % 2
-        flag("wait", "PACKED", slot)
-        emit("MTE2", "load_packed", slot, i)
-        flag("wait", "SCALE", slot)
-        emit("MTE2", "load_scale", slot, i)
-        flag("set", "MTE2_V", slot)
-
-    for slot in range(2):
-        if not unprime:
-            flag("set", "PACKED", slot)
-            flag("set", "SCALE", slot)
-        if duplicate:
-            flag("set", "PACKED", slot)
-        if archive:
-            flag("set", "MTE3_V", slot)
-    for i in range(min(count, 2)):
-        load(i)
-    for tick in range(count + 1):
-        if tick < count:
-            slot = tick % 2
-            flag("wait", "MTE2_V", slot)
-            emit("V", "dequant", slot, tick)
-            flag("set", "PACKED", slot)
-            if early_scale:
-                flag("set", "SCALE", slot)
-            if archive:
-                flag("wait", "MTE3_V", slot)
-            emit("V", "gemv", slot, tick)
-            if archive:
-                flag("set", "V_MTE3", slot)
-                flag("wait", "V_MTE3", slot)
-                emit("MTE3", "archive", slot, tick)
-                flag("set", "MTE3_V", slot)
-        if tick:
-            slot = (tick - 1) % 2
-            emit("V", "recurrence", slot, tick - 1)
-            if not early_scale:
-                flag("set", "SCALE", slot)
-            if tick + 1 < count:
-                load(tick + 1)
-    for slot in range(2):
-        if not unprime:
-            flag("wait", "PACKED", slot)
-            flag("wait", "SCALE", slot)
-        if duplicate:
-            flag("wait", "PACKED", slot)
-        if archive:
-            flag("wait", "MTE3_V", slot)
-    return tuple(tuple(q) for q in queues.values())
+    for task, splits in enumerate(tasks):
+        emit("V", "zero_state", task, splits)
+        for split in range(splits):
+            fence("V_MTE2", drop_v_mte2, duplicate_v_mte2)
+            emit("MTE2", "load", task, split)
+            fence("MTE2_V", drop_mte2_v)
+            emit("V", "merge", task, split)
+        emit("V", "normalize", task, splits)
+        emit("V", "cast", task, splits)
+        fence("V_MTE3", drop_v_mte3)
+        emit("MTE3", "store", task, splits)
+        fence("MTE3_V", drop_mte3_v)
+    return tuple(tuple(queues[pipe]) for pipe in QUEUES)
 
 
 def explore(queues):
-    keys = sorted({cmd[1:] for q in queues for cmd in q if cmd[0] in ("set", "wait")})
+    keys = sorted({cmd[1] for q in queues for cmd in q if cmd[0] in ("set", "wait")})
     key_index = {key: i for i, key in enumerate(keys)}
-    sets = Counter(cmd[1:] for q in queues for cmd in q if cmd[0] == "set")
-    waits = Counter(cmd[1:] for q in queues for cmd in q if cmd[0] == "wait")
+    sets = Counter(cmd[1] for q in queues for cmd in q if cmd[0] == "set")
+    waits = Counter(cmd[1] for q in queues for cmd in q if cmd[0] == "wait")
     assert sets == waits, "unbalanced token census"
-    # Owners: packed, scales, intermediate pages, archived score panels.
-    start = ((0, 0, 0), (0,) * len(keys), (-1,) * 8, 0)
+    # State: the three queue PCs, the marking, the owner of the single workspace
+    # landing, the owner of the single output row, how many records the running state
+    # has absorbed, which task that state belongs to, and whether it is normalized.
+    start = ((0, 0, 0), (0,) * len(keys), None, None, 0, None, False)
     pending = deque([start])
     seen = {start}
     terminals = 0
     while pending:
-        pcs, marking, owners, retired = pending.popleft()
+        pcs, marking, landing, outrow, merged, owner, normalized = pending.popleft()
         progress = False
         for pipe, queue in enumerate(queues):
             if pcs[pipe] == len(queue):
                 continue
-            op, slot_or_route, value = queue[pcs[pipe]]
-            tokens, live = list(marking), list(owners)
-            next_retired = retired
-            if op in ("set", "wait"):
-                index = key_index[(slot_or_route, value)]
-                if op == "wait" and tokens[index] == 0:
-                    continue
-                assert op != "set" or tokens[index] == 0, "double SET loses token"
-                tokens[index] = int(op == "set")
-            else:
-                slot, iteration = slot_or_route, value
-                packed, scale, page, panel = slot, 2 + slot, 4 + slot, 6 + slot
-                if op == "load_packed":
-                    assert live[packed] == -1, "packed overwrite"
-                    live[packed] = iteration
-                elif op == "load_scale":
-                    assert live[scale] == -1, "scale overwritten before recurrence"
-                    live[scale] = iteration
-                elif op == "dequant":
-                    assert live[packed] == iteration and live[page] == -1, "dequant ownership"
-                    live[packed], live[page] = -1, iteration
-                elif op == "gemv":
-                    assert live[page] == iteration and live[panel] == -1, "score overwrite"
-                    live[panel] = iteration
-                elif op == "archive":
-                    assert live[panel] == iteration, "archive read race"
-                    live[panel] = -1
-                elif op == "recurrence":
-                    assert retired == iteration, "online state reordered"
-                    assert live[page] == live[scale] == iteration, "recurrence ownership"
-                    live[page] = live[scale] = -1
-                    # The non-archiving Split-K panel has only a V reader.
-                    if not any(k[0] == "MTE3_V" for k in keys):
-                        live[panel] = -1
-                    next_retired += 1
+            op = queue[pcs[pipe]]
+            tokens = list(marking)
+            next_landing, next_outrow = landing, outrow
+            next_merged, next_owner, next_normalized = merged, owner, normalized
+            if op[0] in ("set", "wait"):
+                index = key_index[op[1]]
+                if op[0] == "wait":
+                    if tokens[index] == 0:
+                        continue
+                    tokens[index] = 0
                 else:
-                    raise AssertionError(op)
-            progress = True
-            next_pcs = list(pcs)
-            next_pcs[pipe] += 1
-            state = (tuple(next_pcs), tuple(tokens), tuple(live), next_retired)
-            if state not in seen:
-                seen.add(state)
-                pending.append(state)
-        if not progress:
-            assert all(pc == len(q) for pc, q in zip(pcs, queues)), "deadlock / unprimed cycle"
-            assert not any(marking) and all(x == -1 for x in owners), "token or buffer leak"
-            terminals += 1
-    assert terminals, "no finite drain"
-    return len(seen)
-
-
-# --------------------------------------------------------------------------
-# The Split-K reduction's record ring (ReduceHead in
-# kernels/ops/turboquant/turboquant_single_token_decode_splitk_aiv.cpp).
-#
-# A second, independent bounded marked graph in the same block, entered only
-# after the grid barrier. It has the same shape as the strip ring -- two slots,
-# capacity-one credits on both routes, primed before the loop and drained
-# after it, including the slot a K below the ring depth never fills -- over a
-# different payload: one packed partial-state record per split instead of a
-# packed strip, and no archive edge.
-#
-# Its routes carry IDs of their own (V_MTE2 4/5, MTE2_V 2/3) because the strip
-# ring's are audited per ID by section 5; the model names the routes, so what
-# it proves is the structure, and the ID disjointness is the kernel's own
-# static constants.
-def reduce_schedule(splits, unprime=False, no_refill_credit=False, leak=False,
-                    merge_without_ready=False):
-    queues = {p: [] for p in ("MTE2", "V", "MTE3")}
-
-    def emit(pipe, op, *args):
-        queues[pipe].append((op, *args))
-
-    def set_flag(route, slot):
-        emit({"FREE": "V", "READY": "MTE2", "EGRESS": "V"}[route], "set", route, slot)
-
-    def wait_flag(route, slot):
-        emit({"FREE": "MTE2", "READY": "V", "EGRESS": "MTE3"}[route], "wait", route, slot)
-
-    def fetch(split, slot):
-        wait_flag("FREE", slot)
-        emit("MTE2", "load_record", slot, split)
-        if not merge_without_ready:
-            set_flag("READY", slot)
-
-    # The prologue: the reducing block decoded another head, so the gate is
-    # re-read and the running state re-seeded before the first record lands.
-    emit("MTE2", "load_gate", 0, 0)
-    emit("V", "seed", 0, 0)
-    # The gate's own place: a third slot of the READY route, which the kernel
-    # spells as a distinct MTE2_V id for the same reason.
-    set_flag("READY", 2)
-    wait_flag("READY", 2)
-
-    for slot in range(2):
-        if not unprime:
-            set_flag("FREE", slot)
-    for split in range(min(splits, 2)):
-        fetch(split, split)
-    for split in range(splits):
-        slot = split % 2
-        if not merge_without_ready:
-            wait_flag("READY", slot)
-        emit("V", "merge", slot, split)
-        if not leak:
-            set_flag("FREE", slot)
-        if split + 2 < splits:
-            if no_refill_credit:
-                emit("MTE2", "load_record", slot, split + 2)
-                set_flag("READY", slot)
-            else:
-                fetch(split + 2, slot)
-    for slot in range(2):
-        if not unprime and not leak:
-            wait_flag("FREE", slot)
-    emit("V", "egress", 0, 0)
-    set_flag("EGRESS", 0)
-    wait_flag("EGRESS", 0)
-    emit("MTE3", "store_context", 0, 0)
-    return tuple(tuple(q) for q in queues.values())
-
-
-def explore_reduce(queues, splits):
-    keys = sorted({cmd[1:] for q in queues for cmd in q if cmd[0] in ("set", "wait")})
-    key_index = {key: i for i, key in enumerate(keys)}
-    sets = Counter(cmd[1:] for q in queues for cmd in q if cmd[0] == "set")
-    waits = Counter(cmd[1:] for q in queues for cmd in q if cmd[0] == "wait")
-    assert sets == waits, "unbalanced token census"
-    # Per-slot record owner, how many splits have been merged, whether the
-    # state is seeded and whether the context panel holds the egress result.
-    start = ((0, 0, 0), (0,) * len(keys), (-1, -1), 0, False, False)
-    pending = deque([start])
-    seen = {start}
-    terminals = 0
-    while pending:
-        pcs, marking, owners, merged, seeded, context = pending.popleft()
-        progress = False
-        for pipe, queue in enumerate(queues):
-            if pcs[pipe] == len(queue):
-                continue
-            op, slot, value = queue[pcs[pipe]]
-            tokens, live = list(marking), list(owners)
-            next_merged, next_seeded, next_context = merged, seeded, context
-            if op in ("set", "wait"):
-                index = key_index[(slot, value)]
-                if op == "wait" and tokens[index] == 0:
-                    continue
-                assert op != "set" or tokens[index] == 0, "double SET loses token"
-                tokens[index] = int(op == "set")
-            elif op == "load_gate":
-                pass
-            elif op == "seed":
-                next_seeded = True
-            elif op == "load_record":
-                assert live[slot] == -1, "record slot overwritten before its merge"
-                live[slot] = value
-            elif op == "merge":
-                assert seeded, "merged into an unseeded running state"
-                assert live[slot] == value, "merge read the wrong record"
-                # Splits may merge in any order and still be correct -- the
-                # recurrence is associative and commutative -- but the record
-                # a merge consumes must be the one its slot holds.
-                live[slot] = -1
+                    assert tokens[index] == 0, "double SET loses token"
+                    tokens[index] = 1
+            elif op[0] == "zero_state":
+                # The running (max, sum, Acc) belong to one task at a time. Re-seeding
+                # them while the previous task's output row is still owed to MTE3 is
+                # legal; overwriting the ROW is not, and `cast` is what checks that.
+                next_owner, next_merged, next_normalized = op[1], 0, False
+            elif op[0] == "load":
+                assert next_landing is None, (
+                    "workspace landing overwritten before its merge consumed it")
+                next_landing = (op[1], op[2])
+            elif op[0] == "merge":
+                assert next_landing == (op[1], op[2]), (
+                    "merge read an unwritten or stale workspace landing")
+                assert next_owner == op[1] and not next_normalized, (
+                    "merged into another task's running state")
+                next_landing = None
                 next_merged += 1
-            elif op == "egress":
-                assert merged == splits, "egress before every split merged"
-                next_context = True
-            elif op == "store_context":
-                assert context, "context stored before the egress produced it"
-                next_context = False
+            elif op[0] == "normalize":
+                assert next_owner == op[1] and next_merged == op[2], (
+                    "normalized before every split was merged")
+                next_normalized = True
+            elif op[0] == "cast":
+                assert next_normalized and next_owner == op[1], (
+                    "cast an unnormalized accumulator")
+                assert next_outrow is None, (
+                    "output row overwritten before MTE3 read the previous task's")
+                next_outrow = op[1]
+            elif op[0] == "store":
+                assert next_outrow == op[1], "stored an unwritten output row"
+                next_outrow = None
             else:
-                raise AssertionError(op)
+                raise AssertionError(op[0])
             progress = True
             next_pcs = list(pcs)
             next_pcs[pipe] += 1
-            state = (tuple(next_pcs), tuple(tokens), tuple(live), next_merged,
-                     next_seeded, next_context)
+            state = (tuple(next_pcs), tuple(tokens), next_landing, next_outrow,
+                     next_merged, next_owner, next_normalized)
             if state not in seen:
                 seen.add(state)
                 pending.append(state)
         if not progress:
-            assert all(pc == len(q) for pc, q in zip(pcs, queues)), "deadlock / unprimed cycle"
-            assert not any(marking) and all(x == -1 for x in owners), "token or buffer leak"
-            assert merged == splits and not context, "reduction did not drain"
+            assert all(pc == len(q) for pc, q in zip(pcs, queues)), (
+                "deadlock / unprimed cycle")
+            assert not any(marking), "nonempty final marking: a hardware flag left set"
+            assert landing is None and outrow is None, "buffer leak"
             terminals += 1
     assert terminals, "no finite drain"
     return len(seen)
@@ -284,35 +194,26 @@ def explore_reduce(queues, splits):
 
 def main():
     total = 0
-    for archive in (False, True):
-        for count in (0, 1, 2, 3, 4, 5, 8, 16, 64):
-            states = explore(schedule(count, archive))
-            total += states
-            print(f"PASS {'AIV' if archive else 'Split-K'} N={count}: {states} reachable states, empty final marking")
-    for mutation in ("unprime", "duplicate", "early_scale"):
+    # Every split count the host tiling can emit for this reducer (the fused operator's
+    # K is 1..8), at one task and at consecutive tasks on the same block, plus the empty
+    # reduce task a block gets when its share of (token, head) pairs runs out.
+    for tasks in ((0,), (1,), (2,), (3,), (4,), (5,), (8,), (1, 1), (2, 3), (8, 8),
+                  (0, 4), (4, 0), (3, 1, 2)):
+        states = explore(schedule(tasks))
+        total += states
+        print(f"PASS reduction tasks={tasks}: {states} reachable states, "
+              f"empty final marking")
+    controls = ("drop_v_mte2", "drop_mte2_v", "drop_v_mte3", "drop_mte3_v",
+                "duplicate_v_mte2")
+    for mutation in controls:
         try:
-            explore(schedule(4, **{mutation: True}))
+            explore(schedule((3, 2), **{mutation: True}))
         except AssertionError as error:
             print(f"PASS rejected negative control: {mutation}: {error}")
         else:
-            raise AssertionError(f"accepted unsafe schedule: {mutation}")
-    # Every K the kernel accepts, plus the two below the ring depth.
-    for splits in (1, 2, 3, 4, 5, 8, 12, 16):
-        states = explore_reduce(reduce_schedule(splits), splits)
-        total += states
-        print(f"PASS reduction K={splits}: {states} reachable states, empty final marking")
-    # `merge_without_ready` drops the forward edge AND its SET, so the census
-    # still balances: it is the control that has to be caught by ownership
-    # rather than by counting, and it is the shape a reduction that trusted
-    # program order across two queues would have.
-    for mutation in ("unprime", "no_refill_credit", "leak", "merge_without_ready"):
-        try:
-            explore_reduce(reduce_schedule(5, **{mutation: True}), 5)
-        except AssertionError as error:
-            print(f"PASS rejected negative control: reduction {mutation}: {error}")
-        else:
             raise AssertionError(f"accepted unsafe reduction schedule: {mutation}")
-    print(f"PASS {total} states: 1-safe, ordered ownership, liveness, finite drain; 7 negative controls")
+    print(f"PASS {total} states: 1-safe, ordered ownership across the reduce-task "
+          f"boundary, liveness, finite drain; {len(controls)} negative controls")
 
 
 if __name__ == "__main__":

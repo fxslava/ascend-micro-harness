@@ -78,8 +78,6 @@ for f in tests/npu/validation/test_turboquant_a8_validation.cpp \
          tests/npu/bench/bench_turboquant_reshape_and_cache.cpp \
          tests/npu/bench/bench_turboquant_decode_splitk.cpp \
          tests/npu/validation/test_turboquant_decode_splitk_aic_validation.cpp \
-         tests/npu/validation/test_turboquant_decode_splitk_aiv_validation.cpp \
-         tests/npu/test_npu_decode_single_token_unaligned.cpp \
          tests/camodel/test_camodel_turboquant_reshape_and_cache_a8.cpp \
          tests/camodel/test_camodel_turboquant_reshape_and_cache_bf16.cpp \
          tests/research/test_cluster_sync_probe.cpp; do

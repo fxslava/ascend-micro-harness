@@ -18,7 +18,7 @@ struct FakeRig {
         pending = true;
         ++launches;
     }
-    tq_splitk_rig::AivRig::Census Validate(int) {
+    tq_splitk_rig::Census Validate(int) {
         require(!pending && launches == expected && validations == 0,
                 "validation must run once after all synchronized launches");
         ++validations;

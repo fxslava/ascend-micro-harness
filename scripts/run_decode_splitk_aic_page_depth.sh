@@ -51,10 +51,13 @@ configure_and_build() {
     rsync -a --delete --exclude '.git' --exclude 'bin' --exclude 'probe/prof_output' \
         "${repo_dir}/" "${src_dir}/"
     rm -rf "${build_dir}"
+    # --impl aic needs the AIC decoder compiled into the benchmark, which is
+    # TQ_BENCH_LEGACY_DECODERS; it is OFF by default now that the AIV decoder is deleted
+    # and both benchmark targets isolate the fused operator.
     cmake -S "${src_dir}" -B "${build_dir}" -G "Unix Makefiles" \
         -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION="${soc}" \
-        -DASCEND_HOME_PATH="${toolkit}"
-    cmake --build "${build_dir}" --target bench_decode_splitk_sim -j 4
+        -DASCEND_HOME_PATH="${toolkit}" -DTQ_BENCH_LEGACY_DECODERS=ON
+    cmake --build "${build_dir}" --target bench_decode_splitk_sim -j"${JOBS:-$(nproc)}"
 }
 
 sim_env() {

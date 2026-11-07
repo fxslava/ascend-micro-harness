@@ -93,11 +93,15 @@ if [[ -z "${L2ATOMIC_SKIP_BUILD:-}" ]]; then
     cmake -S "${src_dir}" -B "${build_dir}" -G "Unix Makefiles" \
         -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION="${soc}" \
         -DASCEND_HOME_PATH="${toolkit}"
-    cmake --build "${build_dir}" --target test_camodel_l2_atomic_synthetic -j 4
+    # One invocation for whatever this run needs, not one per target: CANN recompiles
+    # each ascendc_library's preprocess core objects on every `cmake --build` (the
+    # top-level CMakeLists.txt has the figures), so a second invocation pays that again
+    # for libraries the first one already built.
+    probe_targets=(test_camodel_l2_atomic_synthetic)
     if [[ "${mode_word}" == "baseline" || "${mode_word}" == "all" ]]; then
-        cmake --build "${build_dir}" \
-            --target test_camodel_cube_single_tile_baseline -j 4
+        probe_targets+=(test_camodel_cube_single_tile_baseline)
     fi
+    cmake --build "${build_dir}" --target "${probe_targets[@]}" -j"${JOBS:-$(nproc)}"
 fi
 
 export LD_LIBRARY_PATH="${build_dir}/lib:${sim_lib_dir}:${toolkit}/lib64:${toolkit}/devlib:${LD_LIBRARY_PATH:-}"

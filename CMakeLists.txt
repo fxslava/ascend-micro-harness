@@ -56,6 +56,66 @@ if(TQ_GEMM_REDUCE)
   set(TQ_FUSED_DECODE_REDUCE_DEFINES -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1)
 endif()
 
+# ------------------------------------------------------------------ build time
+# WHAT ONE ascendc_library COSTS, MEASURED
+#
+# It is not one compile of the kernel. CANN's legacy pipeline
+# (tools/tikcpp/ascendc_kernel_cmake/legacy_modules/function.cmake) expands each
+# ascendc_library into nested ExternalProjects, and its device_preprocess_project
+# builds THREE libraries out of the same source -- preprocess_obj with -E, aiv_obj
+# and aic_obj -- before the separate aic_device and aiv_device projects compile the
+# generated translation unit and the host project compiles the kernel again. A clean
+# build of test_camodel_fused_decode_opt on this harness's development host measures
+# 2479 s, over seven compiles that each pull the whole kernel in: five of the kernel
+# source itself (precompile_obj, preprocess_obj, aic_obj, aiv_obj, host_bisheng_obj)
+# and two of the generated translation unit that includes it (the aic and aiv
+# device_obj). The fused decode operator is the expensive one because it pulls the
+# cube, vector and reduction services in through templates.
+#
+# Every one of those ExternalProjects carries BUILD_ALWAYS TRUE, and
+# cmake/CannRebuild.cmake must delete the preprocess core objects before each build:
+# CANN links them in place, turning ET_REL into ET_EXEC, and its always-run merge
+# step then cannot link them a second time -- `ld.lld -m aicorelinux -Ttext=0 x.o -o
+# x.o` on an ET_EXEC answers "unknown file type", which is why that step exists and
+# why it cannot simply be dropped. So aiv_obj and aic_obj are recompiled on EVERY
+# build whether anything changed or not, and that is CANN's design rather than
+# something this repository can switch off.
+#
+# WHAT CAN BE DONE ABOUT IT
+#
+# Those recompiles are the same command over the same unchanged input, which is
+# exactly what a compiler cache is for, and CANN forwards
+# CMAKE_C_COMPILER_LAUNCHER/CMAKE_CXX_COMPILER_LAUNCHER onto the configure line of
+# every one of its nested projects -- it is the one hook that reaches the compiles
+# that cost the time. With a cache present the duplicated compiles inside a single
+# clean build and every rebuild after the first become hits.
+#
+# Found, never required: a host with no cache builds exactly as it did before, and
+# -DASCEND_MICRO_COMPILER_CACHE=OFF disables it where one is installed but unwanted,
+# which is what to pass when bisecting a suspected miscompile. An explicit
+# -DCMAKE_CXX_COMPILER_LAUNCHER=... on the command line wins over this block.
+#
+# The other half of the cost is in how the build is INVOKED. `cmake --build` with one
+# target per invocation pays the BUILD_ALWAYS recompile of every ascendc_library in
+# the dependency chain once per invocation; naming every target in a single
+# invocation pays it once. The scripts under scripts/ do that now, and they take -j
+# from the host's core count because the aic and aiv device legs are independent
+# ExternalProjects that can overlap.
+option(ASCEND_MICRO_COMPILER_CACHE
+    "Route the BiSheng and host compiles through ccache/sccache when one is installed" ON)
+if(ASCEND_MICRO_COMPILER_CACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+  find_program(ASCEND_MICRO_COMPILER_CACHE_PROGRAM NAMES ccache sccache)
+  if(ASCEND_MICRO_COMPILER_CACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${ASCEND_MICRO_COMPILER_CACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${ASCEND_MICRO_COMPILER_CACHE_PROGRAM}")
+    message(STATUS "Compiler cache: ${ASCEND_MICRO_COMPILER_CACHE_PROGRAM}, forwarded into "
+                   "CANN's nested device projects")
+  else()
+    message(STATUS "Compiler cache: none found. CANN recompiles each kernel's preprocess "
+                   "core objects on every build; install ccache to make those hits.")
+  endif()
+endif()
+
 set(ASCENDC_CMAKE_DIR
     "${ASCEND_HOME_PATH}/tools/tikcpp/ascendc_kernel_cmake")
 if(NOT EXISTS "${ASCENDC_CMAKE_DIR}/ascendc.cmake")
@@ -90,6 +150,23 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 #   cmake -B <dir> -DTQ_VLLM_INTEGRATION_LAYER=ON
 option(TQ_VLLM_INTEGRATION_LAYER
     "Build the staged vLLM integration layer's device legs as well as its host gate" OFF)
+
+# The decode benchmark's kernel isolation, declared here for the third time for the same
+# reason as the two options above: cmake/NpuTargets.cmake and cmake/SimTargets.cmake compile
+# the IDENTICAL driver source (tests/npu/bench/bench_turboquant_decode_splitk.cpp), so an
+# option visible to one leg only would benchmark one set of kernels on the simulator and
+# another on the physical device, and whichever leg a given host can build would decide which
+# comparison it gets. It used to be declared inside add_ascend_micro_npu_targets(), which runs
+# AFTER add_ascend_micro_sim_targets(), so the simulator leg could not see it at all and
+# hard-coded TQ_BENCH_LEGACY_DECODERS=1 instead.
+#
+# OFF, the default, puts exactly one kernel in both benchmark binaries: the fused decode
+# operator. ON adds the AIC paged-decode comparison columns, which is what
+# scripts/profile_camodel_trace.sh, scripts/run_decode_splitk_aic_page_depth.sh,
+# scripts/run_decode_splitk_aic_page_race.sh and scripts/run_decode_splitk_strip_ladder.sh
+# need. There is no AIV setting: that decoder is deleted.
+option(TQ_BENCH_LEGACY_DECODERS
+    "Benchmark the AIC split-K decoder alongside the fused decode operator" OFF)
 
 include(cmake/SimTargets.cmake)
 include(cmake/NpuTargets.cmake)

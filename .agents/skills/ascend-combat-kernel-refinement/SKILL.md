@@ -22,7 +22,9 @@ Before pushing a pipeline refactor or tagging it for hardware:
 5. Audit each run's dispatch/completion flags, empty drain and instruction
    census. Require measured overlapping engine intervals for an overlap claim.
 
-For the two AIV decode kernels, start with
-`bash scripts/run_decode_pipeline_camodel.sh`; continue with the regular varied
-score and production Split-K runners. Report unavailable gates as pending and
-distinguish simulator observations from hardware performance.
+For the fused decode operator -- the only decode kernel left, after the two AIV
+single-token decoders were deleted -- start with
+`bash scripts/run_fused_decode_canary_ladder.sh`; continue with the varied-score
+rungs and the simulator benchmark's smoke case
+(`bash scripts/run_decode_splitk_bench.sh smoke`). Report unavailable gates as
+pending and distinguish simulator observations from hardware performance.

@@ -51,7 +51,7 @@ if [[ "${mode}" != "run-only" && "${mode}" != "profile-only" ]]; then
         -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION="${soc}" \
         -DASCEND_HOME_PATH="${toolkit}"
     if [[ "${mode}" == "micro" ]]; then
-        cmake --build "${build_dir}" --target "test_camodel_${micro_name}" -j 4
+        cmake --build "${build_dir}" --target "test_camodel_${micro_name}" -j"${JOBS:-$(nproc)}"
     else
         cmake --build "${build_dir}" --target test_pipeline_deadlock_probe_camodel -j 4
     fi

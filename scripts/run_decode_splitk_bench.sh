@@ -7,6 +7,7 @@
 #   bash scripts/run_decode_splitk_bench.sh smoke       # the cheap functional smoke, on sim
 #
 # Overrides: ASCEND_HOME_PATH, SOC_VERSION, SPLITK_BUILD_DIR, SPLITK_SRC_DIR,
+#            SPLITK_LEGACY_DECODERS=ON to build the AIC comparison columns in,
 # SPLITK_TIMEOUT.
 #
 # Two binaries, and the difference matters
@@ -62,10 +63,18 @@ configure_and_build() {
     rsync -a --delete --exclude '.git' --exclude 'bin' --exclude 'probe/prof_output' \
         "${repo_dir}/" "${src_dir}/"
     rm -rf "${build_dir}"
+    # TQ_BENCH_LEGACY_DECODERS adds the AIC paged-decode comparison columns to the
+    # benchmark. OFF, the default, puts only the fused decode operator in the binary, so
+    # --impl aic needs this script run with SPLITK_LEGACY_DECODERS=ON. There is no AIV
+    # setting: that decoder is deleted.
     cmake -S "${src_dir}" -B "${build_dir}" -G "Unix Makefiles" \
         -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION="${soc}" \
-        -DASCEND_HOME_PATH="${toolkit}"
-    cmake --build "${build_dir}" --target "${target}" -j 4
+        -DASCEND_HOME_PATH="${toolkit}" \
+        -DTQ_BENCH_LEGACY_DECODERS="${SPLITK_LEGACY_DECODERS:-OFF}"
+    # -j from the host's core count: CANN's aic and aiv device legs are independent
+    # ExternalProjects and overlap. The top-level CMakeLists.txt has the build-time
+    # figures and the compiler-cache hook that makes a rebuild cheap.
+    cmake --build "${build_dir}" --target "${target}" -j"${JOBS:-$(nproc)}"
 }
 
 case "${mode}" in
@@ -96,8 +105,14 @@ sim|smoke)
     if [[ "${mode}" == "smoke" ]]; then
         # K=2 carries state across pages; K=4 includes an empty worker.
         # --single launches exactly once per selected implementation/case.
-        set -- --context 48 --page-tokens 16 --heads 1 --rows 1 \
-            --splitk "2,4" --single --impl both
+        #
+        # The smoke case used to be `--page-tokens 16 ... --impl both`, which was the AIV
+        # and AIC pair. The AIV decoder is deleted and the fused operator does not take
+        # 16-token pages, so this is the same two properties on the implementation that is
+        # left: three 64-token pages, so K=2 carries state across a page boundary and K=4
+        # leaves one worker with no pages at all.
+        set -- --context 192 --page-tokens 64 --heads 1 --rows 16 \
+            --splitk "2,4" --single --impl fused-opt
     fi
     timeout "${run_timeout}" ./lib/bench_decode_splitk_sim "$@"
     ;;

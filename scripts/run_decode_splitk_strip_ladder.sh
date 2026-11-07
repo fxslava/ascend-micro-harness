@@ -46,7 +46,8 @@ build_sim() {
     mkdir -p "${work}"
     SPLITK_SRC_DIR="${work}/src" SPLITK_BUILD_DIR="${work}/build" \
         ASCEND_HOME_PATH="${toolkit}" SOC_VERSION="${soc}" \
-        bash "${repo_dir}/scripts/run_decode_splitk_bench.sh" sim --help \
+        SPLITK_LEGACY_DECODERS=ON \
+            bash "${repo_dir}/scripts/run_decode_splitk_bench.sh" sim --help \
         >"${work}/build.log" 2>&1
     local status=$?
     if (( status != 0 )); then

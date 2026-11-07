@@ -13,7 +13,21 @@ export ASCEND_HOME_PATH="$toolkit"
 if [[ "${1:-}" != reuse ]]; then
     g++ -std=c++17 -O2 -Wall -Wextra -Werror "$repo/tests/cpu/test_fused_decode_opt_contract.cpp" -o "$root/host-contract"
     "$root/host-contract" | tee "$root/host-contract.log"
+    # Two of the operator's three capacity-one models: the attention ring, and the vector
+    # partial reducer that -DTQ_GEMM_REDUCE=OFF selects (section 1 of
+    # REFINEMENT_OF_COMBAT_KERNELS.md lists all three). Running only the first used to be
+    # enough when the reduction legs had no model; both have one now, and at splits = 1 the
+    # ladder below never enters a reduction at all, so the reducer's ring is a host gate or
+    # it is nothing.
+    #
+    # The THIRD model, tests/cpu/test_gemm_reduce_model.py for the Cube GEMM reduction that
+    # TQ_GEMM_REDUCE=ON selects by default, is deliberately NOT run here. Its batched legs
+    # explore 15 M states and take over half an hour, and it already has its own driver,
+    # scripts/run_gemm_reduce_camodel.sh, which is where that operator's evidence lives. Run
+    # that ladder when the reduction phase changes; putting it inline here would add half an
+    # hour to every canary run for a gate nothing in this ladder can invalidate.
     python3 -u "$repo/tests/cpu/test_fused_decode_opt_model.py" >"$root/host-model.log"
+    python3 -u "$repo/tests/cpu/test_decode_ring_model.py" >"$root/host-vector-reducer-model.log"
     python3 "$repo/tests/cpu/test_fused_decode_opt_trace.py" >"$root/host-audit-controls.log" 2>&1
     mkdir -p "$root/src"
     if command -v rsync >/dev/null; then
@@ -23,7 +37,26 @@ if [[ "${1:-}" != reuse ]]; then
             tar -C "$root/src" -xf -
     fi
     cmake -S "$root/src" -B "$root/build" -DASCEND_HOME_PATH="$toolkit" -DSOC_VERSION="$soc" >"$root/configure.log" 2>&1
-    cmake --build "$root/build" --target test_camodel_fused_decode_opt turboquant_fused_decode_opt_npu -j4 >"$root/build.log" 2>&1 || { tail -100 "$root/build.log"; exit 1; }
+    # ONE cmake --build invocation for both targets, and -j from the host's core count.
+    #
+    # Each ascendc_library in the chain is recompiled by BUILD_ALWAYS on every
+    # invocation -- the top-level CMakeLists.txt has the measured figures and why CANN
+    # needs it -- so two invocations cost that twice. The aic and aiv device legs are
+    # independent ExternalProjects, so the jobs are used.
+    #
+    # turboquant_fused_decode_opt_npu is the section 2 strict-compile gate on the
+    # PHYSICAL leg: the same operator source at RUN_MODE=npu, which is a second full
+    # pass through BiSheng and about half this script's build time. It belongs in the
+    # pre-push ladder, so it is built by default. Set
+    # FUSED_DECODE_OPT_SKIP_NPU_GATE=1 to drop it while iterating on the CAModel
+    # rungs, and run the ladder without it once before pushing.
+    build_targets=(test_camodel_fused_decode_opt)
+    if [[ -z "${FUSED_DECODE_OPT_SKIP_NPU_GATE:-}" ]]; then
+        build_targets+=(turboquant_fused_decode_opt_npu)
+    else
+        printf 'NOTE: the physical-leg compile gate (turboquant_fused_decode_opt_npu) is SKIPPED\n'
+    fi
+    cmake --build "$root/build" --target "${build_targets[@]}" -j"${JOBS:-$(nproc)}" >"$root/build.log" 2>&1 || { tail -100 "$root/build.log"; exit 1; }
 else
     shift
 fi
