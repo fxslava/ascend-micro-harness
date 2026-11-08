@@ -94,25 +94,34 @@ int chunk_head(int chunk) { return chunk % kHeads; }
 void usage(std::FILE* output, const char* argv0)
 {
     std::fprintf(output,
-                 "Usage: %s [--slices N] [--mode4-single-shot]\n"
-                 "  N aligned 16-token strips in ONE monolithic grid of N\n"
-                 "  blocks (default 1, 1..%d). There is no launch window: a\n"
-                 "  grid wider than the AI Core count spans several physical\n"
-                 "  waves inside the single dispatch, which is the case the\n"
-                 "  inter-wave protocol exists for.\n"
-                 "  The default is the recycled two-slot mode-4 channel\n"
-                 "  entry point; --mode4-single-shot dispatches the fallback\n"
-                 "  that gives every event its own id. Audit the trace either\n"
-                 "  way, do not read the PASS line: two earlier runs of the\n"
-                 "  recycled policy produced bit-exact output while their\n"
-                 "  traces showed a second wait passing before its set. That\n"
-                 "  was an un-drained announcement overtaking its own pipeline\n"
-                 "  (guidelines 6.2a); the fences are in place now and\n"
-                 "  scripts/audit_cross_core_fences.py keeps them there.\n",
+                 "Usage: %s [--slices N] [--strips-per-block S]\n"
+                 "          [--mode2 | --mode4-single-shot]\n"
+                 "  N aligned 16-token strips (default 1, 1..%d), dispatched\n"
+                 "  as ONE monolithic grid of N / S blocks of S strips each.\n"
+                 "  There is no launch window: a grid wider than the AI Core\n"
+                 "  count spans several physical waves inside the single\n"
+                 "  dispatch, which is the case the inter-wave protocol exists\n"
+                 "  for.\n"
+                 "  S defaults to 1. S > 1 exercises the in-block strip\n"
+                 "  stream -- one prime, one drain, and the cross-core\n"
+                 "  counters carried across strip boundaries. N must be a\n"
+                 "  multiple of S, and S > 1 needs the mode-2 entry point.\n"
+                 "  --mode2 is the default: one readiness quorum and one\n"
+                 "  release broadcast, on channels that count.\n"
+                 "  --mode4-single-shot dispatches the mode-4 fallback that\n"
+                 "  gives every event its own id; it runs one strip per block.\n"
+                 "  --mode4-reuse is still accepted and now selects --mode2:\n"
+                 "  the recycled mode-4 ring it used to name is refuted and no\n"
+                 "  longer reachable from this kernel\n"
+                 "  (reports/bf16_prefill_key_plane_fix.md).\n"
+                 "  Audit the trace either way, do not read the PASS line:\n"
+                 "  two runs of the recycled policy produced bit-exact output\n"
+                 "  while their traces showed a second wait passing before its\n"
+                 "  set, and a third produced the wrong answer.\n",
                  argv0, kMaxSlices);
 }
 
-int run(int slices, bool reuse_mode4)
+int run(int slices, bool mode2, int strips_per_block)
 {
     Shape shape;
     shape.num_tokens = slices * kBlockSize;
@@ -121,6 +130,18 @@ int run(int slices, bool reuse_mode4)
     shape.block_size = kBlockSize;
     shape.num_blocks = tq_oracle::fragmented_num_blocks(slices);
     require(shape.valid(), "unsupported shape");
+    // tokensPerCore is the block's share of the context in TOKENS. At S = 1 it
+    // is one strip per block, which is every rung this probe used to run; at
+    // S > 1 one block streams S strips over the mode-2 rendezvous, which is the
+    // case the in-block loop exists for and the only case in which a strip
+    // boundary is crossed without a prime or a drain.
+    require(strips_per_block >= 1, "strips per block must be at least 1");
+    require(slices % strips_per_block == 0,
+            "the strip count must be a whole number of blocks");
+    require(mode2 || strips_per_block == 1,
+            "the mode-4 fallback runs one strip per block: its eleven ids per "
+            "sub block are exactly the eight-chunk schedule");
+    const int tokens_per_core = strips_per_block * kBlockSize;
     const int head_bytes = shape.head_bytes();
     const int channels = kHeads * kHeadSize;
 
@@ -207,7 +228,7 @@ int run(int slices, bool reuse_mode4)
         static_cast<std::uint32_t>(shape.head_size),
         static_cast<std::uint32_t>(shape.block_size),
         static_cast<std::uint32_t>(shape.num_blocks),
-        static_cast<std::uint32_t>(shape.block_size), shape.inv_sqrt_len(), reuse_mode4);
+        static_cast<std::uint32_t>(tokens_per_core), shape.inv_sqrt_len(), mode2);
     camodel::check(aclrtSynchronizeStream(session.stream), "aclrtSynchronizeStream");
 
     key_cache.download();
@@ -258,8 +279,17 @@ int run(int slices, bool reuse_mode4)
     // ---- checks 3-5: bit-exact payloads ----------------------------------
     std::size_t key_bytes = 0, value_bytes = 0, scales = 0;
     int failing = 0;
-    for (int strip = 0; strip < shape.strips() && failing < 3; ++strip)
-        for (int chunk = 0; chunk < 2 * kHeads && failing < 3; ++chunk) {
+    // Every mismatching chunk is counted; the first kReportChunks of them are
+    // printed. An earlier revision broke out of both loops at the third
+    // failure, which hid the *shape* of a failure set: the four value chunks
+    // come first in chunk order, so a defect confined to the key plane was
+    // reported as "three chunks differ" with no way to see that the fourth and
+    // fifth did too. The count below is over the whole grid however many lines
+    // it prints, so "how many chunks are wrong" and "which ones were shown"
+    // are separate facts now.
+    constexpr int kReportChunks = 64;
+    for (int strip = 0; strip < shape.strips(); ++strip)
+        for (int chunk = 0; chunk < 2 * kHeads; ++chunk) {
             const int plane = chunk_plane(chunk);
             const int head = chunk_head(chunk);
             const ChunkRef& want = ref.chunk(strip, plane, head);
@@ -288,6 +318,7 @@ int run(int slices, bool reuse_mode4)
                 continue;
             }
             ++failing;
+            if (failing > kReportChunks) continue;
             std::fprintf(stderr,
                          "\nstrip %d page %d chunk %d (%s head %d): %d/%d bytes differ "
                          "(first byte %d: device 0x%02x oracle 0x%02x), %d/%d scales "
@@ -301,17 +332,23 @@ int run(int slices, bool reuse_mode4)
                                    want.packed[static_cast<std::size_t>(first_bad)]),
                          bad_scales, shape.block_size);
         }
-    if (failing != 0) throw std::runtime_error("packed cache page mismatch");
+    if (failing != 0) {
+        std::fprintf(stderr, "\n%d of %d chunks mismatch (%d printed)\n", failing,
+                     shape.strips() * 2 * kHeads,
+                     failing < kReportChunks ? failing : kReportChunks);
+        throw std::runtime_error("packed cache page mismatch");
+    }
 
     const int chunks = shape.strips() * 2 * kHeads;
     std::printf("PASS turboquant_reshape_and_cache_bf16: %d strips x 16 tokens x %d "
                 "channels, %d chunks, BF16 activations\n",
                 shape.strips(), channels, chunks);
-    std::printf("  1 launch of %d grid blocks spanning %d physical wave(s) of 32, "
-                "%s, strip s -> physical page 2s+1 of %d\n",
-                shape.strips(), (shape.strips() + 31) / 32,
-                reuse_mode4 ? "recycled two-slot mode-4 ring"
-                            : "single-shot mode-4 channels",
+    const int blocks = shape.strips() / strips_per_block;
+    std::printf("  1 launch of %d grid blocks of %d strip(s) spanning %d physical "
+                "wave(s) of 32, %s, strip s -> physical page 2s+1 of %d\n",
+                blocks, strips_per_block, (blocks + 31) / 32,
+                mode2 ? "mode-2 readiness quorum and release broadcast"
+                      : "mode-4 single-shot channels",
                 shape.num_blocks);
     std::printf("  keyCache   %zu/%d bytes bit-exact, key-major\n", key_bytes,
                 shape.strips() * kHeads * head_bytes);
@@ -337,47 +374,64 @@ int run(int slices, bool reuse_mode4)
 int main(int argc, char** argv)
 {
     int slices = 1;
+    int strips_per_block = 1;
     // The shared header's constant, so this runner cannot disagree with the
-    // kernel or the NPU harnesses about which policy ships.
-    bool reuse_mode4 = turboquant_wave::kReshapeDefaultReuse;
+    // kernel or the NPU harnesses about which discipline ships.
+    bool mode2 = turboquant_wave::kReshapeBf16DefaultMode2;
     bool saw_slices = false;
+    bool saw_strips = false;
+    // One parser for both integer options, so --slices and --strips-per-block
+    // cannot drift in how they reject a value.
+    const auto parse = [](std::string_view text, int low, int high, int& out) {
+        int value = 0;
+        const auto got =
+            std::from_chars(text.data(), text.data() + text.size(), value);
+        if (got.ec != std::errc() || got.ptr != text.data() + text.size() ||
+            value < low || value > high)
+            return false;
+        out = value;
+        return true;
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             usage(argc == 2 ? stdout : stderr, argv[0]);
             return argc == 2 ? 0 : 2;
         }
-        if (arg == "--mode4-reuse") {
-            reuse_mode4 = true;
+        // --mode4-reuse used to name the recycled two-slot ring. That ring is
+        // refuted and unreachable, so the old spelling selects the discipline
+        // that replaced it rather than silently dispatching the fallback.
+        if (arg == "--mode2" || arg == "--mode4-reuse") {
+            mode2 = true;
             continue;
         }
         if (arg == "--mode4-single-shot") {
-            reuse_mode4 = false;
+            mode2 = false;
             continue;
         }
-        if (arg == "--slices" && !saw_slices && i + 1 < argc) {
-            const std::string_view value = argv[++i];
-            int parsed_value = 0;
-            const auto parsed =
-                std::from_chars(value.data(), value.data() + value.size(), parsed_value);
-            if (parsed.ec == std::errc() && parsed.ptr == value.data() + value.size() &&
-                parsed_value >= 1 && parsed_value <= kMaxSlices) {
-                slices = parsed_value;
-                saw_slices = true;
-                continue;
-            }
+        if (arg == "--slices" && !saw_slices && i + 1 < argc &&
+            parse(argv[i + 1], 1, kMaxSlices, slices)) {
+            ++i;
+            saw_slices = true;
+            continue;
+        }
+        if (arg == "--strips-per-block" && !saw_strips && i + 1 < argc &&
+            parse(argv[i + 1], 1, kMaxSlices, strips_per_block)) {
+            ++i;
+            saw_strips = true;
+            continue;
         }
         usage(stderr, argv[0]);
         return 2;
     }
+    const char* const policy = mode2 ? "mode-2 quorum and broadcast"
+                                     : "mode-4 single-shot channels";
     try {
-        return run(slices, reuse_mode4);
+        return run(slices, mode2, strips_per_block);
     } catch (const std::exception& error) {
-        std::fprintf(stderr,
-                     "FAIL %s (%d slices, %s): %s\n", "turboquant_reshape_and_cache_bf16", slices,
-                     reuse_mode4 ? "recycled mode-4 ring"
-                                 : "single-shot mode-4 channels",
-                     error.what());
+        std::fprintf(stderr, "FAIL %s (%d slices, %d strip(s) per block, %s): %s\n",
+                     "turboquant_reshape_and_cache_bf16", slices, strips_per_block,
+                     policy, error.what());
         return 1;
     }
 }

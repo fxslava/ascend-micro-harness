@@ -807,46 +807,100 @@ Note that `CrossCoreSetFlag` calls issued back to back by one core have **no
 guaranteed order** between different flagIds. Separate them with a wait if the
 order matters.
 
-### 6.2c A recycled mode-4 flag id is a token — once the announcement is drained
+### 6.2c A recycled mode-4 flag id is NOT a token on this part — use mode 2
 
-**This section previously claimed that a mode-4 flag "is not a counting
-semaphore you can cycle an id through", and that recycling an id was refuted on
-this part. That diagnosis is wrong and is retracted. The measurements below are
-unchanged; their cause was not the flag mechanism.** Mode-4 flags do implement
-consuming-latch behaviour on Ascend 950PR and in the CANN 9.2 CAModel. What
-produced the stale releases was §6.2a's hazard — a `CrossCoreSetFlag` issued on
-the scalar unit, overtaking the pipeline work it reports, because the `pipe`
-template argument does not order it. Recycling an id turns that reordering into
-a *stale release*; single-shot allocation turns it into a harmless duplicate.
-That is why it showed under recycling and why recycling looked like the cause.
+**Read this section's history as written: it has now been revised twice, in
+opposite directions, and the measurements survived both revisions while the
+diagnosis did not.**
 
-So the rule is now a precondition rather than a prohibition:
+1. It first claimed a mode-4 flag "is not a counting semaphore you can cycle an
+   id through", on two CAModel runs in which a second wait on a recycled id
+   retired 1032 and 2179 cycles early (the tables below).
+2. That was then retracted. The runs lacked §6.2a's scalar drain in front of the
+   announcement, the cluster sync probe with drains added completed cleanly, and
+   the rule became a precondition: recycle freely, but fence every
+   announcement.
+3. **The retraction is itself wrong, and is withdrawn.** The fence is necessary
+   and is not sufficient. With every announcement drained and
+   `scripts/audit_cross_core_fences.py` green, the BF16 prefill
+   reshape-and-cache instance failed its own single-strip CAModel gate on the
+   recycled ring, and the probe reproduces the fault at four iterations.
 
-> A cyclic two-slot `READY`/`FREE` ring over recycled mode-4 ids is valid for
-> production pipelines, provided **every** announcement is preceded by its
-> `SetFlag<HardEvent::x_S>` / `WaitFlag<HardEvent::x_S>` pair on the pipe whose
-> work it reports, and provided the epilogue drains every queue before the
-> kernel body returns (§6.5, rule 3). A priming set, whose meaning is "this
-> buffer starts empty", reports no earlier work and needs no drain.
+> **A recycled mode-4 id does not reliably consume on Ascend950PR CAModel. Do
+> not cycle an id through `set_intra_block` / `wait_intra_block`. A cross-core
+> ring that must recycle belongs on mode 2, whose ids are counters.** Mode 4
+> remains correct when every id carries exactly ONE announcement, which is what
+> the single-shot fallbacks do, at eleven ids per sub block.
 
-`scripts/audit_cross_core_fences.py` is the gate for that precondition over
-both reshape-and-cache kernels and the probe below, with negative controls. It
-exists because the property is invisible to every other check here: set and
-wait counts balance without it, the id census passes, and the output can be
-bit-exact while a panel is read a generation early.
+The fence precondition of revision 2 stands unchanged for both modes: a
+`CrossCoreSetFlag` issues on the scalar unit and the `pipe` argument does not
+order it (§6.2a), so every announcement still needs its
+`SetFlag<HardEvent::x_S>` / `WaitFlag<HardEvent::x_S>` pair.
+`scripts/audit_cross_core_fences.py` is still the gate for it, over both
+reshape-and-cache kernels, the decode operator and the probe, with negative
+controls. It exists because the property is invisible to every other check
+here: set and wait counts balance without it, the id census passes, and the
+output can be bit-exact while a panel is read a generation early.
 
-#### What settled it
+#### What settles it now
 
-`tests/research/kernel_cluster_sync_probe.cpp` (targets `test_cluster_sync_probe`
-on hardware and `test_cluster_sync_probe_sim` on CAModel) isolates the
-question: one physical AI Core block, `MIX_AIC_1_2`, 1 Cube + 2 Vector cores, no
-data at all, and a multi-iteration cyclic bilateral handshake over **recycled**
-ids 0, 1, 16 and 17 — AIV *k* announces on `k*16`, the Cube waits both, drains
-`MTE1_M` then `M_S`, and releases both on `k*16 + 1`; each Vector core drains
-`V_S` before its own announcement. Both iterations executed cleanly on physical
-silicon. CAModel completed cleanly too (176,061 ticks), with no early wait
-retirement in the trace.
+Two independent measurements, both on `Ascend950PR_9599` CAModel under CANN
+9.2.0-beta.2. `reports/bf16_prefill_key_plane_fix.md` has the full traces.
 
+**The operator.** `BF16_SLICES=1` on the recycled ring: key heads 1 and 3 — the
+two key chunks AIV1 owns — disagreed with the host oracle in 2006 and 2011 of
+2048 packed bytes and in 15 of 16 scale lanes, while the other six chunks were
+bit-exact. In the trace, in RETIREMENT order:
+
+| event | CAModel tick |
+| --- | ---: |
+| Cube `SET_INTRA_BLOCK sync_id:16` (panel ready, AIV1 slot 0, generation 0) | 6960 |
+| AIV1's first wait on it retires | 6970 |
+| AIV1's **second** wait on the same id retires (issued 9534) | **9535** |
+| Cube's second `SET_INTRA_BLOCK sync_id:16` (generation 2) | 11309 |
+
+1774 cycles early, with no announcement outstanding; the same id pair one slot
+over was 2600 cycles early. AIV0's two waits on its own ids retired 10 cycles
+after each matching announcement — correct — which is why half the key plane
+was right and the failure looked like a key-plane layout defect.
+
+**The probe, at four iterations.**
+`scripts/run_cluster_sync_probe_camodel.sh 4 4`, no data in flight:
+
+```
+core0.veccore0 waits id m4:1  on VEC   ok               [36492, 37437, 47184, None]
+core0.veccore1 waits id m4:17 on VEC   early retirement [36213, 35673, 34155, None]
+VIOLATION: core0.veccore1 waits id m4:17 on VEC: wait 1 was released at tick
+158173 but the announcement that should have released it is at tick 159423.
+```
+
+Revision 2 rested on this same probe at **two** iterations, which cannot
+distinguish a blocking wait followed by a legitimately satisfied one from a
+latch that stopped blocking — the probe's own runner says so and defaults to
+four for that reason. Four shows it. Note also that it appears on AIV1's
+channel and not AIV0's, in the same run: the behaviour is not symmetric between
+the sub blocks, so a one-core reading proves nothing about the other.
+
+**The model already said so.** `tests/cpu/test_reshape_wave_model.py` explores
+the schedule under four flag semantics, and the recycled policy fails its
+`sticky latch, never cleared` column while the single-shot policy survives it.
+Revision 2 chose the `consuming wait` column on the strength of the two-iteration
+probe. The column the hardware is in is the other one. The knob stays, and it
+is the thing to re-measure on physical silicon before trusting either reading
+there — nothing in this section is a hardware claim.
+
+#### Where the recycled ring went
+
+`turboquant_wave::RecycledChannels` stays compiled, and
+`tests/cpu/test_wave_protocol_header.cpp` keeps checking its algebra, because
+that is what keeps the refutation above reproducible. No kernel dispatches it:
+`kReshapeDefaultReuse` is `false`, so the INT8 instance's mode-4 default is the
+single-shot allocation, and the BF16 instance is off mode 4 entirely — one
+readiness quorum and one release broadcast on mode-2 counting channels, the
+same construction `turboquant_paged_decode_attention.cpp` has shipped since
+commit 719a390e. §6.5's rule 2 is written around mode 2 now.
+
+#### The original measurements, unchanged
 Read the trace, not the exit status. The probe moves no data, so a *sticky*
 latch would retire every wait early and the run would still finish and still
 print nothing wrong; what distinguishes the two semantics is the tick order of
@@ -876,13 +930,11 @@ margin on READY id 16 of the synthesised ring.
 
 At the time **the mechanism was not isolated**, and the reading taken — that
 the flag is a level bit a wait tests without clearing — was the conservative
-one. It was also wrong: the probe above exercises exactly the recycled
-handshake those runs were doing, with drains added, and finds no early
-retirement on silicon or in simulation. What the revisions above lacked was a
-drain on the *producer's* pipe before the announcement, so the Cube's "panel
-ready" for chunk 7 was visible on the scalar stream before its Fixpipe had
-written the panel. With one id per slot, the wait that observed it was the
-chunk-7 wait, and it read the panel early.
+one. **It is the reading that survived.** Revision 2 argued it away on a
+two-iteration probe run and on the observation that those revisions also lacked
+a drain on the *producer's* pipe. The missing drain was real and is fixed; the
+early retirement is still there with the drain in place, measured above. Both
+faults existed; only one of them was fixed by the fence.
 
 The first fix adopted was to **label every cross-core event uniquely** — one
 flag id per announcement and one per release, each set and waited exactly once.
@@ -902,9 +954,15 @@ twice, reproducibly, with every gate green. Three consequences:
 
 * a cross-core edge audit should check **tick order**, not just balance: that
   every wait was released by an announcement already issued, and that no id
-  ever carried two outstanding ones. `scripts/analyze_reshape_trace.py` does
-  this per id across all three core dumps, and it is the check that caught
-  both stale releases; a per-id count check passes vacuously;
+  ever carried two outstanding ones. A per-id count check passes vacuously.
+  `scripts/audit_mode4_tick_order.py` is the script that can do it, because the
+  order property needs the wait's RELEASE tick and a dump logs a wait at its
+  ISSUE tick: it derives the release from the scalar drain behind the wait, and
+  it reads mode 2 as well as mode 4. `scripts/analyze_reshape_trace.py` used to
+  claim this check and could not perform it — it compared the two ISSUE
+  columns, so it reported "a stale set released it" on every run, including
+  bit-exact ones. It does the census and the channel shape now and names the
+  release-tick audit as its mandatory companion;
 * the fence in front of every announcement is a correctness precondition of
   the recycled policy, so it gets its own audit
   (`scripts/audit_cross_core_fences.py`) rather than a comment;
