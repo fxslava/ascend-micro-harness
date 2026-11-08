@@ -302,6 +302,13 @@
 // failed the device link.
 #include "turboquant_wave_protocol.hpp"
 
+// The shared layout contract: kCubeTileRows, kOperandC0 and the NzTiled* address
+// functions this file's TURBOQUANT_INGRESS_NZ instance writes against. Dependency-free
+// on purpose, so the host oracle and tests/cpu/test_turboquant_kv_layout_bridge.cpp
+// compile the SAME arithmetic with no kernel toolchain -- which is what makes the
+// bridge gate an agreement test rather than two transcriptions of a comment.
+#include "baseline/common/turboquant_layout.h"
+
 // Verification-only, and absent from every build that does not ask for it.
 // ASCEND_MICRO_SPARSE_SAMPLING is set on the CAModel probe's kernel library
 // and on its runner, never on the physical-device library, so a production
@@ -318,7 +325,7 @@
 namespace turboquant_bf16 {
 
 // ------------------------------------------------------------ strip geometry
-constexpr std::uint32_t kTokens = 16;   // tokens per strip == blockSize
+constexpr std::uint32_t kTokens = 16;   // tokens per strip
 constexpr std::uint32_t kHeads = 4;     // numKvHeads
 constexpr std::uint32_t kHeadSize = 256;
 constexpr std::uint32_t kGroup = 32;    // channels per Cube group == INT8 K0
@@ -327,6 +334,78 @@ constexpr std::uint32_t kChunks = 2u * kHeads;         // 4 value chunks then 4 
 constexpr std::uint32_t kPanel = kTokens * kHeadSize;  // 4096 elements per chunk
 constexpr std::uint32_t kPackedBytes = kPanel / 2u;    // 2048 bytes of nibbles
 constexpr std::uint32_t kScaleFloats = kTokens;        // one scale per token
+
+// ----------------------------------------------------------- the output layout
+// TURBOQUANT_INGRESS_NZ selects WHICH 4-bit cache contract this instance writes.
+// It is a build-time instance choice, exactly like the BF16/INT8 activation split
+// this file already is, and it defaults OFF so the shipping strip readers and
+// every gate built on them are untouched.
+//
+//   off  RFC 3.1 STRIP, the shipping contract: key token-major, value channel-major
+//        inside a 16-token strip, scales planar. Read by
+//        turboquant_paged_decode_attention.cpp, pinned by
+//        scripts/kv_plane_layout_check.py and tests/common/turboquant_oracle.hpp.
+//
+//   on   NZ-TILED, what the kv4fp8 fused decode reads:
+//        common/turboquant_layout.h's NzTiledChannelByte / NzTiledChannelNibble /
+//        NzTiledScaleIndex. kCubeTileRows-row tiles, kOperandC0-byte column groups,
+//        one byte carrying channels (c, c + kHeadSize/2) of ONE token, and scales in
+//        per-row slots of NzScaleSlotFloats lanes.
+//
+// The two are not reachable from one another by any permutation of addresses --
+// tests/cpu/test_turboquant_kv_layout_bridge.cpp check 3 proves the co-byte
+// matchings share not one pair, and the strip VALUE plane does not even pair along
+// the same axis of the (token, channel) grid -- which is why this is a mode and not
+// an offset. The NZ instance is what makes an ingress -> fused-decode round trip
+// exist; check 1 of that test is the gate on the arithmetic below.
+//
+// Three consequences inside this file, all of them simplifications:
+//
+//   1. K and V become SYMMETRIC. The strip value plane needed a transposed panel,
+//      so the Cube ran the value chunks with the page as the B operand and a
+//      NZ(kHeadSize, kTokens) Fixpipe. NZ wants both planes token-major, so every
+//      chunk takes what used to be the key path in GemmGroupLoad, GemmBlock and
+//      FixpipeChunk, and the value absmax ladder (ValueFoldEmit) goes unused.
+//   2. The nibble pack gains one Interleave per token in front of the int4b_t Cast,
+//      which is what turns the hardware's adjacent-element pairing into the
+//      (c, c + kHeadSize/2) pairing. It is the exact inverse of the decode's
+//      UnpackAffine, and the same construction as that codec's StageAffinePlane.
+//   3. The packed egress is 4 strided bursts rather than 1 contiguous one, because
+//      a 16-token strip inside a kCubeTileRows-row tile is one contiguous run per
+//      column group, and the scale egress is per-token DataCopyPad into the slots.
+#if defined(TURBOQUANT_INGRESS_NZ)
+constexpr bool kIngressNz = true;
+#else
+constexpr bool kIngressNz = false;
+#endif
+
+// The NZ tile geometry this instance writes into, from the shared contract.
+constexpr std::uint32_t kNzTileRows = vllm_ascend::turboquant::kCubeTileRows;   // 64
+constexpr std::uint32_t kNzGroupBytes = vllm_ascend::turboquant::kOperandC0;    // 32
+constexpr std::uint32_t kPackedRowBytes = kHeadSize / 2u;                       // 128
+constexpr std::uint32_t kNzGroups = kPackedRowBytes / kNzGroupBytes;            // 4
+constexpr std::uint32_t kNzTilePlaneBytes = kNzTileRows * kPackedRowBytes;      // 8192
+
+// The scale slot width, folded at compile time from kHeads.
+//
+// It is NOT taken from the launch's scalar numKvHeads, and that is deliberate rather than a
+// shortcut. This file's head count is a compile-time constant (kHeads; see "What it
+// deliberately omits" at the top) -- the chunk schedule, the UB map and the Cube's block
+// geometry are all built on it -- so a launch whose numKvHeads disagreed would already be
+// writing the wrong panels, and deriving the slot width from the scalar would only hide that
+// behind a correct-looking stride. Folding it also keeps the device link clean:
+// NzScaleSlotFloats is a dependency-free constexpr, not an __aicore__ function, so CALLING it
+// with a runtime argument leaves an undefined symbol in the AIV object.
+constexpr std::uint32_t kNzScaleSlot =
+    vllm_ascend::turboquant::NzScaleSlotFloats(kHeads);
+// The kv stride within a slot: lane kv * numKvHeads + head, which is NzTiledScaleIndex.
+constexpr std::uint32_t kNzScaleKvStride = kHeads;
+static_assert(!kIngressNz || 2u * kHeads <= kNzScaleSlot,
+              "a scale slot must hold a key and a value lane for every kv head");
+static_assert(!kIngressNz || kPackedRowBytes % kNzGroupBytes == 0u,
+              "a packed row must be a whole number of NZ column groups");
+static_assert(!kIngressNz || kNzTileRows % kTokens == 0u,
+              "a Cube tile must be a whole number of strips, or a strip straddles two tiles");
 
 // ----------------------------------------------------- element width, arch35
 // This file is a clone of the INT8 kernel with one activation element widened
@@ -399,6 +478,16 @@ namespace turboquant_bf16 {
 // column of the schedule contains a runtime predicate or a modulo.
 template <std::uint32_t C>
 constexpr bool kIsKey = (C >= kHeads);
+// Does this chunk's panel come off the Cube token-major, [token][channel]?
+//
+// Under the strip contract only the key chunks do: the value plane is channel-major,
+// so its panel is produced transposed and the whole Cube/Fixpipe/absmax path forks on
+// it. The NZ-tiled contract wants both planes token-major -- it is the decode's own
+// symmetry, where ReadPlane differs between K and V only in which GM tensor it reads
+// -- so under TURBOQUANT_INGRESS_NZ every chunk takes the token-major path and the
+// fork disappears. This predicate is that statement, used everywhere the fork was.
+template <std::uint32_t C>
+constexpr bool kTokenMajor = kIngressNz || kIsKey<C>;
 template <std::uint32_t C>
 constexpr std::uint32_t kChunkHead = C % kHeads;
 template <std::uint32_t C>
@@ -444,8 +533,22 @@ constexpr std::uint32_t kLanesPerBlock = kBlock / sizeof(float);  // 8
 
 constexpr std::uint32_t kPanelBytes = kPanel * 4u;        // 16384, FP32 or INT32
 constexpr std::uint32_t kLandSlotBytes = kPanelBytes + kBankSkewBytes;
+
+// The scale slice inside a packed ring slot.
+//
+//   strip  16 contiguous FP32, which is two whole DataBlocks and one MTE3 burst,
+//          because the strip scale plane is planar and a strip's tokens are
+//          consecutive floats of one (kv, block, head) slice.
+//   NZ     16 DataBlocks, one per token. The NZ scale plane is per-row slots, so a
+//          token's scale is a lone 4-byte lane 32 bytes from the next one and there
+//          is no burst expression of it; it goes out as one DataCopyPad per token,
+//          and a DataCopyPad source must START on a 32-byte boundary. That is also
+//          exactly the shape Brcb writes, so the spread costs one Brcb and no copy.
+//          Same construction as turboquant_reshape_scatter_aiv.cpp's scale egress.
+constexpr std::uint32_t kScaleSliceBytes =
+    kIngressNz ? kScaleFloats * kBlock : kScaleFloats * 4u;
 constexpr std::uint32_t kPackSlotBytes =
-    RoundUpBlock(kPackedBytes + kScaleFloats * 4u) + kBankSkewBytes;
+    RoundUpBlock(kPackedBytes + kScaleSliceBytes) + kBankSkewBytes;
 
 // The Fixpipe landing ring stays at UB 0 so the Cube forms a raw __ubuf__
 // pointer without depending on any Vector-side allocation.
@@ -482,9 +585,17 @@ constexpr std::uint32_t kUbFold8 = NextSlot(kUbFold64, kTokens * 64u * 4u);
 // vcvt_s162s4 intrinsic, which is the only reason this goes through FP16.
 constexpr std::uint32_t kUbHalf = NextSlot(kUbFold8, kTokens * 8u * 4u);
 
+// NZ only: the woven FP16 panel. Interleave reads the two halves of a token row and
+// writes 2 * 128 elements, and the int4b_t Cast then reads them in order, so the
+// weave cannot be done in place over its own source. Allocated rather than aliased
+// onto a dead fold buffer: the folds ARE dead here, but a hand-placed live range is
+// how a silent corruption gets in, and the arena has the room (the static_assert
+// below is what says so).
+constexpr std::uint32_t kUbWoven = NextSlot(kUbHalf, kPanel * 2u);
+
 // Logically scalar state, one lane-replicated DataBlock each where the API
 // reads whole blocks. kScaleFloats is 16 == two DataBlocks.
-constexpr std::uint32_t kUbAbsMax = NextSlot(kUbHalf, kPanel * 2u);
+constexpr std::uint32_t kUbAbsMax = NextSlot(kUbWoven, kIngressNz ? kPanel * 2u : 0u);
 constexpr std::uint32_t kUbExpBits = NextSlot(kUbAbsMax, kScaleFloats * 4u);
 constexpr std::uint32_t kUbPow = NextSlot(kUbExpBits, kScaleFloats * 4u);
 constexpr std::uint32_t kUbInv = NextSlot(kUbPow, kScaleFloats * 4u);
@@ -502,7 +613,8 @@ constexpr std::uint32_t kArenaEnd = kUbPackRing + kPackDepth * kPackSlotBytes;
 static_assert(kUbLandRing % kBlock == 0u && kUbCast % kBlock == 0u &&
                   kUbWork % kBlock == 0u && kUbFold128 % kBlock == 0u &&
                   kUbFold64 % kBlock == 0u && kUbFold8 % kBlock == 0u &&
-                  kUbHalf % kBlock == 0u && kUbAbsMax % kBlock == 0u &&
+                  kUbHalf % kBlock == 0u && kUbWoven % kBlock == 0u &&
+                  kUbAbsMax % kBlock == 0u &&
                   kUbExpBits % kBlock == 0u && kUbPow % kBlock == 0u &&
                   kUbInv % kBlock == 0u &&
                   kUbInvRep % kBlock == 0u && kUbInvBcast % kBlock == 0u &&
@@ -517,8 +629,15 @@ static_assert(kArenaEnd + kReadPadBytes <= kUbWindow,
               "UB arena leaves no VECTOR_REG_WIDTH read pad behind the state");
 static_assert(kUbInvSeed + kReadPadBytes <= kUbWindow,
               "the last state block must have a whole vector register behind it");
-static_assert(kPackedBytes % kBlock == 0u && kScaleFloats * 4u % kBlock == 0u,
-              "both MTE3 bursts must be whole 32-byte bursts");
+// The strip instance's two MTE3 bursts are whole 32-byte bursts. The NZ instance's
+// packed egress is four bursts of kTokens 32-byte blocks each -- still whole blocks,
+// so the same requirement in a different shape -- and its scale egress is
+// deliberately NOT a burst (see kScaleSliceBytes), so it is excluded here and
+// constrained instead by the DataBlock-per-token spread.
+static_assert(kPackedBytes % kBlock == 0u &&
+                  (kIngressNz ? kNzGroupBytes % kBlock == 0u && kScaleSliceBytes == kScaleFloats * kBlock
+                              : kScaleFloats * 4u % kBlock == 0u),
+              "every MTE3 burst must be a whole number of 32-byte DataBlocks");
 static_assert(kTokens * kLanesPerBlock * 4u == kTokens * kBlock,
               "a Brcb repeat writes eight DataBlocks per source element");
 
@@ -879,7 +998,7 @@ __aicore__ inline void GemmGroupLoad(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* 
     constexpr std::uint32_t slot = kL1Slot<Chunk>;
     auto* page = reinterpret_cast<__cbuf__ bfloat16_t*>(kL1PageBase<slot> + G * kFractalBytes);
 
-    if constexpr (kIsKey<Chunk>) {
+    if constexpr (kTokenMajor<Chunk>) {
         // A = the page group, NZ(kTokens, kGroup): A[t][i] = x[t][G*32 + i].
         auto src = MakeTensor(MakeMemPtr(page),
                               MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kTokens, kGroup));
@@ -916,7 +1035,7 @@ __aicore__ inline void GemmBlock(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* l0b,
     constexpr bool init = (G == 0u);
     auto* c_ptr = l0c + C1 * kTokens * kGroup;
 
-    if constexpr (kIsKey<Chunk>) {
+    if constexpr (kTokenMajor<Chunk>) {
         auto a = MakeTensor(MakeMemPtr(l0a + kL0TableElems + G * kFractalElems),
                             MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kTokens, kGroup));
         auto b = MakeTensor(MakeMemPtr(l0b + block),
@@ -958,7 +1077,7 @@ __aicore__ inline void FixpipeChunk(__cc__ float* l0c)
     fp.unitFlag = 0;
     fp.subBlockId = (kOwner<Chunk> == 1u);
 
-    if constexpr (kIsKey<Chunk>) {
+    if constexpr (kTokenMajor<Chunk>) {
         auto c = MakeTensor(MakeMemPtr(l0c),
                             MakeFrameLayout<NZLayoutPtn, 16>(kTokens, kHeadSize));
         auto y = MakeTensor(MakeMemPtr(ub),
@@ -1293,11 +1412,19 @@ struct VectorEngine {
     AscendC::GlobalTensor<std::int8_t> key_cache;
     AscendC::GlobalTensor<std::int8_t> value_cache;
     AscendC::GlobalTensor<float> scale_cache;
+    // The strip contract's bases. Unused by the NZ instance.
     std::uint32_t page_bytes;    // byte base of (block, head 0) in either cache
     std::uint32_t head_bytes;    // blockSize * headSize / 2
     std::uint32_t key_scale;     // float base of (kv 0, block, head 0)
     std::uint32_t value_scale;   // float base of (kv 1, block, head 0)
     std::uint32_t head_scale;    // blockSize
+    // The NZ contract's bases. Unused by the strip instance. nz_tile_base is the byte
+    // base of this strip's (tile, head 0) and nz_tile_row0 the strip's first row WITHIN
+    // that tile, so a page of several strips lands each one in its own rows -- which is
+    // the offset bf8bfd7 added to the vllm prefill writer, in the NZ geometry.
+    std::uint32_t nz_tile_base;
+    std::uint32_t nz_tile_row0;
+    std::uint32_t nz_scale_row0;      // the strip's first GLOBAL slot
     float inv_sqrt_len;
 };
 
@@ -1307,6 +1434,22 @@ template <class T>
 __aicore__ inline AscendC::LocalTensor<T> View(std::uint32_t base, std::uint32_t count)
 {
     return AscendC::LocalTensor<T>(kUb, base, count);
+}
+
+// NZ only: weave every token row's two channel halves so the int4b_t Cast that follows
+// produces the NZ co-byte pairing. One Interleave per token, unrolled at compile time
+// like every other per-token emit in this file, so the Vector stream holds kTokens
+// issues and no loop counter. See the call site for why the pairing has to change.
+template <std::uint32_t... Ts>
+__aicore__ inline void WeaveNibblePairs(const AscendC::LocalTensor<half>& dst,
+                                        const AscendC::LocalTensor<half>& src,
+                                        std::integer_sequence<std::uint32_t, Ts...>)
+{
+    constexpr std::uint32_t half_row = kHeadSize / 2u;  // == kPackedRowBytes
+    (AscendC::Interleave(dst[Ts * kHeadSize], dst[Ts * kHeadSize + half_row],
+                         src[Ts * kHeadSize], src[Ts * kHeadSize + half_row],
+                         static_cast<std::int32_t>(half_row)),
+     ...);
 }
 
 // Row-wise max ladder for the key layout: fold N partials per token down to
@@ -1443,7 +1586,7 @@ __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
     auto abs_max = View<float>(kUbAbsMax, kScaleFloats);
     auto one = View<float>(kUbOne, kScaleFloats);
     AscendC::Abs(work, cast, all);
-    if constexpr (kIsKey<Chunk>) {
+    if constexpr (kTokenMajor<Chunk>) {
         auto f128 = View<float>(kUbFold128, kTokens * 128u);
         auto f64 = View<float>(kUbFold64, kTokens * 64u);
         auto f8 = View<float>(kUbFold8, kTokens * 8u);
@@ -1504,7 +1647,7 @@ __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
     bc.src0BlkStride = 1;
     bc.dstRepStride = 8;
     bc.src0RepStride = 8;
-    if constexpr (kIsKey<Chunk>) {
+    if constexpr (kTokenMajor<Chunk>) {
         auto inv_bcast = View<float>(kUbInvBcast, kTokens * kLanesPerBlock);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Brcb(inv_bcast, inv, 2, {1, 8});
@@ -1549,36 +1692,137 @@ __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
     AscendC::Cast(staged, quant, AscendC::RoundMode::CAST_RINT, kPanel);
     AscendC::PipeBarrier<PIPE_V>();
     auto nibbles = packed.template ReinterpretCast<AscendC::int4b_t>();
-    AscendC::Cast(nibbles, staged, AscendC::RoundMode::CAST_RINT, kPanel);
+    if constexpr (kIngressNz) {
+        // The co-byte pairing, and the only place this instance's nibble order differs
+        // from the strip one. The hardware int4b_t Cast pairs ADJACENT elements -- it
+        // puts element 2j in the low nibble of byte j and 2j+1 in the high one -- which
+        // gives channels (2j, 2j+1). The NZ-tiled contract needs channels
+        // (j, j + kHeadSize/2) of the same token. So weave each token row's two halves
+        // first: Interleave writes dst[2i] = src0[i] and dst[2i+1] = src1[i], so with
+        // src0 the low half of the row and src1 the high half, the Cast then lands
+        // channel j low and channel j + kPackedRowBytes high.
+        //
+        // This is the exact inverse of the expand that reads it (UnpackAffine's
+        // DeInterleave in common/turboquant_codec_mx.h), and the same construction as
+        // that codec's own StageAffinePlane. Per token row rather than per panel,
+        // because the halves to weave are a ROW's halves and the panel is token-major.
+        auto woven = View<half>(kUbWoven, kPanel);
+        WeaveNibblePairs(woven, staged,
+                         std::make_integer_sequence<std::uint32_t, kTokens>{});
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(nibbles, woven, AscendC::RoundMode::CAST_RINT, kPanel);
+    } else {
+        AscendC::Cast(nibbles, staged, AscendC::RoundMode::CAST_RINT, kPanel);
+    }
     // The quantised panel is scale invariant - scaling Y and absmax together
     // leaves every nibble unchanged - so invSqrtLen folds into the stored scale
     // alone, and q * scale reconstructs the orthonormal rotation.
-    auto scale = View<float>(kScaleBase<pack>, kScaleFloats);
-    AscendC::Muls(scale, pow_two, engine.inv_sqrt_len, lanes);
+    if constexpr (kIngressNz) {
+        // One DataBlock per token, because each goes out as its own DataCopyPad into a
+        // per-row scale slot (kScaleSliceBytes). Brcb writes element t at t * 8, which
+        // is that layout; the replicated lanes beside it are never read.
+        //
+        // The invSqrtLen fold is in place over pow_two, which this is the last use of.
+        auto spread = View<float>(kScaleBase<pack>, kScaleFloats * kLanesPerBlock);
+        AscendC::Muls(pow_two, pow_two, engine.inv_sqrt_len, lanes);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Brcb(spread, pow_two, 2, {1, 8});
+    } else {
+        auto scale = View<float>(kScaleBase<pack>, kScaleFloats);
+        AscendC::Muls(scale, pow_two, engine.inv_sqrt_len, lanes);
+    }
 
     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(pack_evt);
 }
 
 // --- the MTE3 stage ----------------------------------------------------------
+// NZ only: the four column-group bursts of one chunk, unrolled at compile time. Which
+// GM tensor depends on the PLANE, so it stays kIsKey -- that is the one asymmetry the
+// NZ contract keeps, and it is the same one the decode's ReadPlane keeps.
+template <std::uint32_t Chunk, std::uint32_t... Gs>
+__aicore__ inline void NzStoreGroups(VectorEngine& engine,
+                                     const AscendC::LocalTensor<std::int8_t>& packed,
+                                     const std::uint32_t tile,
+                                     const AscendC::DataCopyParams& group,
+                                     std::integer_sequence<std::uint32_t, Gs...>)
+{
+    if constexpr (kIsKey<Chunk>) {
+        (AscendC::DataCopy(engine.key_cache[tile + Gs * kNzTileRows * kNzGroupBytes],
+                           packed[Gs * kNzGroupBytes], group),
+         ...);
+    } else {
+        (AscendC::DataCopy(engine.value_cache[tile + Gs * kNzTileRows * kNzGroupBytes],
+                           packed[Gs * kNzGroupBytes], group),
+         ...);
+    }
+}
+
 template <std::uint32_t Chunk>
 __aicore__ inline void StoreChunk(VectorEngine& engine)
 {
     constexpr std::uint32_t pack = kPackSlot<Chunk>;
     constexpr std::int32_t pack_evt = static_cast<std::int32_t>(pack);
     auto packed = View<std::int8_t>(kPackBase<pack>, kPackedBytes);
-    auto scale = View<float>(kScaleBase<pack>, kScaleFloats);
 
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pack_evt);
-    const std::uint32_t page = engine.page_bytes + kChunkHead<Chunk> * engine.head_bytes;
-    const std::uint32_t slice =
-        (kIsKey<Chunk> ? engine.key_scale : engine.value_scale) +
-        kChunkHead<Chunk> * engine.head_scale;
-    if constexpr (kIsKey<Chunk>) {
-        AscendC::DataCopy(engine.key_cache[page], packed, kPackedBytes);
+    if constexpr (kIngressNz) {
+        // The packed plane of this (strip, head), into its place inside a
+        // kCubeTileRows-row NZ tile. Inside one column group the tile's rows are
+        // adjacent, so this strip's kTokens rows are ONE contiguous
+        // kTokens * kNzGroupBytes run per group -- four runs, at the group stride.
+        // The UB panel is token-major, so the source of each run is kTokens blocks at
+        // the packed row pitch, which is what srcStride carries.
+        //
+        //   GM byte(t, col) = tile + (col / kNzGroupBytes) * kNzTileRows * kNzGroupBytes
+        //                   + (tile_row0 + t) * kNzGroupBytes + col % kNzGroupBytes
+        //   UB byte(t, col) = t * kPackedRowBytes + col
+        //
+        // which is NzTiledChannelByte of common/turboquant_layout.h, specialised to a
+        // strip. tests/cpu/test_turboquant_kv_layout_bridge.cpp is the gate on it.
+        const std::uint32_t tile = engine.nz_tile_base +
+                                   kChunkHead<Chunk> * kNzTilePlaneBytes +
+                                   engine.nz_tile_row0 * kNzGroupBytes;
+        AscendC::DataCopyParams group;
+        group.blockCount = static_cast<std::uint16_t>(kTokens);
+        group.blockLen = static_cast<std::uint16_t>(kNzGroupBytes / kBlock);
+        group.srcStride =
+            static_cast<std::uint16_t>((kPackedRowBytes - kNzGroupBytes) / kBlock);
+        group.dstStride = 0;
+        NzStoreGroups<Chunk>(engine, packed, tile, group,
+                             std::make_integer_sequence<std::uint32_t, kNzGroups>{});
+
+        // The scale plane is per-row slots, so a token's scale is a lone 4-byte lane
+        // kNzScaleSlot floats from the next one: one DataCopyPad per token, from the
+        // Brcb'd DataBlock the pack stage left. Lane kv * numKvHeads + head within the
+        // slot, which is NzTiledScaleIndex.
+        const std::uint32_t lane =
+            (kIsKey<Chunk> ? 0u : kNzScaleKvStride) + kChunkHead<Chunk>;
+        auto spread = View<float>(kScaleBase<pack>, kScaleFloats * kLanesPerBlock);
+        AscendC::DataCopyExtParams one_float;
+        one_float.blockCount = 1;
+        one_float.blockLen = 4u;
+        one_float.srcStride = 0;
+        one_float.dstStride = 0;
+        one_float.rsv = 0;
+        for (std::uint32_t t = 0; t < kTokens; ++t) {
+            AscendC::DataCopyPad(
+                engine.scale_cache[(engine.nz_scale_row0 + t) * kNzScaleSlot + lane],
+                spread[t * kLanesPerBlock], one_float);
+        }
     } else {
-        AscendC::DataCopy(engine.value_cache[page], packed, kPackedBytes);
+        const std::uint32_t page =
+            engine.page_bytes + kChunkHead<Chunk> * engine.head_bytes;
+        const std::uint32_t slice =
+            (kIsKey<Chunk> ? engine.key_scale : engine.value_scale) +
+            kChunkHead<Chunk> * engine.head_scale;
+        auto scale = View<float>(kScaleBase<pack>, kScaleFloats);
+        if constexpr (kIsKey<Chunk>) {
+            AscendC::DataCopy(engine.key_cache[page], packed, kPackedBytes);
+        } else {
+            AscendC::DataCopy(engine.value_cache[page], packed, kPackedBytes);
+        }
+        AscendC::DataCopy(engine.scale_cache[slice], scale, kScaleFloats);
     }
-    AscendC::DataCopy(engine.scale_cache[slice], scale, kScaleFloats);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pack_evt);
 }
 
@@ -1643,7 +1887,7 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
     engine.scale_cache.SetGlobalBuffer(scale_cache);
     engine.head_bytes = head_bytes;
     engine.head_scale = block_size;
-    engine.inv_sqrt_len = inv_sqrt_len;
+        engine.inv_sqrt_len = inv_sqrt_len;
 
     // ---- prologue: the quantiser's three immediate constants --------------
     // The factored revision also built two replicated sign panels here, from a
@@ -1675,12 +1919,24 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
     // again. The page index is re-derived per strip rather than assumed
     // contiguous, which is what lets a fragmented slot mapping work.
     for (std::uint32_t s = 0; s < strips; ++s) {
-        const std::uint32_t slot0 =
-            static_cast<std::uint32_t>(slot_mapping[s * block_size]);
+        // Where strip s's first token sits in the mapping. Under the strip contract a
+        // strip fills one whole physical page, so successive strips are block_size
+        // entries apart; under NZ a strip is kTokens tokens wherever block_size puts it,
+        // so they are kTokens apart and several strips can share a page.
+        const std::uint32_t slot0 = static_cast<std::uint32_t>(
+            slot_mapping[s * (kIngressNz ? kTokens : block_size)]);
         const std::uint32_t page = slot0 / block_size;
         engine.page_bytes = page * num_kv_heads * head_bytes;
         engine.key_scale = page * num_kv_heads * block_size;
         engine.value_scale = (num_blocks + page) * num_kv_heads * block_size;
+        // The NZ bases, from the same one scalar read. slot0 is a GLOBAL slot, so
+        // NzTiledChannelByte's (slot - slot % kNzTileRows) carries the page base and no
+        // separate page term is added -- which is also why this instance needs no
+        // num_blocks and no blockSize in its addressing beyond the page it is given.
+        engine.nz_tile_row0 = slot0 % kNzTileRows;
+        engine.nz_tile_base =
+            (slot0 - engine.nz_tile_row0) * num_kv_heads * kPackedRowBytes;
+        engine.nz_scale_row0 = slot0;
         // Every address this strip's MTE3 bursts use is formed from the three
         // scalars above, and StoreChunk<kChunks - 1> is issued inside this same
         // fold, so the next iteration's writes to them cannot reach a burst

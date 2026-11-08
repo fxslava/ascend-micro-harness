@@ -222,6 +222,23 @@ function(add_ascend_micro_sim_targets)
   add_micro_camodel_probe(turboquant_reshape_and_cache_bf16
       kernels/ops/turboquant/turboquant_reshape_and_cache_bf16.cpp)
 
+  # The NZ-TILED ingress instance of the same source. TURBOQUANT_INGRESS_NZ makes it
+  # write common/turboquant_layout.h's NzTiled* contract instead of RFC 3.1's strip
+  # one, which is what the kv4fp8 fused decode reads -- so this is the instance a
+  # write -> read round trip is possible with. The strip instance above is untouched
+  # and still what ships; see the kernel's own kIngressNz comment for the three
+  # differences and tests/cpu/test_turboquant_kv_layout_bridge.cpp for the gate.
+  #
+  # A library with no runner of its own: the round-trip harness links it beside
+  # camodel_fused_decode_opt_kernel, because the whole point is one process that
+  # writes with one kernel and reads with the other.
+  ascendc_library(camodel_turboquant_reshape_nz_kernel SHARED
+      kernels/ops/turboquant/turboquant_reshape_and_cache_bf16.cpp)
+  ascendc_compile_definitions(camodel_turboquant_reshape_nz_kernel PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH TURBOQUANT_INGRESS_NZ)
+  ascendc_compile_options(camodel_turboquant_reshape_nz_kernel PRIVATE
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
   # The paged decode attention operator: 16 query tokens, d = 256, an int4
   # paged KV cache, a 12-column eight-strip modulo schedule over two-slot UB
   # rings, and a 32-block grid. Its runner takes --strips/--strip-begin/--block
@@ -269,6 +286,16 @@ function(add_ascend_micro_sim_targets)
   # round trip to exist.
   add_executable(test_turboquant_kv_layout_bridge tests/cpu/test_turboquant_kv_layout_bridge.cpp)
   target_compile_options(test_turboquant_kv_layout_bridge PRIVATE -Wall -Wextra -Werror)
+
+  # The NZ ingress instance's two host gates, both sub-second and both Tier 1.
+  #
+  # ..._e2e_reference pins what the fused decode MEANS by a cache byte, by reproducing the
+  # fused-decode fixture's own expectation from its own bytes: value = (signed nibble + 0.5)
+  # * stored scale / kGain, score scaled by inv_sqrt_len. A round-trip golden needs that
+  # exactly right, and it also measures the half-step gap between the decode's midrise
+  # reconstruction and the prefill ingress's midtread quantiser.
+  add_executable(test_turboquant_e2e_reference tests/cpu/test_turboquant_e2e_reference.cpp)
+  target_compile_options(test_turboquant_e2e_reference PRIVATE -Wall -Wextra -Werror)
 
   # The host oracle that USED to be the AIV-only single-token decode operator's. That
   # operator is deleted -- kernels/ops/turboquant/turboquant_single_token_decode_aiv.cpp
