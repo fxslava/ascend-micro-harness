@@ -91,6 +91,59 @@ constexpr uint64_t NzTiledPackedByte(uint64_t slot, uint64_t kvHead, uint64_t co
            ((column / kOperandC0) * kCubeTileRows + tileRow) * kOperandC0 + column % kOperandC0;
 }
 
+
+// --------------------------------------------------- the ingress view of an NZ-tiled cache
+// NzTiledPackedByte names the byte of a packed COLUMN. A LOGICAL element is
+// (slot, kvHead, channel), and getting from one to the other is the kv4fp8 nibble pairing,
+// which is NOT the RFC 3.1 strip contract's "two adjacent channels per byte":
+//
+//   channel c          -> the LOW  nibble of column  c                 , for c <  headSize/2
+//   channel c          -> the HIGH nibble of column (c - headSize/2)   , for c >= headSize/2
+//
+// so one byte carries channels (c, c + headSize/2) of ONE token. That is forced by the
+// decode's own expand: UnpackAffine (common/turboquant_codec_mx.h) DeInterleaves a chunk
+// into a low plane and a high plane of equal length, and StageNzTileToL1
+// (vector/turboquant_vector_service.h) stages the low plane at L1 offset 0 and the high
+// plane at + tilePlaneBytes_. The L1 operand is the kCubeTileRows x headSize NZ image whose
+// groups span kOperandC0 channels each, so the low plane lands on channels [0, headSize/2)
+// and the high plane on [headSize/2, headSize).
+//
+// An ingress writer that feeds this decode must produce exactly this pairing. The inverse of
+// the expand is already production code -- StageAffinePlane's Interleave + int4b_t Cast in
+// the same codec -- and tests/cpu/test_turboquant_kv_layout_bridge.cpp is the gate that the
+// writer's address function and the decode's name the same byte and the same nibble.
+//
+// `slot` is the GLOBAL row, physical * blockSize + token, which makes these self-contained:
+// no separate page base is added, because (slot - slot % kCubeTileRows) already carries it.
+constexpr uint64_t NzTiledChannelByte(uint64_t slot, uint64_t kvHead, uint64_t channel,
+                                      uint64_t numKvHeads, uint64_t headSize)
+{
+    const uint64_t packedBytes = headSize / kPackFactor;
+    return NzTiledPackedByte(slot, kvHead, channel % packedBytes, numKvHeads, packedBytes);
+}
+
+// 0 for the low nibble of that byte, 1 for the high one.
+constexpr uint32_t NzTiledChannelNibble(uint64_t channel, uint64_t headSize)
+{
+    return channel < headSize / kPackFactor ? 0u : 1u;
+}
+
+// The scale lanes of ONE cache row: 2 * numKvHeads (a key lane and a value lane per head)
+// rounded up to a whole fp32 block, so a tile's scales are one contiguous
+// kCubeTileRows * NzScaleSlotFloats burst beside the tile. ScaleSlotFloats in
+// common/turboquant_common.h is this function; it lives here because the host tiling, the
+// Torch-free tests and the oracles need it without a kernel toolchain.
+constexpr uint32_t NzScaleSlotFloats(uint32_t numKvHeads)
+{
+    return ((2u * numKvHeads + kFp32PerBlock - 1u) / kFp32PerBlock) * kFp32PerBlock;
+}
+
+// kv 0 for the key plane, 1 for the value plane. `slot` is the global row, as above.
+constexpr uint64_t NzTiledScaleIndex(uint64_t slot, uint64_t kvHead, uint64_t kv,
+                                     uint64_t numKvHeads)
+{
+    return slot * NzScaleSlotFloats(static_cast<uint32_t>(numKvHeads)) + kv * numKvHeads + kvHead;
+}
 constexpr uint16_t kFlagOperandsReady = 0;
 constexpr uint16_t kFlagProductReady = 1;
 constexpr uint16_t kFlagSlotReady = 0;
