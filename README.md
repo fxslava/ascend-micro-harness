@@ -566,19 +566,43 @@ so the fix is at ingress: `stage_blocks_nz` in
 with the four byte-identity L1→L0 loads in
 [`routines/routine_fractal_load_zn_bf16.hpp`](routines/routine_fractal_load_zn_bf16.hpp).
 
-That ingress is now the operator's prologue, and the operator is bit-exact on
-CAModel at 1, 2 and 3 strips:
+That ingress is now the operator's prologue. With the flat copy put back the
+operator fails on the runner below, which is what makes the layout fix measured
+rather than argued; the report also records why that failure looked
+Value-specific — the runner used to cap its comparison at three chunks and the
+value heads come first, so the equally broken key chunks were never printed.
+That cap is gone: every mismatching chunk is counted and the count printed with
+the failure. Details and the gates in
+[`reports/micro_layout_bf16.md`](reports/micro_layout_bf16.md).
+
+**The operator's cross-core discipline is mode 2 now, and the claim that used
+to stand here — "bit-exact on CAModel at 1, 2 and 3 strips" — was stale.** It
+was written of the recycled two-slot mode-4 ring, which then failed this gate
+at ONE strip: key heads 1 and 3, the two key chunks AIV1 owns, disagreed with
+the oracle in ~2000 of 2048 packed bytes. A mode-4 `wait_intra_block` on a
+recycled id does not reliably consume it, so an id's second wait is released by
+its first announcement's residue, and AIV1 read a landing panel the Cube had
+not written yet. One readiness quorum and one release broadcast on mode-2
+counting channels replace it, and because those counters carry across strip
+boundaries one block now streams any number of strips with one prime and one
+drain:
 
 ```sh
-bash scripts/run_reshape_bf16_camodel.sh
+BF16_SLICES="1 2 3" bash scripts/run_reshape_bf16_camodel.sh
+BF16_SLICES=8 BF16_STRIPS_PER_BLOCK=8 bash scripts/run_reshape_bf16_camodel.sh
+BF16_SYNC=mode4-single-shot BF16_SLICES="1 3" bash scripts/run_reshape_bf16_camodel.sh
 ```
 
-With the flat copy put back it fails on the same runner, which is what makes
-the fix measured rather than argued. The report also records why the failure
-looked Value-specific — the runner caps its comparison at three chunks and the
-value heads come first, so the equally broken key chunks were never printed.
-Details and the gates in
-[`reports/micro_layout_bf16.md`](reports/micro_layout_bf16.md).
+Those are green, with the fence audit, the trace census and the release-tick
+audit, and so is a full wave of 32 blocks. A grid whose block count is not a
+whole number of waves is **not**: at 33 strips the single wave-1 block is wrong
+in all eight of its chunks while every wave-0 strip is bit-exact, because that
+block is placed on two sub-block-1 Vector cores and no sub-block-0 one — 33
+Cube roles, 32 AIV0 roles and 34 AIV1 roles across the run. That is a second
+defect, in role placement rather than synchronisation, and it is open.
+[`reports/bf16_prefill_key_plane_fix.md`](reports/bf16_prefill_key_plane_fix.md)
+has the diagnosis, every gate run with its result, and every gate not run with
+the reason.
 
 `routines/routine_cube_hadamard16.hpp` dispatches one FP16×FP16→FP32
 `Mmad` followed by one L0C→GM `Fixpipe` copy. The caller precomputes the

@@ -207,15 +207,42 @@ int main()
     }
 
     // The canonical policy. A silent flip of kReshapeDefaultReuse would
-    // otherwise pass every check above, because both policies are legal: what
-    // decides which one ships is the evidence in guidelines section 6.2c, and
-    // this is where that decision is pinned.
-    expect(turboquant_wave::kReshapeDefaultReuse,
-           "the default policy is no longer the recycled ring; if that is "
-           "deliberate, update guidelines section 6.2c and this gate together");
+    // otherwise pass every check above, because both policies are legal in the
+    // ALGEBRA: what decides which one ships is the evidence in guidelines
+    // section 6.2c, and this is where that decision is pinned.
+    //
+    // It was pinned to the recycled ring. It is pinned the other way now, and
+    // this gate is the place the reversal has to be stated rather than
+    // discovered. The ring was measured wrong on Ascend950PR CAModel: a mode-4
+    // `wait_intra_block` on an id that already carried an announcement does not
+    // reliably consume it, so an id's SECOND wait is released by its FIRST
+    // announcement's residue. That is the `sticky latch, never cleared` column
+    // of tests/cpu/test_reshape_wave_model.py's semantics matrix -- the one
+    // reading under which the recycled policy already failed in the model, and
+    // which section 6.2c had concluded the hardware does not exhibit.
+    // reports/bf16_prefill_key_plane_fix.md has the traces: the BF16 prefill
+    // instance failed its own single-strip gate on it, and
+    // scripts/run_cluster_sync_probe_camodel.sh 4 4 reproduces the early
+    // retirement with no data in flight.
+    //
+    // So: no kernel may DISPATCH the recycled ring, while the header keeps
+    // compiling its algebra and this file keeps checking it, because that is
+    // what keeps the refutation reproducible.
+    expect(!turboquant_wave::kReshapeDefaultReuse,
+           "the recycled two-slot ring is the mode-4 default again. It is "
+           "refuted on this target (guidelines section 6.2c, "
+           "reports/bf16_prefill_key_plane_fix.md); if new evidence overturns "
+           "that, update section 6.2c and this gate together");
     expect(turboquant_wave::ReshapeDefault::kRecycles ==
                turboquant_wave::kReshapeDefaultReuse,
            "the ReshapeDefault alias does not follow kReshapeDefaultReuse");
+    // The BF16 instance does not select a mode-4 policy at all any more: its
+    // default entry point is the mode-2 quorum and broadcast, and its mode-4
+    // leg is the single-shot fallback. Pinned here for the same reason.
+    expect(turboquant_wave::kReshapeBf16DefaultMode2,
+           "the BF16 prefill instance's default is no longer mode 2; mode 4 "
+           "cannot express a quorum, and a per-chunk per-core channel is what "
+           "the recycled ring was");
 
     // The boundary guard, on every rung of the wave ladder.
     for (const int strips : {1, 32, 33, 48, 64, 128}) {

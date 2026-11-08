@@ -413,11 +413,46 @@ TQ_WAVE_FN constexpr bool LegalIntraId(std::uint16_t id)
 // Both reshape-and-cache kernels run eight chunks over a depth-2 landing ring.
 constexpr std::uint32_t kReshapeChunks = 8u;
 constexpr std::uint32_t kReshapeLandDepth = 2u;
-// The canonical policy, shared by the kernels' default entry points, the
+// The canonical MODE-4 policy, shared by the kernels' mode-4 entry points, the
 // harness defaults and the trace analyser so none of them can drift from the
 // others. Flipping this constant flips the default everywhere; the other
 // policy stays compiled either way.
-constexpr bool kReshapeDefaultReuse = true;
+//
+// **It is false now, and RecycledChannels is no longer any kernel's default.**
+// The recycled ring was measured wrong on Ascend950PR CAModel: a mode-4
+// `wait_intra_block` on an id that already carried an announcement does not
+// reliably consume it, so the SECOND wait on a recycled id is released by the
+// FIRST announcement's residue. The BF16 prefill instance failed its own
+// single-strip gate on it -- AIV1's second and third product-ready waits
+// retired 1774 and 2600 cycles before the announcements that should have
+// released them, and the two chunks those waits gate read a landing panel the
+// Cube had not written. `scripts/run_cluster_sync_probe_camodel.sh 4 4`
+// reproduces it with no data in flight, on AIV1's channel only, in the same run
+// where AIV0's is clean. reports/bf16_prefill_key_plane_fix.md has the traces.
+//
+// This is NOT section 6.2a's hazard: every announcement in both kernels is
+// behind its scalar drain and scripts/audit_cross_core_fences.py is green. The
+// announcement had not issued at all when the wait passed. So the "mode-4
+// consumes" verdict of guidelines section 6.2c does not hold in the AIC -> AIV
+// direction on a recycled id, and the proof in safe_pipeline_proof.json is
+// sound about the net but rests on a premise this target does not honour.
+//
+// The BF16 instance has moved off mode 4 entirely, onto the mode-2 quorum and
+// broadcast that turboquant_paged_decode_attention.cpp has shipped since commit
+// 719a390e; see kReshapeBf16DefaultMode2 below. The INT8 instance still selects
+// a mode-4 policy, and this constant now points it at the single-shot
+// allocation, which gives no id two announcements and therefore cannot take
+// this fault. RecycledChannels stays compiled so the host gate keeps checking
+// its algebra and so the refutation above stays reproducible through the second
+// entry point -- not because anything should dispatch it.
+constexpr bool kReshapeDefaultReuse = false;
+
+// The BF16 prefill instance's cross-core discipline: true selects the mode-2
+// rendezvous of its default entry point, false the mode-4 single-shot channels
+// of its fallback. A separate constant from kReshapeDefaultReuse because the
+// two instances no longer use the same MECHANISM, and conflating them would
+// make one of the two harnesses silently dispatch the other's.
+constexpr bool kReshapeBf16DefaultMode2 = true;
 
 using ReshapeSingleShot = ChannelPolicy<false, kReshapeChunks, kReshapeLandDepth>;
 using ReshapeRecycled = ChannelPolicy<true, kReshapeChunks, kReshapeLandDepth>;
