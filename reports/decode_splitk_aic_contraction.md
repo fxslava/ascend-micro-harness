@@ -295,6 +295,12 @@ would have said the Vector pipe was idle.
 Given as a share of each side's own busy time, because the two sides differ by
 three orders of magnitude and one percentage would hide that.
 
+**Read §7b before quoting the occupancy figures in this section.** Everything
+here is measured at a 64-tick gap threshold, which is coarser than AIV0's actual
+stalls: at 16 ticks the same pipe shows 842 gaps and 27.3% stall. Both numbers
+are of the same trace and both are right -- this section is about whether
+*pipes* overlap, §7b is about whether one pipe issues back to back.
+
 `VECTOR` against `MTE3` is 0.0% at every threshold, and it is correct: AIV0's
 MTE3 is six instructions, the partition write-out, which by construction runs
 after all vector work.
@@ -348,9 +354,297 @@ well they are scheduled.
 That is the end of this line of optimisation. The remaining work on AIV0 is
 the recurrence itself: `select_query`'s per-row issue, `Exp`, the reductions
 in `update_denominator`, and the ~150 `RV_VLDI` per row that survive the tree.
-None of it is a scheduling problem.
+None of it is a *cross-pipe* scheduling problem -- but §7b finds 19,190 ticks
+of within-pipe issue stall, ten fixed 17-tick gaps per query row, which is the
+same per-row issue cost named here, now measured.
 
-## 7. Gate status
+## 7. Proposal: a fused streaming FMA over the 16 strip tokens
+
+The proposal is to delete `weighted` and the `ReduceDataBlock` + `ReducePairElem`
+pair, and instead loop over the 16 tokens of the strip, broadcasting `P[t]` and
+accumulating `P[t] * V[t, 0..255]` into `weighted_sum` with an `Mla`. The stated
+motivation is the 16 serial vector bursts visible on AIV0, read as register RAW
+stalls in the contraction.
+
+Two separate things are wrong with it, and the second is the interesting one.
+
+### 7a. The layout premise does not hold: the value page is channel-major
+
+The rewrite needs `V[t, 0..255]` to be a contiguous 256-element slice. It is not.
+From `tests/common/splitk_decode_fixture.hpp`, which is the definition of the
+packing every one of these kernels reads:
+
+```cpp
+const auto at_key = static_cast<std::size_t>(t) * kChannels + c;   // key:   token-major
+const auto at_val = static_cast<std::size_t>(c) * 16 + t;          // value: CHANNEL-major
+```
+
+The key cache is token-major, the value cache is **channel-major**. For a fixed
+token `t`, the 256 channels sit at a stride of 16 floats. Block strides step
+whole 32-byte DataBlocks; they cannot express one element every sixteen, so
+there is no repeat form that reads `V[t, ·]` as a vector.
+
+This is not an accident of the fixture. The contraction the proposal would
+remove is built on that layout, and says so in its operands:
+
+```cpp
+AscendC::Adds(p_x4, p_scaled, 0.0f, kKeyLanes, 4,
+              AscendC::UnaryRepeatParams(1, 1, kKeyBlocks, 0));
+AscendC::Mul(weighted, value_page, p_x4, kVecLanes,
+             static_cast<std::uint8_t>(kDecodeChannels * kDecodeKeys / kDecodeVecLanes),
+             AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 0));
+```
+
+`p_x4` is `p` replicated four times and `src1RepStride = 0` holds it still while
+`value_page` sweeps: that only multiplies the right weight into the right slot
+because consecutive lanes are consecutive *tokens* of one channel. The layout
+was chosen for exactly the horizontal contraction being proposed for removal.
+
+Getting token-major values needs either a transpose per strip -- `Transpose` on
+this product handles 16x16 blocks or NCHW/NHWC, so 16x256 is sixteen calls plus
+a `sharedTmpBuffer` and 4096 elements of movement -- or a change to the value
+cache packing, which would ripple through the reshape-and-cache kernels, the CPU
+oracle and the NPU drivers. Neither is free, and §7b says neither would pay.
+
+(`Axpy(dst, src, scalarValue, count)` would be a better fit than `Brcb` + `Mla`,
+since it takes the multiplier as a scalar -- but reading `P[t]` into a scalar
+means `GetValue` on a UB value, which §1.2's zero-scalar-compute invariant
+forbids. The broadcast formulation was the right instinct.)
+
+### 7b. The stalls are real, and the contraction is not where they are
+
+The 16 serial bursts are really there, and the earlier "93.3% occupied, one
+unbroken interval" figure in §6a hid them: that was measured at a 64-tick gap
+threshold, which is coarser than the stalls. Re-run with
+`scripts/analyze_vector_stalls.py`, which attributes each gap to the instruction
+the pipe was waiting to issue:
+
+```
+$ python3 scripts/analyze_vector_stalls.py /tmp/tree-run/ev_p4 16
+vector retirements: 48386
+span 70350 ticks, stalled 19190 ticks in 842 gaps > 16 ticks (27.3%)
+```
+
+So 27.3% of AIV0's span is fine-grained stall. The user's observation stands and
+my §6a emphasis needed this correction.
+
+But the gaps are not distributed the way data-dependent stalls are:
+
+| gap size | count |
+| --- | --- |
+| exactly 17 ticks | 769 |
+| exactly 18 ticks | 4 |
+| exactly 20 ticks | 64 |
+| > 32 ticks | 5 |
+
+A RAW stall varies with the producer's latency. A quantum of *exactly* 17 ticks,
+769 times, is a fixed issue cost. Sweeping the threshold shows the same cliff:
+842 gaps at 16 ticks collapse to 5 at 32.
+
+| threshold | gaps | stalled ticks | share of span |
+| --- | --- | --- | --- |
+| 4 | 2824 | 33987 | 48.3% |
+| 8 | 1165 | 23909 | 34.0% |
+| 16 | 842 | 19190 | 27.3% |
+| 32 | 5 | 4765 | 6.8% |
+| 64 | 4 | 4723 | 6.7% |
+
+And every instruction the rewrite would delete retires with **zero** stall in
+front of it:
+
+| mnemonic | retired | stalls | stall ticks | what it is |
+| --- | --- | --- | --- | --- |
+| `RV_VLDI` | 9600 | **0** | 0 | |
+| `RV_VST` | 6551 | 64 | 1092 | |
+| `RV_VLD` | 6416 | **0** | 0 | |
+| `RV_VMUL` | 4544 | **0** | 0 | the `Mul(weighted, ...)` |
+| `RV_VSTUI` | 4224 | 64 | 1280 | |
+| `RV_VCGADD` | 4096 | **0** | 0 | `ReduceDataBlock` |
+| `RV_SMOVI` | 1168 | **517** | **8789** | scalar/immediate into a vector register |
+| `RV_VLOOPv2` | 976 | 67 | 5724 | hardware loop setup |
+| `RV_VCPADD` | 512 | **0** | 0 | `ReducePairElem` |
+| `RV_SMOV` | 448 | **128** | **2176** | scalar into a vector register |
+
+`RV_VMUL`, `RV_VCGADD` and `RV_VCPADD` -- the materialize-and-reduce sequence,
+9152 retirements -- stall exactly zero times. All 19,190 stalled ticks sit on
+operand setup (`RV_SMOVI` 44% of its retirements, `RV_SMOV` 29%), hardware loop
+setup, and stores. Cross-core flags account for 129 ticks of the 19,190.
+
+The 645 `SMOVI`/`SMOV` gaps over 64 row-instances (4 strips x 16 rows) are about
+ten per query row: a fixed per-row cost of configuring vector operands, paid
+across the whole recurrence body, not in the contraction.
+
+It scales with the row count, which is what a structural per-row cost should do
+and a one-off should not:
+
+| run | strips | gaps > 16 | stalled | share |
+| --- | ---: | ---: | ---: | ---: |
+| `ev_p4`, 4 pages K=1 | 4 | 842 | 19190 | 27.3% |
+| `ev_p8`, 8 pages K=1 | 8 | 1678 | 33598 | 24.7% |
+| `ev_s127`, ragged S=127 | 8 | 1678 | 34070 | 24.8% |
+
+Doubling the strips doubles the gap count (842 -> 1678, against 2 x 842 = 1684).
+
+### 7c. Why the rewrite would make the measured number worse
+
+A per-token broadcast of `P[t]` into a vector register *is* an `RV_SMOVI`-class
+operation -- the one class that carries the 17-tick penalty, 44% of the time.
+Sixteen of them per row, 64 row-instances, is 1024 added instructions of exactly
+the kind that stalls; at the observed rate that is on the order of 7,600 extra
+stalled ticks. What it buys back is 9,152 retirements that currently stall zero
+times -- issue slots, not stall. The proposal trades instructions that cost
+nothing in stall for instructions that cost 17 ticks each, to fix a stall.
+
+So: blocked on the layout, and against the evidence even if the layout were
+fixed.
+
+### 7d. What the measurement points at instead
+
+If the cost is ~10 operand-setup instructions per query row, paid 16 times per
+strip, then the lever is the per-row structure, not the contraction. The 16
+query rows are independent -- separate `m`, `l` and `acc` -- and their state is
+already laid out contiguously per row (`panel` [16][16], `m`/`l` [16][8], `acc`
+[16][256]). A phase-major recurrence, where each phase issues once with a repeat
+form covering all 16 rows instead of 16 separate row bodies, would pay the
+operand setup once per phase per strip rather than once per phase per row: the
+same amortisation the DataBlock tree in §2 already used, applied to the loop
+structure instead of the reduction.
+
+That is a rewrite of `routine_vector_decode_recurrence.hpp`, which three kernels
+share, and the reductions stay within a row so the arithmetic ordering per row
+need not change. It is not attempted here. Note the routine's existing comment
+that unrolling the 16 rows at the strip sites instantiated 128 bodies and did
+not compile in 25 minutes -- phase-major is the opposite move (widen each phase,
+do not replicate the body), but the compile cost is worth checking early.
+
+## 8. The phase-major prototype: phase 1 widened over all 16 rows
+
+Section 7d said the lever was the per-row loop structure. This is that
+prototype: phase 1 only, hoisted out of the row loop and issued once for all
+16 query rows. Phases 2 to 5 still run per row, unchanged.
+
+It is in `vector_decode_recur_strip_phase_major` and
+`update_max_and_alpha_all`, additive beside the existing entry points, and only
+`turboquant_paged_decode_splitk_aic`'s aligned path calls it. The partial path
+and the other four kernels that share the engine are untouched.
+
+### 8a. Why phase 1, and why the result is bit-identical rather than within budget
+
+The 16 rows are independent -- each carries its own `m`, `l` and `acc`, and no
+row reads another's state -- so phase 1 may run for all of them before any row
+runs phase 2.
+
+Phase 1 is also the one phase whose widening cannot move a bit:
+
+| step | per row | widened | identical because |
+| --- | --- | --- | --- |
+| `Mul` | 16 lanes | 256 lanes, 4 repeats, `src1RepStride = 0` | elementwise |
+| `ReduceRepeat<MAX>` | repeatTime 1 | repeatTime 16, one repeat per row | **MAX selects an operand, it does not round** |
+| `Brcb` | repeatTime 1 | repeatTime 2 | per-element fill |
+| `Max`, `Sub`, `Exp` | 8 lanes | 128 lanes | elementwise over independent rows |
+
+The reduction is the whole point. A SUM tree had to be argued against a ULP
+budget, as §2a did. MAX is associative, commutative *and* exact, so visiting a
+row's 16 lanes in any order returns the same float. The prediction was
+bit-identity, and the gate confirms it exactly: the p4 margin line is
+character-for-character the same before and after, down to
+`got=0.630742371` and `mean signed deviation -6.688996e-10`.
+
+Six instructions per row times 16 rows becomes seven instructions, plus one
+`Adds` that replicates `key_scale` into a 64-lane block -- the `p_x4` shape
+from phase 4, reused.
+
+### 8b. Ticks
+
+| rung | with the tree (§3a) | phase-major | change |
+| --- | ---: | ---: | ---: |
+| pages 4, K 1, 16-token pages | 73,728 | **62,887** | **-14.70%** |
+| pages 8, K 1, 16-token pages | 139,110 | **117,428** | **-15.59%** |
+| S = 127 of 128, 128-token page | 140,621 | **120,745** | **-14.14%** |
+
+The ragged rung gains too, which is the expected shape rather than a surprise:
+seven of its eight strips are full and take the widened aligned path, and only
+the last one is masked.
+
+Both read from the run logs, not transcribed from §3a. One widened phase out of
+five is worth about as much as the whole DataBlock tree was.
+
+### 8c. Where it came from
+
+AIV0 at four strips, against the same `ev_p4` baseline §7b measured:
+
+| | baseline | phase-major | change |
+| --- | ---: | ---: | ---: |
+| vector retirements | 48,386 | 45,314 | **-6.3%** |
+| span | 70,350 | 59,480 | **-15.5%** |
+| stalled ticks (gap 16) | 19,190 | 16,133 | **-15.9%** |
+| stall gaps | 842 | 659 | **-21.7%** |
+
+| mnemonic | retired before | retired after | stalls before | stalls after |
+| --- | ---: | ---: | ---: | ---: |
+| `RV_SMOVI` | 1168 | 864 | 517 | **462** |
+| `RV_SMOV` | 448 | 328 | 128 | **64** |
+| `RV_VST` | 6551 | 6359 | 64 | **0** |
+| `RV_SMEM_BAR` | 1865 | 1265 | 0 | 0 |
+| `RV_SEND` | 3895 | 3335 | 0 | 0 |
+| `RV_VLD` | 6416 | 6008 | 0 | 0 |
+| `RV_PLT` | 1812 | 1512 | 0 | 0 |
+| `RV_VLOOPv2` | 976 | 740 | 67 | 67 |
+
+The mechanism §7b named is the one that moved: 424 fewer `SMOVI`/`SMOV`
+operand-setup instructions, and 119 fewer of the 17-tick gaps in front of them.
+
+Two things the prediction got wrong, both in the same direction. §7c estimated
+one widened phase at a few percent, reasoning that phase 1 is six of about
+forty instructions per row. It is 14.7%, because widening a phase also deletes
+the scaffolding around it: 600 fewer `RV_SMEM_BAR`, 560 fewer `RV_SEND` and 300
+fewer `RV_PLT` -- barrier, dispatch and predicate traffic that is charged per
+*instruction*, not per lane, and never appeared in the stall census because it
+never stalls.
+
+The stall *share* barely moves, 27.3% to 27.1%. That is the honest reading:
+this did not make the pipe denser, it removed instructions and the stalls they
+carried, together and in proportion. The remaining 16,133 ticks sit in phases 2
+to 5, which are still per row.
+
+### 8d. Gates
+
+| gate | state |
+| --- | --- |
+| device build, `-Wall -Werror` | **PASS**, 52 s, zero errors, zero warnings |
+| compile-time blowup (the risk in §7d) | **did not occur** -- widening a phase is not unrolling a body |
+| CAModel `cheap`: p1 K1, p4 K1, p4 K2, p4 K4, p8 K1 | **PASS**, 0 channels over tolerance on every rung |
+| bit-identity against the pre-change run | **PASS**, margin lines character-identical |
+| §1a strip-stream token model | **PASS**, unchanged -- the schedule was not touched |
+| §6.6 cross-core fence audit | **PASS**, 16 self-test controls |
+| CAModel `tails`: S = 1, S = 113, S = 127 at 128-token pages | **PASS**, 0 channels over tolerance on every rung |
+| `wide` (128-token pages over more than one page, 32 strips) | **NOT RUN** |
+| physical NPU | **UNAVAILABLE** on this host |
+
+The masked path was not modified and its operands still start at the base of
+each widened slot, so it is unaffected by construction -- and `tails` is the
+rung that shows it: all three pass, S = 1 exactly (one live token, every margin
+0.00000x).
+
+`wide` remains the standing gap, as it was before this change: no rung anywhere
+in this report has run 128-token pages over more than ONE page. What that
+geometry adds over `tails` is the multi-page block-table walk at 32 strips.
+This change is per-strip arithmetic and does not vary with strip count or page
+geometry, so the risk it carries there is low -- but low is not measured, and
+it is recorded here as not run rather than as covered.
+
+### 8e. What this says about the rest
+
+Phases 2 to 5 are the remaining 16,133 stalled ticks and the bulk of the
+per-row body. Phase 2 (`exponentiate_scores`) and phase 3
+(`update_denominator`) widen on exactly the same argument as phase 1 -- the
+same `Brcb`-then-elementwise shape over independent rows -- except that phase
+3's `ReduceRepeat<SUM>` is a SUM, so that one owes a ULP argument where phase 1
+owed none. Phase 4 is the contraction and is already wide in the channel
+direction; widening it over rows would want the 4096-element `weighted` buffer
+16 times over, which is where UB space, not instruction count, starts to bind.
+
+## 9. Gate status
 
 | gate | state |
 | --- | --- |
@@ -361,6 +655,8 @@ None of it is a scheduling problem.
 | §6.6 cross-core fence audit | **PASS**, untouched |
 | legacy `camodel_paged_decode_attention` ULP gate | see below |
 | `--page-tokens 128` over more than one page | **NOT RUN** |
+| §7 fused streaming FMA | **NOT IMPLEMENTED** -- blocked on the channel-major value page (§7a), and §7b/§7c measure it as a regression |
+| §7d phase-major recurrence | **PROTOTYPED** for phase 1 -- see section 8 |
 | physical NPU | **UNAVAILABLE** on this host |
 
 The legacy gate is the one that matters for this change, because `acc` is the

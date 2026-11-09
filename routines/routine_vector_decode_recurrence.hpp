@@ -75,6 +75,7 @@ constexpr std::uint32_t kDecodeChannels = 256;   // head size
 constexpr std::uint32_t kDecodeStateLanes = 8;   // one FP32 DataBlock
 constexpr std::uint32_t kDecodeBcLanes = 64;     // one Brcb repeat, 256 bytes
 constexpr std::uint32_t kDecodeVecLanes = 64;    // FP32 lanes in one repeat
+constexpr std::uint32_t kDecodeRows = 16;        // query rows in a score panel
 
 // FP32 elements in one DataBlock, and the per-channel reduction's shape.
 constexpr std::uint32_t kDecodeLanesPerBlock = 8;
@@ -146,12 +147,44 @@ struct NativeDecodeRecurrenceEngine {
         static_cast<std::int32_t>(kDecodeChannels);
     static constexpr std::int32_t kVecLanes =
         static_cast<std::int32_t>(kDecodeVecLanes);
+    // The whole panel, and the whole carried-max array, as flat lane counts.
+    static constexpr std::int32_t kPanelLanes =
+        static_cast<std::int32_t>(kDecodeRows * kDecodeKeys);
+    static constexpr std::int32_t kRowStateLanes =
+        static_cast<std::int32_t>(kDecodeRows * kDecodeStateLanes);
 
     // ---- the current query's views, set by select_query ------------------
     AscendC::LocalTensor<float> panel_row;  // kDecodeKeys
     AscendC::LocalTensor<float> m_cur;      // kDecodeStateLanes
     AscendC::LocalTensor<float> l_cur;      // kDecodeStateLanes
     AscendC::LocalTensor<float> acc_cur;    // kDecodeChannels
+
+    // ---- phase-major operands, set by a caller that wants them -----------
+    // The 16 query rows are independent -- each carries its own m, l and acc,
+    // and no row reads another's state -- so phase 1 can run ONCE over all of
+    // them instead of once per row. These are the wide operands it works in;
+    // `select_query_wide` then points the narrow per-row views at the right
+    // row of each, so phases 2 to 5 are untouched.
+    //
+    // Why bother: the stall attribution in
+    // reports/decode_splitk_aic_contraction.md section 7b measures about ten
+    // fixed 17-tick issue gaps per query row, in front of RV_SMOVI / RV_SMOV
+    // operand setup, while the arithmetic itself never stalls. Widening a
+    // phase pays that setup once per strip instead of once per row.
+    //
+    // Additive on purpose: a caller that leaves these unset and calls
+    // `vector_decode_recur_strip` is bit-for-bit unaffected.
+    AscendC::LocalTensor<float> key_scale_x4;     // kDecodeVecLanes
+    AscendC::LocalTensor<float> scaled_all;       // kDecodeRows * kDecodeKeys
+    AscendC::LocalTensor<float> tile_max_all;     // kDecodeRows
+    AscendC::LocalTensor<float> tile_max_bc_all;  // kDecodeRows * kDecodeStateLanes
+    AscendC::LocalTensor<float> m_new_all;        // kDecodeRows * kDecodeStateLanes
+    AscendC::LocalTensor<float> alpha_all;        // kDecodeRows * kDecodeStateLanes
+    AscendC::LocalTensor<float> alpha_delta_all;  // kDecodeRows * kDecodeStateLanes
+
+    std::uint32_t scaled_all_base = 0;
+    std::uint32_t m_new_all_base = 0;
+    std::uint32_t alpha_all_base = 0;
 
     // Base byte addresses the views are derived from.
     std::uint32_t panel_base = 0;
@@ -185,6 +218,20 @@ struct NativeDecodeRecurrenceEngine {
         m_cur = {position, m_base + query * kDecodeStateLanes * 4u, kDecodeStateLanes};
         l_cur = {position, l_base + query * kDecodeStateLanes * 4u, kDecodeStateLanes};
         acc_cur = {position, acc_base + query * kDecodeChannels * 4u, kDecodeChannels};
+    }
+
+    // The same, plus the three views that phase 1 has already filled for every
+    // row. Offsets stay 32-byte aligned: a score row is 64 bytes and a state
+    // block is 32.
+    __aicore__ inline void select_query_wide(std::uint32_t query)
+    {
+        select_query(query);
+        scaled_row = {position, scaled_all_base + query * kDecodeKeys * 4u,
+                      kDecodeKeys};
+        m_new = {position, m_new_all_base + query * kDecodeStateLanes * 4u,
+                 kDecodeStateLanes};
+        alpha = {position, alpha_all_base + query * kDecodeStateLanes * 4u,
+                 kDecodeStateLanes};
     }
 
     // ---------------------------------------------------------------- phases
@@ -341,6 +388,55 @@ struct NativeDecodeRecurrenceEngine {
         reduce_max_and_alpha();
     }
 
+    // Phase 1 for ALL kDecodeRows rows, in seven instructions instead of 16 x
+    // 6. Bit-identical to running `update_max_and_alpha` per row, and that is
+    // not a tolerance claim:
+    //
+    //   * the Mul is elementwise, so widening it changes nothing;
+    //   * MAX is associative, commutative AND exact -- it selects an operand
+    //     rather than rounding one -- so a 16-lane reduction gives the same
+    //     float whatever order it visits the lanes in. (This is exactly what
+    //     the SUM tree in `contract_values` could NOT claim, which is why that
+    //     one needed a ULP budget and this one does not.)
+    //   * Brcb, Max, Sub and Exp are elementwise over independent rows.
+    //
+    // Requires `key_scale_x4`, `scaled_all`, `tile_max_all`,
+    // `tile_max_bc_all`, `m_new_all`, `alpha_all` and `alpha_delta_all`, and
+    // reads `panel` and `m_prev` whole. Leaves every row's `m_new` and `alpha`
+    // where `select_query_wide` expects them.
+    __aicore__ inline void update_max_and_alpha_all()
+    {
+        // key_scale_x4[j] = key_scale[j % 16] for j < 64, so one 64-lane
+        // repeat covers four score rows with src1RepStride = 0 holding the
+        // scale still. The same shape as p_x4 in phase 4.
+        AscendC::Adds(key_scale_x4, key_scale, 0.0f, kKeyLanes, 4,
+                      AscendC::UnaryRepeatParams(1, 1, kKeyBlocks, 0));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(scaled_all, panel, key_scale_x4, kVecLanes,
+                     static_cast<std::uint8_t>(kDecodeRows * kDecodeKeys /
+                                               kDecodeVecLanes),
+                     AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 0));
+        AscendC::PipeBarrier<PIPE_V>();
+        // One maximum per row, written consecutively: ReduceRepeat reduces
+        // everything inside a repeat to a single value, so a repeat IS a row.
+        // This is the per-row call with repeatTime raised from 1 to 16.
+        AscendC::ReduceRepeat<AscendC::ReduceType::MAX, float>(
+            tile_max_all, scaled_all, kKeyLanes,
+            static_cast<std::int32_t>(kDecodeRows), 1, 1, kKeyBlocks,
+            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        AscendC::PipeBarrier<PIPE_V>();
+        // Each maximum into its own DataBlock, eight per repeat, landing row r
+        // at offset r * kDecodeStateLanes -- which is where m_prev keeps row r.
+        AscendC::Brcb(tile_max_bc_all, tile_max_all,
+                      static_cast<std::uint8_t>(kDecodeRows /
+                                                kDecodeLanesPerBlock),
+                      {1, 8});
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Max(m_new_all, m_prev, tile_max_bc_all, kRowStateLanes);
+        AscendC::Sub(alpha_delta_all, m_prev, m_new_all, kRowStateLanes);
+        AscendC::Exp(alpha_all, alpha_delta_all, kRowStateLanes);
+    }
+
     // Phase 2. Centre the row on the new maximum and exponentiate.
     __aicore__ inline void exponentiate_scores()
     {
@@ -461,7 +557,9 @@ __aicore__ inline void vector_decode_recur_query(Engine& engine)
 }
 
 // The whole strip: all kDecodeQueries queries in order.
-constexpr std::uint32_t kDecodeQueries = 16;
+// The same 16 as kDecodeRows, which the engine's wide operands are sized by.
+// Tied together so the two cannot drift apart.
+constexpr std::uint32_t kDecodeQueries = kDecodeRows;
 
 template <class Engine>
 __aicore__ inline void vector_decode_recur_strip(Engine& engine)
@@ -469,6 +567,39 @@ __aicore__ inline void vector_decode_recur_strip(Engine& engine)
     for (std::uint32_t query = 0; query < kDecodeQueries; ++query) {
         engine.select_query(query);
         vector_decode_recur_query(engine);
+    }
+}
+
+// The whole strip with phase 1 hoisted out of the row loop.
+//
+// Phase 1 runs once for all kDecodeQueries rows (see
+// `update_max_and_alpha_all`), then phases 2 to 5 run per row exactly as
+// `vector_decode_recur_query` runs them -- same calls, same order, same
+// operands, reached through `select_query_wide` instead of `select_query`.
+//
+// The result is bit-identical to `vector_decode_recur_strip`: nothing about
+// the arithmetic changes, only how many instructions carry it. See
+// `update_max_and_alpha_all` for why MAX makes that an exact claim rather than
+// a tolerance.
+//
+// Additive, like `vector_decode_recur_rows` above and for the same reason:
+// `vector_decode_recur_strip` stays the symbol the frozen Cube decode operator
+// calls, with the instruction stream its ladder was verified against.
+//
+// The ALIGNED path only. A partial strip masks the score row between phase 1's
+// two halves, which the wide form does not yet express, so a caller still
+// sends short strips to `vector_decode_recur_strip_masked`.
+template <class Engine>
+__aicore__ inline void vector_decode_recur_strip_phase_major(Engine& engine)
+{
+    engine.update_max_and_alpha_all();
+    AscendC::PipeBarrier<PIPE_V>();
+    for (std::uint32_t query = 0; query < kDecodeQueries; ++query) {
+        engine.select_query_wide(query);
+        engine.exponentiate_scores();
+        engine.update_denominator();
+        engine.update_accumulator();
+        engine.commit_state();
     }
 }
 
