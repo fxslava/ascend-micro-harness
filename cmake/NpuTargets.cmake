@@ -241,6 +241,68 @@ function(add_ascend_micro_npu_targets)
       turboquant_fused_decode_opt_npu ascendcl)
   target_compile_options(test_npu_fused_decode_opt PRIVATE -Wall -Wextra -Werror)
 
+  # ------------------------- the WRITE -> READ round trip (hardware, two operators)
+  # THE NZ-TILED INGRESS INSTANCE of the BF16 prefill. A THIRD library out of the same
+  # source, beside turboquant_bf16_npu above, and the only difference is
+  # TURBOQUANT_INGRESS_NZ: it makes the writer target common/turboquant_layout.h's
+  # NzTiled* contract -- what the kv4fp8 fused decode reads -- instead of RFC 3.1's strip
+  # one. The two are not reachable from one another by any permutation of addresses
+  # (tests/cpu/test_turboquant_kv_layout_bridge.cpp check 3), so this is a separate
+  # instance and not a flag on the shipping one: turboquant_bf16_npu is untouched and is
+  # still what every other harness here links, and no production launch gets this define.
+  #
+  # cmake/SimTargets.cmake registers camodel_turboquant_reshape_nz_kernel, the CAModel twin
+  # of this library, for the same reason and with the same define.
+  ascendc_library(turboquant_bf16_nz_npu SHARED
+      kernels/ops/turboquant/turboquant_reshape_and_cache_bf16.cpp)
+  ascendc_compile_definitions(turboquant_bf16_nz_npu PRIVATE
+      ASCEND_MICRO_CANN_LAUNCH TURBOQUANT_INGRESS_NZ)
+  ascendc_compile_options(turboquant_bf16_nz_npu PRIVATE
+      -std=c++17 -Wall -Werror ${CANN_SYSTEM_OPTIONS}
+      -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH)
+
+  # tests/npu/validation/test_turboquant_e2e_npu.cpp: ONE process, TWO real operators, ONE
+  # cache. The NZ prefill writes quantised K and V into physical 64-token pages through a
+  # fragmented slot mapping, and the fused decode then reads those very pages through a
+  # block table and computes attention over them -- nothing between the two launches but a
+  # stream synchronise. It is the first target in this harness where a genuine
+  # ingress -> decode round trip exists at all; before the NZ instance landed, the two
+  # operators named different bytes and reports/turboquant_e2e_roundtrip.md records that
+  # finding.
+  #
+  # It therefore links BOTH kernel libraries, which is the whole point and is the one place
+  # in this file where the "link the one library the driver calls" rule does not apply.
+  #
+  # TURBOQUANT_INGRESS_NZ is set on the EXECUTABLE as well as on the kernel library. The
+  # driver does not branch on it; it carries an #error on its absence, so a build that
+  # linked the strip instance by mistake fails at compile time rather than launching, passing
+  # no gate and being very hard to read.
+  #
+  # HARDWARE ONLY, like the four ladders above and for the same reason: every gate is a real
+  # launch pair compared against a golden image and an FP64 oracle, so a build on a host with
+  # no 950PR establishes that this harness compiles and nothing about either kernel. Unlike
+  # those four it has no CAModel twin yet -- the simulator leg has the two halves in isolation
+  # (scripts/run_turboquant_e2e_roundtrip.sh), which is a canary and not a baseline.
+  #
+  # acl_op_compiler is linked when the toolkit has it. This driver calls no aclnn or aclop
+  # entry point, so the link is for parity with the runtime set the hardware runners are
+  # expected to carry and is skipped rather than failing configure where the library is absent.
+  add_executable(test_turboquant_e2e_npu
+      tests/npu/validation/test_turboquant_e2e_npu.cpp)
+  target_include_directories(test_turboquant_e2e_npu PRIVATE
+      "${ASCEND_HOME_PATH}/include")
+  target_compile_definitions(test_turboquant_e2e_npu PRIVATE TURBOQUANT_INGRESS_NZ)
+  target_link_libraries(test_turboquant_e2e_npu PRIVATE
+      turboquant_bf16_nz_npu turboquant_fused_decode_opt_npu ascendcl)
+  find_library(TQ_E2E_ACL_OP_COMPILER NAMES acl_op_compiler
+      HINTS "${ASCEND_HOME_PATH}/lib64" NO_DEFAULT_PATH)
+  if(TQ_E2E_ACL_OP_COMPILER)
+    target_link_libraries(test_turboquant_e2e_npu PRIVATE ${TQ_E2E_ACL_OP_COMPILER})
+  else()
+    message(STATUS "acl_op_compiler not found; test_turboquant_e2e_npu links ascendcl only")
+  endif()
+  target_compile_options(test_turboquant_e2e_npu PRIVATE -Wall -Wextra -Werror)
+
   # ------------------------- single-token decode at an unaligned context S
   # test_npu_decode_single_token_unaligned walked S = 1, 7, 15, 17, 31, 33, 127, 129,
   # 255, 257, 1023 -- not one of them a multiple of the 16-token strip and most not of
@@ -290,6 +352,7 @@ function(add_ascend_micro_npu_targets)
       bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
       test_npu_decode_splitk_aic
       test_npu_fused_decode_opt
+      test_turboquant_e2e_npu
       test_cluster_sync_probe)
     set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64")
@@ -298,5 +361,6 @@ function(add_ascend_micro_npu_targets)
       test_turboquant_a8_validation test_turboquant_bf16_validation
       bench_turboquant_reshape_and_cache bench_turboquant_decode_splitk
       test_npu_decode_splitk_aic
-      test_npu_fused_decode_opt)
+      test_npu_fused_decode_opt
+      test_turboquant_e2e_npu)
 endfunction()
