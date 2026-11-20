@@ -1,0 +1,21 @@
+{
+  "command": [
+    "/home/dmin/work/agent_08/build/residual-sweep/lib/test_camodel_e8_int8_dequant_residual",
+    "--fixtures",
+    "/home/dmin/work/agent_08/artifacts/fixtures/e8_v1",
+    "--tables",
+    "/home/dmin/work/agent_08/artifacts/fixtures/e8_layout_v1"
+  ],
+  "cwd": "/home/dmin/work/agent_08/artifacts/phase1/run-round3-repeat24-plain",
+  "timing_model_dir": "/opt/e8/cann/x86_64-linux/simulator/dav_3510/lib",
+  "expected_pem_sha256": "1a6420fe8123e88a120f0bbfc76710968e6708599c77d80a7b1097aca06eed33",
+  "collection": "ordinary CAModel text dumps; NO callback helper",
+  "cache_evidence": "Consecutive warmup + repeats; hit/refill counters unavailable. Verify persistence separately.",
+  "environment": {
+    "LD_LIBRARY_PATH": "/home/dmin/work/agent_08/build/residual-sweep/lib:/opt/e8/cann/tools/simulator/Ascend950PR_9599/lib:/opt/e8/cann/lib64:/opt/e8/cann/devlib:/home/dmin/Ascend-9.2.1/cann-9.2.1/lib64:/home/dmin/Ascend-9.2.1/cann-9.2.1/lib64/plugin/opskernel:/home/dmin/Ascend-9.2.1/cann-9.2.1/lib64/plugin/nnengine:/home/dmin/Ascend-9.2.1/cann-9.2.1/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/cann-9.1.0/lib64:/usr/local/Ascend/cann-9.1.0/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.1.0/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.1.0/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/python3.12.13/lib::/usr/local/Ascend/cann-9.1.0/devlib:/home/dmin/Ascend-9.2.1/cann-9.2.1/devlib",
+    "LD_PRELOAD": null,
+    "soc_version": null
+  },
+  "exit_code": 0,
+  "loaded_pem_verified": true
+}

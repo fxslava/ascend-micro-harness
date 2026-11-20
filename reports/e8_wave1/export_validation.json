@@ -1,0 +1,76 @@
+{
+  "status": "PASS_FROZEN_SOURCE_AND_EXACT_GOLDEN_EXPORT",
+  "validated_utc": "2026-11-20T21:16:09.525343+00:00",
+  "phase0_commit": "cf94dd09c4e7721f006a3eb43633a1dda5d9658c",
+  "native_validation": {
+    "status": "PASS_EXACT_REGENERATION",
+    "payloads": 23,
+    "elements_per_dtype": 8192,
+    "numpy": "2.2.6",
+    "oracle_status": "CPU_ONLY_PASS",
+    "output": "/home/dmin/work/e8_coordinator/exports/wave1_simt_20261120_211432/regenerated"
+  },
+  "frozen_headers": [
+    {
+      "file": "routine_e8_bf16_dequant_simt.hpp",
+      "sha256": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2",
+      "source": "/home/dmin/work/agent_06/ascend-micro-harness/routines/routine_e8_bf16_dequant_simt.hpp",
+      "slot": "agent_06"
+    },
+    {
+      "file": "routine_e8_int8_dequant_simt.hpp",
+      "sha256": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45",
+      "source": "/home/dmin/work/agent_08/ascend-micro-harness/routines/routine_e8_int8_dequant_simt.hpp",
+      "slot": "agent_08"
+    }
+  ],
+  "generator": {
+    "file": "e8_reference.py",
+    "source": "/home/dmin/work/agent_09/ascend-micro-harness/scripts/e8_reference.py",
+    "sha256": "a5b6c0d0b9d32ed53f285c7dbbbe63dbd8e5464019ebe461bb4d0b9f967ad495",
+    "matches_slots": [
+      "06",
+      "08",
+      "09"
+    ]
+  },
+  "goldens": {
+    "directory": "e8_wave1_goldens",
+    "source": "/home/dmin/work/agent_06/artifacts/fixtures/e8_v1",
+    "also_verified_against": "/home/dmin/work/agent_08/artifacts/fixtures/e8_v1",
+    "manifest_sha256": "efeb8b9c8a540989bd62847a643b818f2500678fe7c205e540e16ea1f723aec7",
+    "payload_files": 23,
+    "payload_bytes": 344768,
+    "numpy": "2.2.6",
+    "seed": 9503510
+  },
+  "historical_CAModel_evidence": [
+    {
+      "file": "reports/e8_wave1/agent06_round3_repeat24_plain_approval.json",
+      "source": "/home/dmin/work/e8_coordinator/reports/agent06_round3_repeat24_plain_approval.json",
+      "sha256": "b6e9ff3863adb2d5738a068a7fb4cde10ad174396d19c7c882f6ee7ed8abe0d3"
+    },
+    {
+      "file": "reports/e8_wave1/agent06_measurement_manifest.json",
+      "source": "/home/dmin/work/agent_06/artifacts/phase1/run-round3-repeat24-plain/measurement_manifest.json",
+      "sha256": "af84a78a2dda53eec58bdbf22d0fc4102020a53d7bb6e50debf0b246e9c13112"
+    },
+    {
+      "file": "reports/e8_wave1/agent08_round3_repeat24_plain_approval.json",
+      "source": "/home/dmin/work/e8_coordinator/reports/agent08_round3_repeat24_plain_approval.json",
+      "sha256": "0acfbf7895c568d04de6ce3d8a59828bab8a5e076dd7da65d617ff8a0458b870"
+    },
+    {
+      "file": "reports/e8_wave1/agent08_measurement_manifest.json",
+      "source": "/home/dmin/work/agent_08/artifacts/phase1/run-round3-repeat24-plain/measurement_manifest.json",
+      "sha256": "3fbeab52f18e5ea8038eb148fb586f4d46e50aab7b44a7acced98976a1e7b19b"
+    }
+  ],
+  "new_device_builds": 0,
+  "new_CAModel_launches": 0,
+  "limits": [
+    "Historical CAModel results apply only to frozen selected Wave1 standalone configuration",
+    "Regeneration compared all23 payload names/lengths/hashes and metadata with original fixture records; report/source paths are machine-dependent",
+    "Native slot trees are source snapshots without Git metadata; destination repository contains cf94dd0"
+  ]
+}

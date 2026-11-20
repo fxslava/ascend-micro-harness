@@ -1,8 +1,8 @@
 # Micro-Routine Registry
 
-Phase0 audit: Ascend950PR / `dav_3510` / CANN 9.2.1. **Wave 2 codegen, builds and CAModel are not approved.** This registry and the proposed assignment plan await user sign-off.
+Inventory baseline `cf94dd09c4e7721f006a3eb43633a1dda5d9658c`: Ascend950PR / `dav_3510` / CANN 9.2.1. Wave 2 implementation was subsequently authorized; each CAModel run still requires its own orchestrator approval. This update vendors the frozen Wave 1 sources and goldens; it authorizes no new device run.
 
-All 25 headers under `C:/ascend-micro-harness/routines/` were inspected in nine slot assignments, scheduled three workers at a time. Every source hash was independently rechecked during consolidation. The JSON companion embeds full API/CANN evidence, exact declarations, resources, synchronization and audit limitations. Unknown measurements are not zero; historical reports are not current hash-bound certification.
+The original 25 headers under `C:/ascend-micro-harness/routines/` were inspected in nine slot assignments, scheduled three workers at a time. Every source hash was independently rechecked during consolidation. The JSON companion embeds full API/CANN evidence, exact declarations, resources, synchronization and audit limitations. Unknown measurements are not zero; historical reports are not current hash-bound certification.
 
 ## Frozen Wave 1 references
 
@@ -14,6 +14,21 @@ The authoritative `C:/Ascend/ascend-wsl-registry.json` had all 9 slots free and 
 |Agent 08 INT8 SIMT E8 dequant|8011 / 7857|0.968505859|Frozen source/binary hashes rechecked; standalone reference|
 
 Exact original paths, hashes, approval records and timing backend are in JSON `frozen_baselines`. These wrappers emit physical BF16/INT8 to UB. Their register helpers can be adapted after sign-off into new Wave 2 VFs; the wrappers cannot be chained without an intermediate UB boundary. No reference source or binary was changed.
+
+## Portable frozen Wave 1 import
+
+The repository now registers **27 headers**, including these two byte-identical native-slot imports:
+
+| Header | Namespace | Selected configuration | Source SHA-256 |
+|---|---|---|---|
+| [routine_e8_bf16_dequant_simt.hpp](routines/routine_e8_bf16_dequant_simt.hpp) | `ascend_micro::e8` | BF16 / SIMT / Arithmetic / 512 threads / AoS / ResidualBits | `28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2` |
+| [routine_e8_int8_dequant_simt.hpp](routines/routine_e8_int8_dequant_simt.hpp) | `ascend_micro::e8_int8_simt` | INT8 / SIMT / Arithmetic / 512 threads / AoS / ResidualBits | `e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45` |
+
+Both are AIV SIMT leaves for positive multiples of256 elements; the measured workload is8192 elements/32 D256 rows/1024 E8 vectors. Caller-owned input/output views require32B base alignment and the documented256B read pad. Selected scratch/LUT/L1 footprints are zero; historical wrappers reserve32768B static UB. Peak allocated VREG remains unknown; zero emitted spills belongs to the frozen selected configuration. Caller owns MTE2/V/MTE3 staging, flags and final drains. These are E8-only leaves: composing their wrappers with inverse Hadamard creates a UB boundary; register fusion requires a separately reviewed VF.
+
+The canonical `routines/e8_reference.py` is copied unchanged from native Agent09 and matches Agents06/08. The23 payloads in `routines/e8_wave1_goldens/` include both physical BF16/INT8 golden outputs, unrounded FP32 reconstructions, labels, scales and inputs. `routines/generate_e8_wave1_goldens.py` verifies the package or regenerates it with NumPy2.2.6 into an explicit native directory. All23 regenerated payload records match the original names, sizes and SHA-256 hashes. See [usage and exact template arguments](routines/E8_WAVE1_SIMT.md), [provenance](routines/e8_wave1_export.json) and [validation](reports/e8_wave1/export_validation.json).
+
+The original Phase0 and Wave1 measurements remain historical. No frozen kernel source was edited, no new CAModel benchmark was run, and no full Wave2 pipeline performance is implied by this import.
 
 ## Proposed nine-slot execution plan
 

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "status": "Phase0 audit complete; Wave2 plan awaiting user sign-off",
-  "generated_utc": "2026-11-20T16:38:52.180014+00:00",
+  "status": "Phase0 inventory archived at cf94dd0; frozen Wave1 SIMT headers and goldens imported; Wave2 execution tracked separately",
+  "generated_utc": "2026-11-20T21:16:09.525343+00:00",
   "repository_root": "C:/ascend-micro-harness",
   "target": {
     "soc": "Ascend950PR_9599",
@@ -11,11 +11,12 @@
     "image": "sha256:bbd643260f6c27e371e4df556813e9365980361194f06b0e9cdeda697378784c",
     "API_docs": "C:/PipeSim/docs/ascendc_api",
     "new_builds": 0,
-    "new_CAModel_launches": 0
+    "new_CAModel_launches": 0,
+    "counter_scope": "Original Phase0 inventory only; this export runs no compiler or CAModel"
   },
   "wave1_slots_confirmed_free_before_inventory": 9,
   "coverage": {
-    "existing_header_count": 25,
+    "existing_header_count": 27,
     "existing_headers": [
       "routine_cube_decode_score.hpp",
       "routine_cube_gqa_fixpipe_dual_dst.hpp",
@@ -41,11 +42,14 @@
       "routine_vector_icdf_quantize.hpp",
       "routine_vector_normalize_store.hpp",
       "routine_vector_online_softmax.hpp",
-      "routine_vector_rotate_butterfly.hpp"
+      "routine_vector_rotate_butterfly.hpp",
+      "routine_e8_bf16_dequant_simt.hpp",
+      "routine_e8_int8_dequant_simt.hpp"
     ],
-    "external_frozen_references": 2,
+    "external_frozen_references": 0,
     "parallel_inventory_workers_max": 3,
-    "inventory_batches": 3
+    "inventory_batches": 3,
+    "vendored_frozen_wave1_references": 2
   },
   "routine_entries": [
     {
@@ -3049,7 +3053,7 @@
         "current_K": 16,
         "current_D": null,
         "current_elements": 256,
-        "proposed_M128_D256": "unsupported by this fixed16x16x16 engine/config. D=256 is not this routine’s logical dimension; no D256 Hadamard or 256-competitor WTA can be inferred. Requires new geometry, load schedules, weights and resource audit.",
+        "proposed_M128_D256": "unsupported by this fixed16x16x16 engine/config. D=256 is not this routine\u2019s logical dimension; no D256 Hadamard or 256-competitor WTA can be inferred. Requires new geometry, load schedules, weights and resource audit.",
         "evidence": {
           "path": "C:/ascend-micro-harness/routines/routine_cube_wta_fixpipe.hpp",
           "line_start": 15,
@@ -3365,7 +3369,7 @@
           "current_K": 16,
           "current_D": null,
           "current_elements": 256,
-          "proposed_M128_D256": "unsupported by this fixed16x16x16 engine/config. D=256 is not this routine’s logical dimension; no D256 Hadamard or 256-competitor WTA can be inferred. Requires new geometry, load schedules, weights and resource audit.",
+          "proposed_M128_D256": "unsupported by this fixed16x16x16 engine/config. D=256 is not this routine\u2019s logical dimension; no D256 Hadamard or 256-competitor WTA can be inferred. Requires new geometry, load schedules, weights and resource audit.",
           "evidence": {
             "path": "C:/ascend-micro-harness/routines/routine_cube_wta_fixpipe.hpp",
             "line_start": 15,
@@ -13868,59 +13872,11 @@
           }
         ]
       }
-    }
-  ],
-  "frozen_baselines": {
-    "timestamp_utc": "2026-11-20T16:20:27.988810+00:00",
-    "wave1_released_slots": 9,
-    "image": "sha256:bbd643260f6c27e371e4df556813e9365980361194f06b0e9cdeda697378784c",
-    "no_simd_dequant_reoptimization": true,
-    "baselines": [
-      {
-        "agent": "06",
-        "dtype": "BF16",
-        "postwarm_ticks": [
-          9736,
-          9815
-        ],
-        "ticks_per_element": 1.19329833984375,
-        "role": "frozen reference only; no source or binary changes",
-        "hashes": {
-          "/home/dmin/work/agent_06/ascend-micro-harness/routines/routine_e8_bf16_dequant_simt.hpp": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2",
-          "/home/dmin/work/agent_06/build/residual-sweep/lib/libcamodel_e8_bf16_dequant_residual_kernel.so": "1b2ef6cdd8de45ef0e2cf27d260b853f8466d32585252fd36b566c2ecda77e4a",
-          "/home/dmin/work/agent_06/build/residual-sweep/lib/test_camodel_e8_bf16_dequant_residual": "b1cb3cb717c04b537803f0d70c9f969413b7b251db1a40b096ba48ff21330149",
-          "/home/dmin/Ascend-9.2.1/cann-9.2.1/x86_64-linux/simulator/bin/libcannsim_helper.so": "656a2c872bb5e93a287588260cfa9e53813b7fab51e7ea94b16211265bbb1d0d"
-        },
-        "approval": "reports/agent06_round3_repeat24_plain_approval.json"
-      },
-      {
-        "agent": "08",
-        "dtype": "INT8",
-        "postwarm_ticks": [
-          8011,
-          7857
-        ],
-        "ticks_per_element": 0.968505859375,
-        "role": "frozen reference only; no source or binary changes",
-        "hashes": {
-          "/home/dmin/work/agent_08/ascend-micro-harness/routines/routine_e8_int8_dequant_simt.hpp": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45",
-          "/home/dmin/work/agent_08/build/residual-sweep/lib/libcamodel_e8_int8_dequant_residual_kernel.so": "b01b7cc7c41ffaa6055f0e3c983a6810ae9ba9c41e375f4c3861ae13593d3f1f",
-          "/home/dmin/work/agent_08/build/residual-sweep/lib/test_camodel_e8_int8_dequant_residual": "dc416ebca55b6ca1536e352bc549afa91349b71a7dcda0816e415f694b20e4a2"
-        },
-        "approval": "reports/agent08_round3_repeat24_plain_approval.json"
-      }
-    ],
-    "timing_backend": {
-      "path": "/home/dmin/Ascend-9.2.1/cann-9.2.1/x86_64-linux/simulator/dav_3510/lib/libpem_davinci.so",
-      "sha256": "1a6420fe8123e88a120f0bbfc76710968e6708599c77d80a7b1097aca06eed33",
-      "callback_helper": "excluded from measurements; its frozen hash is provenance only, not an enabled profiler"
-    }
-  },
-  "external_reference_entries": [
+    },
     {
-      "header": "/home/dmin/work/agent_06/ascend-micro-harness/routines/routine_e8_bf16_dequant_simt.hpp",
+      "header": "C:/ascend-micro-harness/routines/routine_e8_bf16_dequant_simt.hpp",
       "sha256": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2",
-      "scope": "external frozen Wave1 reference; not one of25 repository inventory headers",
+      "scope": "repository header; byte-identical frozen Wave1 import",
       "namespace": "ascend_micro::e8",
       "public_routines": [
         {
@@ -13981,8 +13937,9 @@
         ],
         "ticks_per_element": 1.19329833984375,
         "output": "exact correctly rounded physical golden; GMguards pass",
-        "approval": "reports/agent06_round3_repeat24_plain_approval.json",
-        "full_rotation_pipeline_verified": false
+        "approval": "reports/e8_wave1/agent06_round3_repeat24_plain_approval.json",
+        "full_rotation_pipeline_verified": false,
+        "measurement_manifest": "reports/e8_wave1/agent06_measurement_manifest.json"
       },
       "intrinsic_audit": [
         {
@@ -13995,12 +13952,35 @@
         }
       ],
       "frozen": true,
-      "changes_allowed": false
+      "changes_allowed": false,
+      "id": "routine_e8_bf16_dequant_simt",
+      "header_path": "C:/ascend-micro-harness/routines/routine_e8_bf16_dequant_simt.hpp",
+      "header_sha256": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2",
+      "source_native_path": "/home/dmin/work/agent_06/ascend-micro-harness/routines/routine_e8_bf16_dequant_simt.hpp",
+      "inventory_slot": "agent_06",
+      "selected_template_arguments": {
+        "Elements": 8192,
+        "Threads": 512,
+        "Backend": "SIMT",
+        "Representation": "Arithmetic",
+        "TableLayout": "AoS",
+        "Shaping": "ResidualBits",
+        "scratch_bytes": 0,
+        "table_bytes": 0
+      },
+      "golden_fixture": {
+        "manifest": "routines/e8_wave1_goldens/manifest.json",
+        "manifest_sha256": "efeb8b9c8a540989bd62847a643b818f2500678fe7c205e540e16ea1f723aec7",
+        "oracle": "routines/e8_reference.py",
+        "oracle_sha256": "a5b6c0d0b9d32ed53f285c7dbbbe63dbd8e5464019ebe461bb4d0b9f967ad495",
+        "portable_generator": "routines/generate_e8_wave1_goldens.py",
+        "reproduction_validation": "reports/e8_wave1/export_validation.json"
+      }
     },
     {
-      "header": "/home/dmin/work/agent_08/ascend-micro-harness/routines/routine_e8_int8_dequant_simt.hpp",
+      "header": "C:/ascend-micro-harness/routines/routine_e8_int8_dequant_simt.hpp",
       "sha256": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45",
-      "scope": "external frozen Wave1 reference; not one of25 repository inventory headers",
+      "scope": "repository header; byte-identical frozen Wave1 import",
       "namespace": "ascend_micro::e8_int8_simt",
       "public_routines": [
         {
@@ -14061,8 +14041,9 @@
         ],
         "ticks_per_element": 0.968505859375,
         "output": "exact correctly rounded physical golden; GMguards pass",
-        "approval": "reports/agent08_round3_repeat24_plain_approval.json",
-        "full_rotation_pipeline_verified": false
+        "approval": "reports/e8_wave1/agent08_round3_repeat24_plain_approval.json",
+        "full_rotation_pipeline_verified": false,
+        "measurement_manifest": "reports/e8_wave1/agent08_measurement_manifest.json"
       },
       "intrinsic_audit": [
         {
@@ -14075,9 +14056,79 @@
         }
       ],
       "frozen": true,
-      "changes_allowed": false
+      "changes_allowed": false,
+      "id": "routine_e8_int8_dequant_simt",
+      "header_path": "C:/ascend-micro-harness/routines/routine_e8_int8_dequant_simt.hpp",
+      "header_sha256": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45",
+      "source_native_path": "/home/dmin/work/agent_08/ascend-micro-harness/routines/routine_e8_int8_dequant_simt.hpp",
+      "inventory_slot": "agent_08",
+      "selected_template_arguments": {
+        "Elements": 8192,
+        "Threads": 512,
+        "Backend": "SIMT",
+        "Representation": "Arithmetic",
+        "TableLayout": "AoS",
+        "Shaping": "ResidualBits",
+        "scratch_bytes": 0,
+        "table_bytes": 0
+      },
+      "golden_fixture": {
+        "manifest": "routines/e8_wave1_goldens/manifest.json",
+        "manifest_sha256": "efeb8b9c8a540989bd62847a643b818f2500678fe7c205e540e16ea1f723aec7",
+        "oracle": "routines/e8_reference.py",
+        "oracle_sha256": "a5b6c0d0b9d32ed53f285c7dbbbe63dbd8e5464019ebe461bb4d0b9f967ad495",
+        "portable_generator": "routines/generate_e8_wave1_goldens.py",
+        "reproduction_validation": "reports/e8_wave1/export_validation.json"
+      }
     }
   ],
+  "frozen_baselines": {
+    "timestamp_utc": "2026-11-20T16:20:27.988810+00:00",
+    "wave1_released_slots": 9,
+    "image": "sha256:bbd643260f6c27e371e4df556813e9365980361194f06b0e9cdeda697378784c",
+    "no_simd_dequant_reoptimization": true,
+    "baselines": [
+      {
+        "agent": "06",
+        "dtype": "BF16",
+        "postwarm_ticks": [
+          9736,
+          9815
+        ],
+        "ticks_per_element": 1.19329833984375,
+        "role": "frozen reference only; no source or binary changes",
+        "hashes": {
+          "/home/dmin/work/agent_06/ascend-micro-harness/routines/routine_e8_bf16_dequant_simt.hpp": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2",
+          "/home/dmin/work/agent_06/build/residual-sweep/lib/libcamodel_e8_bf16_dequant_residual_kernel.so": "1b2ef6cdd8de45ef0e2cf27d260b853f8466d32585252fd36b566c2ecda77e4a",
+          "/home/dmin/work/agent_06/build/residual-sweep/lib/test_camodel_e8_bf16_dequant_residual": "b1cb3cb717c04b537803f0d70c9f969413b7b251db1a40b096ba48ff21330149",
+          "/home/dmin/Ascend-9.2.1/cann-9.2.1/x86_64-linux/simulator/bin/libcannsim_helper.so": "656a2c872bb5e93a287588260cfa9e53813b7fab51e7ea94b16211265bbb1d0d"
+        },
+        "approval": "reports/agent06_round3_repeat24_plain_approval.json"
+      },
+      {
+        "agent": "08",
+        "dtype": "INT8",
+        "postwarm_ticks": [
+          8011,
+          7857
+        ],
+        "ticks_per_element": 0.968505859375,
+        "role": "frozen reference only; no source or binary changes",
+        "hashes": {
+          "/home/dmin/work/agent_08/ascend-micro-harness/routines/routine_e8_int8_dequant_simt.hpp": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45",
+          "/home/dmin/work/agent_08/build/residual-sweep/lib/libcamodel_e8_int8_dequant_residual_kernel.so": "b01b7cc7c41ffaa6055f0e3c983a6810ae9ba9c41e375f4c3861ae13593d3f1f",
+          "/home/dmin/work/agent_08/build/residual-sweep/lib/test_camodel_e8_int8_dequant_residual": "dc416ebca55b6ca1536e352bc549afa91349b71a7dcda0816e415f694b20e4a2"
+        },
+        "approval": "reports/agent08_round3_repeat24_plain_approval.json"
+      }
+    ],
+    "timing_backend": {
+      "path": "/home/dmin/Ascend-9.2.1/cann-9.2.1/x86_64-linux/simulator/dav_3510/lib/libpem_davinci.so",
+      "sha256": "1a6420fe8123e88a120f0bbfc76710968e6708599c77d80a7b1097aca06eed33",
+      "callback_helper": "excluded from measurements; its frozen hash is provenance only, not an enabled profiler"
+    }
+  },
+  "external_reference_entries": [],
   "composition_rules": [
     {
       "id": "A_single_SIMT_VF",
@@ -14995,5 +15046,16 @@
     "Nonlinear E8 shaping cannot be folded away.",
     "Source/API gaps in accumulation, normalization, barrier/layout/staging and descriptor contracts block blind composition; no fixes performed.",
     "No exact finite E8 device encoder or complete Wave2 pipeline is certified here."
-  ]
+  ],
+  "phase0_generated_utc": "2026-11-20T16:38:52.180014+00:00",
+  "wave1_import": {
+    "phase0_commit": "cf94dd09c4e7721f006a3eb43633a1dda5d9658c",
+    "provenance": "routines/e8_wave1_export.json",
+    "usage": "routines/E8_WAVE1_SIMT.md",
+    "validation": "reports/e8_wave1/export_validation.json",
+    "payload_files": 23,
+    "source_and_golden_hashes_preserved": true,
+    "new_builds": 0,
+    "new_CAModel_launches": 0
+  }
 }

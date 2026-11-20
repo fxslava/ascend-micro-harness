@@ -6,3 +6,13 @@ reports/decode_comparison_*/trace.json -text
 reports/fused_decode_opt_json_*/trace.json -text
 reports/decode_trace_comparison_*/matched_context_128_overlay.json -text
 reports/decode_trace_comparison_*/old_bf16_n16_source/trace.json -text
+
+# Frozen Wave 1 E8 source and byte-exact golden payloads.
+routines/routine_e8_bf16_dequant_simt.hpp text eol=lf
+routines/routine_e8_int8_dequant_simt.hpp text eol=lf
+routines/e8_reference.py text eol=lf
+routines/generate_e8_wave1_goldens.py text eol=lf
+routines/e8_wave1_goldens/** -text
+routines/e8_wave1_export.json text eol=lf
+routines/E8_WAVE1_SIMT.md text eol=lf
+reports/e8_wave1/** text eol=lf
