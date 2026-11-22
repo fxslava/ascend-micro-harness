@@ -1,0 +1,39 @@
+{
+  "status": "PASS, whole-file analyzer comparison has no new diagnostics",
+  "parent_raw": {
+    "fatal": 71,
+    "warning": 65,
+    "info": 0,
+    "total": 136,
+    "by_code": {
+      "AKA1004": 71,
+      "AKA1009": 38,
+      "AKA3001": 1,
+      "AKA3002": 18,
+      "AKA3003": 6,
+      "AKA9001": 2
+    }
+  },
+  "candidate_raw": {
+    "fatal": 71,
+    "warning": 65,
+    "info": 0,
+    "total": 136,
+    "by_code": {
+      "AKA1004": 71,
+      "AKA1009": 38,
+      "AKA3001": 1,
+      "AKA3002": 18,
+      "AKA3003": 6,
+      "AKA9001": 2
+    }
+  },
+  "parent_findings": 136,
+  "candidate_findings": 136,
+  "new_findings": 0,
+  "absent_parent_diagnostics": 0,
+  "sha256": {
+    "analyzer-parent-findings.json": "366794053606e8180e06c5c11da3625c93bdbdd7e6091ed7cb816e0e2031f27a",
+    "analyzer-findings.json": "0b0a40be68e816044572d36695a269b266fcdcf4fc10db5126244d4ffa4bb82d"
+  }
+}

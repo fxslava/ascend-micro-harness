@@ -1,0 +1,3155 @@
+{
+  "calibration": [
+    {
+      "measured": 34935,
+      "replayed": 34935,
+      "max_error": 0
+    },
+    {
+      "measured": 35271,
+      "replayed": 35271,
+      "max_error": 0
+    }
+  ],
+  "weights": [
+    [
+      {
+        "role": 0,
+        "wait_start": 24761,
+        "score_ready": 24974,
+        "previous_vector_end": 24872,
+        "first_vector": 25089,
+        "key_done": 25181,
+        "scalar_prefix": 115,
+        "key_vector": 92,
+        "value_and_vf_admission": 185,
+        "total_prefix": 392,
+        "key_write_evidence": [
+          {
+            "tick": 25145,
+            "engine": "RVECST",
+            "id": 55868,
+            "mnemonic": "RV_VST",
+            "tail": "  Vd[0], Sn[10]=0x5fe0, Sn2[11]=0x1, Am[0]=0x0, Pg[2], dist:NORM_B32, "
+          },
+          {
+            "tick": 25181,
+            "engine": "RVECST",
+            "id": 55973,
+            "mnemonic": "RV_VST",
+            "tail": "  Vd[0], Sn[6]=0x5fe0, Sn2[7]=0x1, Am[0]=0x0, Pg[1], dist:NORM_B32, "
+          }
+        ],
+        "popped_sha256": "f60a9c5d84bcee71a1ee95edd6a8401542d13ef16121d0f7a126ab4b2c75df13",
+        "retired_sha256": "bf3f47ea0c8a726dae0d3169b31b7d9814400a26294d053efd622cdedbb0572a"
+      },
+      {
+        "role": 1,
+        "wait_start": 24778,
+        "score_ready": 24974,
+        "previous_vector_end": 24889,
+        "first_vector": 25089,
+        "key_done": 25181,
+        "scalar_prefix": 115,
+        "key_vector": 92,
+        "value_and_vf_admission": 185,
+        "total_prefix": 392,
+        "key_write_evidence": [
+          {
+            "tick": 25145,
+            "engine": "RVECST",
+            "id": 55873,
+            "mnemonic": "RV_VST",
+            "tail": "  Vd[0], Sn[10]=0x5fe0, Sn2[11]=0x1, Am[0]=0x0, Pg[2], dist:NORM_B32, "
+          },
+          {
+            "tick": 25181,
+            "engine": "RVECST",
+            "id": 55977,
+            "mnemonic": "RV_VST",
+            "tail": "  Vd[0], Sn[6]=0x5fe0, Sn2[7]=0x1, Am[0]=0x0, Pg[1], dist:NORM_B32, "
+          }
+        ],
+        "popped_sha256": "2c8033b6329f257ae790f55caebdbc90d19f59d85005096bc94c3e4d7da6917c",
+        "retired_sha256": "523c382256fd39b8cf303962683a45afb598fe920d36dad18fafa5feac716b8f"
+      }
+    ],
+    [
+      {
+        "role": 0,
+        "wait_start": 24903,
+        "score_ready": 25099,
+        "previous_vector_end": 25010,
+        "first_vector": 25216,
+        "key_done": 25308,
+        "scalar_prefix": 117,
+        "key_vector": 92,
+        "value_and_vf_admission": 185,
+        "total_prefix": 394,
+        "key_write_evidence": [
+          {
+            "tick": 25272,
+            "engine": "RVECST",
+            "id": 57116,
+            "mnemonic": "RV_VST",
+            "tail": "  Vd[0], Sn[10]=0x5fe0, Sn2[11]=0x1, Am[0]=0x0, Pg[2], dist:NORM_B32, "
+          },
+          {
+            "tick": 25308,
+            "engine": "RVECST",
+            "id": 57245,
+            "mnemonic": "RV_VST",
+            "tail": "  Vd[0], Sn[6]=0x5fe0, Sn2[7]=0x1, Am[0]=0x0, Pg[1], dist:NORM_B32, "
+          }
+        ],
+        "popped_sha256": "c300df8bb84b54d9cea21a18ed8b1ccd33bd5dc31f8712d73d7246522a9eb0f6",
+        "retired_sha256": "da38b964fadf3a1303b00e2ba643a79922401fdaf7b594ad721de5c24005b24d"
+      },
+      {
+        "role": 1,
+        "wait_start": 24683,
+        "score_ready": 25099,
+        "previous_vector_end": 24790,
+        "first_vector": 25216,
+        "key_done": 25308,
+        "scalar_prefix": 117,
+        "key_vector": 92,
+        "value_and_vf_admission": 185,
+        "total_prefix": 394,
+        "key_write_evidence": [
+          {
+            "tick": 25272,
+            "engine": "RVECST",
+            "id": 57121,
+            "mnemonic": "RV_VST",
+            "tail": "  Vd[0], Sn[10]=0x5fe0, Sn2[11]=0x1, Am[0]=0x0, Pg[2], dist:NORM_B32, "
+          },
+          {
+            "tick": 25308,
+            "engine": "RVECST",
+            "id": 57249,
+            "mnemonic": "RV_VST",
+            "tail": "  Vd[0], Sn[6]=0x5fe0, Sn2[7]=0x1, Am[0]=0x0, Pg[1], dist:NORM_B32, "
+          }
+        ],
+        "popped_sha256": "b8ffbee200c3df0572379485aca695f033e7a06b314bad6231d5b78e140a8a2b",
+        "retired_sha256": "759f7e80e7b2d1fe3812215aaebd8af2b246877bf673d2d890e799c02de71b5b"
+      }
+    ]
+  ],
+  "ub_bytes": 192384,
+  "ub_limit": 221184,
+  "mte2_startup": 200,
+  "comparison_sha256": "2dcd96722ba4e9623448c5c52748a8568d997848db427858cc4a82f76da1ec81",
+  "frontier": [
+    {
+      "name": "Wave-v11 measured parent",
+      "variant": "parent",
+      "makespan": 34935,
+      "savings": 0,
+      "stress_457_plus_191": 35583,
+      "critical_chain": [
+        "origin",
+        "AIC.QK3.post",
+        "AIV1.score1.ready",
+        "AIV1.scale.scalar.end",
+        "AIV1.scale.vector.start",
+        "AIV1.key1.done",
+        "AIV1.prefix.end",
+        "AIV1.pairedVF.start",
+        "AIV1.pairedVF.end",
+        "AIV1.P2.post",
+        "AIC.PV2.post",
+        "AIV1.P3.post",
+        "AIC.PV3.post",
+        "AIV0.output3.start",
+        "AIV0.output3.end",
+        "AIC.join1",
+        "AIC.join2",
+        "AIC.branch",
+        "AIC.END",
+        "STOP"
+      ],
+      "times": {
+        "origin": 0,
+        "AIC.QK3.post": 24965,
+        "AIV0.score0.received": 24689,
+        "AIV0.key0.done": 24872,
+        "AIV0.prefix.admission": 24761,
+        "AIV1.score0.received": 24706,
+        "AIV1.key0.done": 24889,
+        "AIV1.prefix.admission": 24778,
+        "AIV0.score1.ready": 24974,
+        "AIV1.score1.ready": 24974,
+        "AIV0.scale.scalar.end": 25089,
+        "AIV1.scale.scalar.end": 25089,
+        "AIV0.scale.vector.start": 25089,
+        "AIV1.scale.vector.start": 25089,
+        "AIV0.key1.done": 25181,
+        "AIV1.key1.done": 25181,
+        "AIV0.prefix.end": 25366,
+        "AIV1.prefix.end": 25366,
+        "AIV0.pairedVF.start": 25366,
+        "AIV1.pairedVF.start": 25366,
+        "AIV0.pairedVF.end": 25724,
+        "AIV1.pairedVF.end": 25724,
+        "AIV0.P2.post": 25774,
+        "AIV1.P2.post": 25777,
+        "AIC.PV2.post": 26080,
+        "AIV0.P3.post": 27253,
+        "AIV1.P3.post": 27257,
+        "AIC.PV3.post": 27563,
+        "AIV0.output0.start": 30566,
+        "AIV0.output1.start": 31376,
+        "AIV0.output2.start": 31377,
+        "AIV0.output3.start": 31378,
+        "AIV1.output0.start": 30379,
+        "AIV1.output1.start": 31203,
+        "AIV1.output2.start": 31204,
+        "AIV1.output3.start": 31205,
+        "AIV0.output0.end": 31124,
+        "AIV0.output1.end": 31909,
+        "AIV0.output2.end": 31928,
+        "AIV0.output3.end": 31930,
+        "AIV1.output0.end": 30946,
+        "AIV1.output1.end": 31698,
+        "AIV1.output2.end": 31700,
+        "AIV1.output3.end": 31732,
+        "AIV0.END": 33914,
+        "AIV1.END": 33739,
+        "AIC.join1": 31944,
+        "AIC.join2": 33468,
+        "AIC.branch": 34885,
+        "AIC.END": 34888,
+        "STOP": 34935
+      },
+      "shared_hbm": {
+        "policy": "fixed measured shared-bus envelopes; new overlap rejected",
+        "mte2": [
+          {
+            "core": "AIV0",
+            "kind": "query",
+            "index": 0,
+            "start": 5411,
+            "end": 5977,
+            "initiation": 200,
+            "measured_service_contention_residual": 366
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 0,
+            "start": 5469,
+            "end": 6212,
+            "initiation": 200,
+            "measured_service_contention_residual": 543
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 1,
+            "start": 5753,
+            "end": 7002,
+            "initiation": 200,
+            "measured_service_contention_residual": 1049
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 2,
+            "start": 13619,
+            "end": 14301,
+            "initiation": 200,
+            "measured_service_contention_residual": 482
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 3,
+            "start": 14124,
+            "end": 14841,
+            "initiation": 200,
+            "measured_service_contention_residual": 517
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 0,
+            "start": 5498,
+            "end": 6271,
+            "initiation": 200,
+            "measured_service_contention_residual": 573
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 1,
+            "start": 5781,
+            "end": 7080,
+            "initiation": 200,
+            "measured_service_contention_residual": 1099
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 2,
+            "start": 17042,
+            "end": 17608,
+            "initiation": 200,
+            "measured_service_contention_residual": 366
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 3,
+            "start": 17224,
+            "end": 17793,
+            "initiation": 200,
+            "measured_service_contention_residual": 369
+          },
+          {
+            "core": "AIV1",
+            "kind": "query",
+            "index": 0,
+            "start": 5554,
+            "end": 6382,
+            "initiation": 200,
+            "measured_service_contention_residual": 628
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 0,
+            "start": 5612,
+            "end": 6638,
+            "initiation": 200,
+            "measured_service_contention_residual": 826
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 1,
+            "start": 5896,
+            "end": 7332,
+            "initiation": 200,
+            "measured_service_contention_residual": 1236
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 2,
+            "start": 13654,
+            "end": 14580,
+            "initiation": 200,
+            "measured_service_contention_residual": 726
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 3,
+            "start": 14195,
+            "end": 15158,
+            "initiation": 200,
+            "measured_service_contention_residual": 763
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 0,
+            "start": 5641,
+            "end": 6724,
+            "initiation": 200,
+            "measured_service_contention_residual": 883
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 1,
+            "start": 5924,
+            "end": 7398,
+            "initiation": 200,
+            "measured_service_contention_residual": 1274
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 2,
+            "start": 17166,
+            "end": 17717,
+            "initiation": 200,
+            "measured_service_contention_residual": 351
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 3,
+            "start": 17350,
+            "end": 17911,
+            "initiation": 200,
+            "measured_service_contention_residual": 361
+          }
+        ],
+        "output_common_shift": 0,
+        "latest_ingress": 17911,
+        "earliest_output": 30379,
+        "aic_policy": "unchanged AIC memory traffic and upstream scalar cold costs"
+      },
+      "edges": {
+        "origin": [],
+        "AIC.QK3.post": [
+          {
+            "source": "origin",
+            "lag": 24965,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.score0.received": [
+          {
+            "source": "origin",
+            "lag": 24689,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.key0.done": [
+          {
+            "source": "origin",
+            "lag": 24872,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.prefix.admission": [
+          {
+            "source": "origin",
+            "lag": 24761,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.score1.ready": [
+          {
+            "source": "AIC.QK3.post",
+            "lag": 9,
+            "kind": "score data"
+          }
+        ],
+        "AIV0.scale.scalar.end": [
+          {
+            "source": "AIV0.score1.ready",
+            "lag": 115,
+            "kind": "retained descriptor cost"
+          }
+        ],
+        "AIV0.scale.vector.start": [
+          {
+            "source": "AIV0.scale.scalar.end",
+            "lag": 0,
+            "kind": "descriptor ready"
+          },
+          {
+            "source": "AIV0.key0.done",
+            "lag": 0,
+            "kind": "single AIV Vector queue"
+          }
+        ],
+        "AIV0.key1.done": [
+          {
+            "source": "AIV0.scale.vector.start",
+            "lag": 92,
+            "kind": "key scale VF service"
+          }
+        ],
+        "AIV0.prefix.end": [
+          {
+            "source": "AIV0.key1.done",
+            "lag": 185,
+            "kind": "retained value preparation/admission"
+          }
+        ],
+        "AIV0.pairedVF.start": [
+          {
+            "source": "AIV0.prefix.end",
+            "lag": 0,
+            "kind": "retained/added pre-VF residual"
+          },
+          {
+            "source": "AIV0.score1.ready",
+            "lag": 0,
+            "kind": "score1 data"
+          },
+          {
+            "source": "AIV0.score0.received",
+            "lag": 0,
+            "kind": "score0 data"
+          }
+        ],
+        "AIV0.pairedVF.end": [
+          {
+            "source": "AIV0.pairedVF.start",
+            "lag": 358,
+            "kind": "paired VF unchanged"
+          }
+        ],
+        "AIV0.P2.post": [
+          {
+            "source": "AIV0.pairedVF.end",
+            "lag": 50,
+            "kind": "P2 copy/fence"
+          }
+        ],
+        "AIV1.score0.received": [
+          {
+            "source": "origin",
+            "lag": 24706,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.key0.done": [
+          {
+            "source": "origin",
+            "lag": 24889,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.prefix.admission": [
+          {
+            "source": "origin",
+            "lag": 24778,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.score1.ready": [
+          {
+            "source": "AIC.QK3.post",
+            "lag": 9,
+            "kind": "score data"
+          }
+        ],
+        "AIV1.scale.scalar.end": [
+          {
+            "source": "AIV1.score1.ready",
+            "lag": 115,
+            "kind": "retained descriptor cost"
+          }
+        ],
+        "AIV1.scale.vector.start": [
+          {
+            "source": "AIV1.scale.scalar.end",
+            "lag": 0,
+            "kind": "descriptor ready"
+          },
+          {
+            "source": "AIV1.key0.done",
+            "lag": 0,
+            "kind": "single AIV Vector queue"
+          }
+        ],
+        "AIV1.key1.done": [
+          {
+            "source": "AIV1.scale.vector.start",
+            "lag": 92,
+            "kind": "key scale VF service"
+          }
+        ],
+        "AIV1.prefix.end": [
+          {
+            "source": "AIV1.key1.done",
+            "lag": 185,
+            "kind": "retained value preparation/admission"
+          }
+        ],
+        "AIV1.pairedVF.start": [
+          {
+            "source": "AIV1.prefix.end",
+            "lag": 0,
+            "kind": "retained/added pre-VF residual"
+          },
+          {
+            "source": "AIV1.score1.ready",
+            "lag": 0,
+            "kind": "score1 data"
+          },
+          {
+            "source": "AIV1.score0.received",
+            "lag": 0,
+            "kind": "score0 data"
+          }
+        ],
+        "AIV1.pairedVF.end": [
+          {
+            "source": "AIV1.pairedVF.start",
+            "lag": 358,
+            "kind": "paired VF unchanged"
+          }
+        ],
+        "AIV1.P2.post": [
+          {
+            "source": "AIV1.pairedVF.end",
+            "lag": 53,
+            "kind": "P2 copy/fence"
+          }
+        ],
+        "AIC.PV2.post": [
+          {
+            "source": "AIV0.P2.post",
+            "lag": 303,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIV1.P2.post",
+            "lag": 303,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIC.QK3.post",
+            "lag": 1,
+            "kind": "single AIC product issue queue"
+          }
+        ],
+        "AIV0.P3.post": [
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1173,
+            "kind": "ordered recurrence and P3 publication"
+          }
+        ],
+        "AIV1.P3.post": [
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1177,
+            "kind": "ordered recurrence and P3 publication"
+          }
+        ],
+        "AIC.PV3.post": [
+          {
+            "source": "AIV0.P3.post",
+            "lag": 306,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIV1.P3.post",
+            "lag": 306,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1,
+            "kind": "single AIC product issue queue"
+          }
+        ],
+        "AIV0.output0.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3003,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output0.end": [
+          {
+            "source": "AIV0.output0.start",
+            "lag": 558,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output1.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3813,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output1.end": [
+          {
+            "source": "AIV0.output1.start",
+            "lag": 533,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output2.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3814,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output2.end": [
+          {
+            "source": "AIV0.output2.start",
+            "lag": 551,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output3.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3815,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output3.end": [
+          {
+            "source": "AIV0.output3.start",
+            "lag": 552,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.END": [
+          {
+            "source": "AIV0.output0.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output1.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output2.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output3.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          }
+        ],
+        "AIV1.output0.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 2816,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output0.end": [
+          {
+            "source": "AIV1.output0.start",
+            "lag": 567,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output1.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3640,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output1.end": [
+          {
+            "source": "AIV1.output1.start",
+            "lag": 495,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output2.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3641,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output2.end": [
+          {
+            "source": "AIV1.output2.start",
+            "lag": 496,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output3.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3642,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output3.end": [
+          {
+            "source": "AIV1.output3.start",
+            "lag": 527,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.END": [
+          {
+            "source": "AIV1.output0.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output1.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output2.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output3.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          }
+        ],
+        "AIC.join1": [
+          {
+            "source": "AIV0.output0.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output1.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output2.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output3.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output0.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output1.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output2.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output3.end",
+            "lag": 14,
+            "kind": "task output join"
+          }
+        ],
+        "AIC.join2": [
+          {
+            "source": "AIC.join1",
+            "lag": 1524,
+            "kind": "retained task join/scalar tail"
+          }
+        ],
+        "AIC.branch": [
+          {
+            "source": "AIC.join2",
+            "lag": 1417,
+            "kind": "retained scalar tail"
+          }
+        ],
+        "AIC.END": [
+          {
+            "source": "AIC.branch",
+            "lag": 3,
+            "kind": "measured unexplained branch-to-END gap"
+          }
+        ],
+        "STOP": [
+          {
+            "source": "AIC.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          },
+          {
+            "source": "AIV0.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          },
+          {
+            "source": "AIV1.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          }
+        ]
+      }
+    },
+    {
+      "name": "K: hoist final key1 scale helper",
+      "variant": "key1_hoist",
+      "makespan": 34739,
+      "savings": 196,
+      "stress_457_plus_191": 35387,
+      "critical_chain": [
+        "origin",
+        "AIV1.prefix.admission",
+        "AIV1.scale.scalar.end",
+        "AIV1.scale.vector.start",
+        "AIV1.key1.done",
+        "AIV1.value.start",
+        "AIV1.prefix.end",
+        "AIV1.pairedVF.start",
+        "AIV1.pairedVF.end",
+        "AIV1.P2.post",
+        "AIC.PV2.post",
+        "AIV1.P3.post",
+        "AIC.PV3.post",
+        "AIV0.output3.start",
+        "AIV0.output3.end",
+        "AIC.join1",
+        "AIC.join2",
+        "AIC.branch",
+        "AIC.END",
+        "STOP"
+      ],
+      "times": {
+        "origin": 0,
+        "AIC.QK3.post": 24965,
+        "AIV0.score0.received": 24689,
+        "AIV0.key0.done": 24872,
+        "AIV0.prefix.admission": 24761,
+        "AIV1.score0.received": 24706,
+        "AIV1.key0.done": 24889,
+        "AIV1.prefix.admission": 24778,
+        "AIV0.score1.ready": 24974,
+        "AIV1.score1.ready": 24974,
+        "AIV0.scale.scalar.end": 24876,
+        "AIV1.scale.scalar.end": 24893,
+        "AIV0.scale.vector.start": 24876,
+        "AIV1.scale.vector.start": 24893,
+        "AIV0.key1.done": 24968,
+        "AIV1.key1.done": 24985,
+        "AIV0.value.start": 24974,
+        "AIV1.value.start": 24985,
+        "AIV0.prefix.end": 25159,
+        "AIV1.prefix.end": 25170,
+        "AIV0.pairedVF.start": 25159,
+        "AIV1.pairedVF.start": 25170,
+        "AIV0.pairedVF.end": 25517,
+        "AIV1.pairedVF.end": 25528,
+        "AIV0.P2.post": 25567,
+        "AIV1.P2.post": 25581,
+        "AIC.PV2.post": 25884,
+        "AIV0.P3.post": 27057,
+        "AIV1.P3.post": 27061,
+        "AIC.PV3.post": 27367,
+        "AIV0.output0.start": 30370,
+        "AIV0.output1.start": 31180,
+        "AIV0.output2.start": 31181,
+        "AIV0.output3.start": 31182,
+        "AIV1.output0.start": 30183,
+        "AIV1.output1.start": 31007,
+        "AIV1.output2.start": 31008,
+        "AIV1.output3.start": 31009,
+        "AIV0.output0.end": 30928,
+        "AIV0.output1.end": 31713,
+        "AIV0.output2.end": 31732,
+        "AIV0.output3.end": 31734,
+        "AIV1.output0.end": 30750,
+        "AIV1.output1.end": 31502,
+        "AIV1.output2.end": 31504,
+        "AIV1.output3.end": 31536,
+        "AIV0.END": 33718,
+        "AIV1.END": 33543,
+        "AIC.join1": 31748,
+        "AIC.join2": 33272,
+        "AIC.branch": 34689,
+        "AIC.END": 34692,
+        "STOP": 34739
+      },
+      "shared_hbm": {
+        "policy": "fixed measured shared-bus envelopes; new overlap rejected",
+        "mte2": [
+          {
+            "core": "AIV0",
+            "kind": "query",
+            "index": 0,
+            "start": 5411,
+            "end": 5977,
+            "initiation": 200,
+            "measured_service_contention_residual": 366
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 0,
+            "start": 5469,
+            "end": 6212,
+            "initiation": 200,
+            "measured_service_contention_residual": 543
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 1,
+            "start": 5753,
+            "end": 7002,
+            "initiation": 200,
+            "measured_service_contention_residual": 1049
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 2,
+            "start": 13619,
+            "end": 14301,
+            "initiation": 200,
+            "measured_service_contention_residual": 482
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 3,
+            "start": 14124,
+            "end": 14841,
+            "initiation": 200,
+            "measured_service_contention_residual": 517
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 0,
+            "start": 5498,
+            "end": 6271,
+            "initiation": 200,
+            "measured_service_contention_residual": 573
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 1,
+            "start": 5781,
+            "end": 7080,
+            "initiation": 200,
+            "measured_service_contention_residual": 1099
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 2,
+            "start": 17042,
+            "end": 17608,
+            "initiation": 200,
+            "measured_service_contention_residual": 366
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 3,
+            "start": 17224,
+            "end": 17793,
+            "initiation": 200,
+            "measured_service_contention_residual": 369
+          },
+          {
+            "core": "AIV1",
+            "kind": "query",
+            "index": 0,
+            "start": 5554,
+            "end": 6382,
+            "initiation": 200,
+            "measured_service_contention_residual": 628
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 0,
+            "start": 5612,
+            "end": 6638,
+            "initiation": 200,
+            "measured_service_contention_residual": 826
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 1,
+            "start": 5896,
+            "end": 7332,
+            "initiation": 200,
+            "measured_service_contention_residual": 1236
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 2,
+            "start": 13654,
+            "end": 14580,
+            "initiation": 200,
+            "measured_service_contention_residual": 726
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 3,
+            "start": 14195,
+            "end": 15158,
+            "initiation": 200,
+            "measured_service_contention_residual": 763
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 0,
+            "start": 5641,
+            "end": 6724,
+            "initiation": 200,
+            "measured_service_contention_residual": 883
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 1,
+            "start": 5924,
+            "end": 7398,
+            "initiation": 200,
+            "measured_service_contention_residual": 1274
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 2,
+            "start": 17166,
+            "end": 17717,
+            "initiation": 200,
+            "measured_service_contention_residual": 351
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 3,
+            "start": 17350,
+            "end": 17911,
+            "initiation": 200,
+            "measured_service_contention_residual": 361
+          }
+        ],
+        "output_common_shift": -196,
+        "latest_ingress": 17911,
+        "earliest_output": 30183,
+        "aic_policy": "unchanged AIC memory traffic and upstream scalar cold costs"
+      },
+      "edges": {
+        "origin": [],
+        "AIC.QK3.post": [
+          {
+            "source": "origin",
+            "lag": 24965,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.score0.received": [
+          {
+            "source": "origin",
+            "lag": 24689,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.key0.done": [
+          {
+            "source": "origin",
+            "lag": 24872,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.prefix.admission": [
+          {
+            "source": "origin",
+            "lag": 24761,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.score1.ready": [
+          {
+            "source": "AIC.QK3.post",
+            "lag": 9,
+            "kind": "score data"
+          }
+        ],
+        "AIV0.scale.scalar.end": [
+          {
+            "source": "AIV0.prefix.admission",
+            "lag": 115,
+            "kind": "retained descriptor cost"
+          }
+        ],
+        "AIV0.scale.vector.start": [
+          {
+            "source": "AIV0.scale.scalar.end",
+            "lag": 0,
+            "kind": "descriptor ready"
+          },
+          {
+            "source": "AIV0.key0.done",
+            "lag": 0,
+            "kind": "single AIV Vector queue"
+          }
+        ],
+        "AIV0.key1.done": [
+          {
+            "source": "AIV0.scale.vector.start",
+            "lag": 92,
+            "kind": "key scale VF service"
+          }
+        ],
+        "AIV0.value.start": [
+          {
+            "source": "AIV0.key1.done",
+            "lag": 0,
+            "kind": "Vector order"
+          },
+          {
+            "source": "AIV0.score1.ready",
+            "lag": 0,
+            "kind": "retained score wait"
+          }
+        ],
+        "AIV0.prefix.end": [
+          {
+            "source": "AIV0.value.start",
+            "lag": 185,
+            "kind": "retained value preparation/admission"
+          }
+        ],
+        "AIV0.pairedVF.start": [
+          {
+            "source": "AIV0.prefix.end",
+            "lag": 0,
+            "kind": "retained/added pre-VF residual"
+          },
+          {
+            "source": "AIV0.score1.ready",
+            "lag": 0,
+            "kind": "score1 data"
+          },
+          {
+            "source": "AIV0.score0.received",
+            "lag": 0,
+            "kind": "score0 data"
+          }
+        ],
+        "AIV0.pairedVF.end": [
+          {
+            "source": "AIV0.pairedVF.start",
+            "lag": 358,
+            "kind": "paired VF unchanged"
+          }
+        ],
+        "AIV0.P2.post": [
+          {
+            "source": "AIV0.pairedVF.end",
+            "lag": 50,
+            "kind": "P2 copy/fence"
+          }
+        ],
+        "AIV1.score0.received": [
+          {
+            "source": "origin",
+            "lag": 24706,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.key0.done": [
+          {
+            "source": "origin",
+            "lag": 24889,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.prefix.admission": [
+          {
+            "source": "origin",
+            "lag": 24778,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.score1.ready": [
+          {
+            "source": "AIC.QK3.post",
+            "lag": 9,
+            "kind": "score data"
+          }
+        ],
+        "AIV1.scale.scalar.end": [
+          {
+            "source": "AIV1.prefix.admission",
+            "lag": 115,
+            "kind": "retained descriptor cost"
+          }
+        ],
+        "AIV1.scale.vector.start": [
+          {
+            "source": "AIV1.scale.scalar.end",
+            "lag": 0,
+            "kind": "descriptor ready"
+          },
+          {
+            "source": "AIV1.key0.done",
+            "lag": 0,
+            "kind": "single AIV Vector queue"
+          }
+        ],
+        "AIV1.key1.done": [
+          {
+            "source": "AIV1.scale.vector.start",
+            "lag": 92,
+            "kind": "key scale VF service"
+          }
+        ],
+        "AIV1.value.start": [
+          {
+            "source": "AIV1.key1.done",
+            "lag": 0,
+            "kind": "Vector order"
+          },
+          {
+            "source": "AIV1.score1.ready",
+            "lag": 0,
+            "kind": "retained score wait"
+          }
+        ],
+        "AIV1.prefix.end": [
+          {
+            "source": "AIV1.value.start",
+            "lag": 185,
+            "kind": "retained value preparation/admission"
+          }
+        ],
+        "AIV1.pairedVF.start": [
+          {
+            "source": "AIV1.prefix.end",
+            "lag": 0,
+            "kind": "retained/added pre-VF residual"
+          },
+          {
+            "source": "AIV1.score1.ready",
+            "lag": 0,
+            "kind": "score1 data"
+          },
+          {
+            "source": "AIV1.score0.received",
+            "lag": 0,
+            "kind": "score0 data"
+          }
+        ],
+        "AIV1.pairedVF.end": [
+          {
+            "source": "AIV1.pairedVF.start",
+            "lag": 358,
+            "kind": "paired VF unchanged"
+          }
+        ],
+        "AIV1.P2.post": [
+          {
+            "source": "AIV1.pairedVF.end",
+            "lag": 53,
+            "kind": "P2 copy/fence"
+          }
+        ],
+        "AIC.PV2.post": [
+          {
+            "source": "AIV0.P2.post",
+            "lag": 303,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIV1.P2.post",
+            "lag": 303,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIC.QK3.post",
+            "lag": 1,
+            "kind": "single AIC product issue queue"
+          }
+        ],
+        "AIV0.P3.post": [
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1173,
+            "kind": "ordered recurrence and P3 publication"
+          }
+        ],
+        "AIV1.P3.post": [
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1177,
+            "kind": "ordered recurrence and P3 publication"
+          }
+        ],
+        "AIC.PV3.post": [
+          {
+            "source": "AIV0.P3.post",
+            "lag": 306,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIV1.P3.post",
+            "lag": 306,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1,
+            "kind": "single AIC product issue queue"
+          }
+        ],
+        "AIV0.output0.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3003,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output0.end": [
+          {
+            "source": "AIV0.output0.start",
+            "lag": 558,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output1.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3813,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output1.end": [
+          {
+            "source": "AIV0.output1.start",
+            "lag": 533,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output2.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3814,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output2.end": [
+          {
+            "source": "AIV0.output2.start",
+            "lag": 551,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output3.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3815,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output3.end": [
+          {
+            "source": "AIV0.output3.start",
+            "lag": 552,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.END": [
+          {
+            "source": "AIV0.output0.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output1.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output2.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output3.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          }
+        ],
+        "AIV1.output0.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 2816,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output0.end": [
+          {
+            "source": "AIV1.output0.start",
+            "lag": 567,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output1.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3640,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output1.end": [
+          {
+            "source": "AIV1.output1.start",
+            "lag": 495,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output2.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3641,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output2.end": [
+          {
+            "source": "AIV1.output2.start",
+            "lag": 496,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output3.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3642,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output3.end": [
+          {
+            "source": "AIV1.output3.start",
+            "lag": 527,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.END": [
+          {
+            "source": "AIV1.output0.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output1.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output2.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output3.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          }
+        ],
+        "AIC.join1": [
+          {
+            "source": "AIV0.output0.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output1.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output2.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output3.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output0.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output1.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output2.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output3.end",
+            "lag": 14,
+            "kind": "task output join"
+          }
+        ],
+        "AIC.join2": [
+          {
+            "source": "AIC.join1",
+            "lag": 1524,
+            "kind": "retained task join/scalar tail"
+          }
+        ],
+        "AIC.branch": [
+          {
+            "source": "AIC.join2",
+            "lag": 1417,
+            "kind": "retained scalar tail"
+          }
+        ],
+        "AIC.END": [
+          {
+            "source": "AIC.branch",
+            "lag": 3,
+            "kind": "measured unexplained branch-to-END gap"
+          }
+        ],
+        "STOP": [
+          {
+            "source": "AIC.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          },
+          {
+            "source": "AIV0.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          },
+          {
+            "source": "AIV1.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          }
+        ]
+      }
+    },
+    {
+      "name": "KV: hoist final key/value prefix",
+      "variant": "full_prefix_hoist",
+      "makespan": 34739,
+      "savings": 196,
+      "stress_457_plus_191": 35387,
+      "critical_chain": [
+        "origin",
+        "AIV1.prefix.admission",
+        "AIV1.scale.scalar.end",
+        "AIV1.scale.vector.start",
+        "AIV1.key1.done",
+        "AIV1.prefix.end",
+        "AIV1.pairedVF.start",
+        "AIV1.pairedVF.end",
+        "AIV1.P2.post",
+        "AIC.PV2.post",
+        "AIV1.P3.post",
+        "AIC.PV3.post",
+        "AIV0.output3.start",
+        "AIV0.output3.end",
+        "AIC.join1",
+        "AIC.join2",
+        "AIC.branch",
+        "AIC.END",
+        "STOP"
+      ],
+      "times": {
+        "origin": 0,
+        "AIC.QK3.post": 24965,
+        "AIV0.score0.received": 24689,
+        "AIV0.key0.done": 24872,
+        "AIV0.prefix.admission": 24761,
+        "AIV1.score0.received": 24706,
+        "AIV1.key0.done": 24889,
+        "AIV1.prefix.admission": 24778,
+        "AIV0.score1.ready": 24974,
+        "AIV1.score1.ready": 24974,
+        "AIV0.scale.scalar.end": 24876,
+        "AIV1.scale.scalar.end": 24893,
+        "AIV0.scale.vector.start": 24876,
+        "AIV1.scale.vector.start": 24893,
+        "AIV0.key1.done": 24968,
+        "AIV1.key1.done": 24985,
+        "AIV0.prefix.end": 25153,
+        "AIV1.prefix.end": 25170,
+        "AIV0.pairedVF.start": 25153,
+        "AIV1.pairedVF.start": 25170,
+        "AIV0.pairedVF.end": 25511,
+        "AIV1.pairedVF.end": 25528,
+        "AIV0.P2.post": 25561,
+        "AIV1.P2.post": 25581,
+        "AIC.PV2.post": 25884,
+        "AIV0.P3.post": 27057,
+        "AIV1.P3.post": 27061,
+        "AIC.PV3.post": 27367,
+        "AIV0.output0.start": 30370,
+        "AIV0.output1.start": 31180,
+        "AIV0.output2.start": 31181,
+        "AIV0.output3.start": 31182,
+        "AIV1.output0.start": 30183,
+        "AIV1.output1.start": 31007,
+        "AIV1.output2.start": 31008,
+        "AIV1.output3.start": 31009,
+        "AIV0.output0.end": 30928,
+        "AIV0.output1.end": 31713,
+        "AIV0.output2.end": 31732,
+        "AIV0.output3.end": 31734,
+        "AIV1.output0.end": 30750,
+        "AIV1.output1.end": 31502,
+        "AIV1.output2.end": 31504,
+        "AIV1.output3.end": 31536,
+        "AIV0.END": 33718,
+        "AIV1.END": 33543,
+        "AIC.join1": 31748,
+        "AIC.join2": 33272,
+        "AIC.branch": 34689,
+        "AIC.END": 34692,
+        "STOP": 34739
+      },
+      "shared_hbm": {
+        "policy": "fixed measured shared-bus envelopes; new overlap rejected",
+        "mte2": [
+          {
+            "core": "AIV0",
+            "kind": "query",
+            "index": 0,
+            "start": 5411,
+            "end": 5977,
+            "initiation": 200,
+            "measured_service_contention_residual": 366
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 0,
+            "start": 5469,
+            "end": 6212,
+            "initiation": 200,
+            "measured_service_contention_residual": 543
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 1,
+            "start": 5753,
+            "end": 7002,
+            "initiation": 200,
+            "measured_service_contention_residual": 1049
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 2,
+            "start": 13619,
+            "end": 14301,
+            "initiation": 200,
+            "measured_service_contention_residual": 482
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 3,
+            "start": 14124,
+            "end": 14841,
+            "initiation": 200,
+            "measured_service_contention_residual": 517
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 0,
+            "start": 5498,
+            "end": 6271,
+            "initiation": 200,
+            "measured_service_contention_residual": 573
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 1,
+            "start": 5781,
+            "end": 7080,
+            "initiation": 200,
+            "measured_service_contention_residual": 1099
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 2,
+            "start": 17042,
+            "end": 17608,
+            "initiation": 200,
+            "measured_service_contention_residual": 366
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 3,
+            "start": 17224,
+            "end": 17793,
+            "initiation": 200,
+            "measured_service_contention_residual": 369
+          },
+          {
+            "core": "AIV1",
+            "kind": "query",
+            "index": 0,
+            "start": 5554,
+            "end": 6382,
+            "initiation": 200,
+            "measured_service_contention_residual": 628
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 0,
+            "start": 5612,
+            "end": 6638,
+            "initiation": 200,
+            "measured_service_contention_residual": 826
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 1,
+            "start": 5896,
+            "end": 7332,
+            "initiation": 200,
+            "measured_service_contention_residual": 1236
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 2,
+            "start": 13654,
+            "end": 14580,
+            "initiation": 200,
+            "measured_service_contention_residual": 726
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 3,
+            "start": 14195,
+            "end": 15158,
+            "initiation": 200,
+            "measured_service_contention_residual": 763
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 0,
+            "start": 5641,
+            "end": 6724,
+            "initiation": 200,
+            "measured_service_contention_residual": 883
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 1,
+            "start": 5924,
+            "end": 7398,
+            "initiation": 200,
+            "measured_service_contention_residual": 1274
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 2,
+            "start": 17166,
+            "end": 17717,
+            "initiation": 200,
+            "measured_service_contention_residual": 351
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 3,
+            "start": 17350,
+            "end": 17911,
+            "initiation": 200,
+            "measured_service_contention_residual": 361
+          }
+        ],
+        "output_common_shift": -196,
+        "latest_ingress": 17911,
+        "earliest_output": 30183,
+        "aic_policy": "unchanged AIC memory traffic and upstream scalar cold costs"
+      },
+      "edges": {
+        "origin": [],
+        "AIC.QK3.post": [
+          {
+            "source": "origin",
+            "lag": 24965,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.score0.received": [
+          {
+            "source": "origin",
+            "lag": 24689,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.key0.done": [
+          {
+            "source": "origin",
+            "lag": 24872,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.prefix.admission": [
+          {
+            "source": "origin",
+            "lag": 24761,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.score1.ready": [
+          {
+            "source": "AIC.QK3.post",
+            "lag": 9,
+            "kind": "score data"
+          }
+        ],
+        "AIV0.scale.scalar.end": [
+          {
+            "source": "AIV0.prefix.admission",
+            "lag": 115,
+            "kind": "retained descriptor cost"
+          }
+        ],
+        "AIV0.scale.vector.start": [
+          {
+            "source": "AIV0.scale.scalar.end",
+            "lag": 0,
+            "kind": "descriptor ready"
+          },
+          {
+            "source": "AIV0.key0.done",
+            "lag": 0,
+            "kind": "single AIV Vector queue"
+          }
+        ],
+        "AIV0.key1.done": [
+          {
+            "source": "AIV0.scale.vector.start",
+            "lag": 92,
+            "kind": "key scale VF service"
+          }
+        ],
+        "AIV0.prefix.end": [
+          {
+            "source": "AIV0.key1.done",
+            "lag": 185,
+            "kind": "retained value preparation/admission"
+          }
+        ],
+        "AIV0.pairedVF.start": [
+          {
+            "source": "AIV0.prefix.end",
+            "lag": 0,
+            "kind": "retained/added pre-VF residual"
+          },
+          {
+            "source": "AIV0.score1.ready",
+            "lag": 0,
+            "kind": "score1 data"
+          },
+          {
+            "source": "AIV0.score0.received",
+            "lag": 0,
+            "kind": "score0 data"
+          }
+        ],
+        "AIV0.pairedVF.end": [
+          {
+            "source": "AIV0.pairedVF.start",
+            "lag": 358,
+            "kind": "paired VF unchanged"
+          }
+        ],
+        "AIV0.P2.post": [
+          {
+            "source": "AIV0.pairedVF.end",
+            "lag": 50,
+            "kind": "P2 copy/fence"
+          }
+        ],
+        "AIV1.score0.received": [
+          {
+            "source": "origin",
+            "lag": 24706,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.key0.done": [
+          {
+            "source": "origin",
+            "lag": 24889,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.prefix.admission": [
+          {
+            "source": "origin",
+            "lag": 24778,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.score1.ready": [
+          {
+            "source": "AIC.QK3.post",
+            "lag": 9,
+            "kind": "score data"
+          }
+        ],
+        "AIV1.scale.scalar.end": [
+          {
+            "source": "AIV1.prefix.admission",
+            "lag": 115,
+            "kind": "retained descriptor cost"
+          }
+        ],
+        "AIV1.scale.vector.start": [
+          {
+            "source": "AIV1.scale.scalar.end",
+            "lag": 0,
+            "kind": "descriptor ready"
+          },
+          {
+            "source": "AIV1.key0.done",
+            "lag": 0,
+            "kind": "single AIV Vector queue"
+          }
+        ],
+        "AIV1.key1.done": [
+          {
+            "source": "AIV1.scale.vector.start",
+            "lag": 92,
+            "kind": "key scale VF service"
+          }
+        ],
+        "AIV1.prefix.end": [
+          {
+            "source": "AIV1.key1.done",
+            "lag": 185,
+            "kind": "retained value preparation/admission"
+          }
+        ],
+        "AIV1.pairedVF.start": [
+          {
+            "source": "AIV1.prefix.end",
+            "lag": 0,
+            "kind": "retained/added pre-VF residual"
+          },
+          {
+            "source": "AIV1.score1.ready",
+            "lag": 0,
+            "kind": "score1 data"
+          },
+          {
+            "source": "AIV1.score0.received",
+            "lag": 0,
+            "kind": "score0 data"
+          }
+        ],
+        "AIV1.pairedVF.end": [
+          {
+            "source": "AIV1.pairedVF.start",
+            "lag": 358,
+            "kind": "paired VF unchanged"
+          }
+        ],
+        "AIV1.P2.post": [
+          {
+            "source": "AIV1.pairedVF.end",
+            "lag": 53,
+            "kind": "P2 copy/fence"
+          }
+        ],
+        "AIC.PV2.post": [
+          {
+            "source": "AIV0.P2.post",
+            "lag": 303,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIV1.P2.post",
+            "lag": 303,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIC.QK3.post",
+            "lag": 1,
+            "kind": "single AIC product issue queue"
+          }
+        ],
+        "AIV0.P3.post": [
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1173,
+            "kind": "ordered recurrence and P3 publication"
+          }
+        ],
+        "AIV1.P3.post": [
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1177,
+            "kind": "ordered recurrence and P3 publication"
+          }
+        ],
+        "AIC.PV3.post": [
+          {
+            "source": "AIV0.P3.post",
+            "lag": 306,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIV1.P3.post",
+            "lag": 306,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1,
+            "kind": "single AIC product issue queue"
+          }
+        ],
+        "AIV0.output0.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3003,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output0.end": [
+          {
+            "source": "AIV0.output0.start",
+            "lag": 558,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output1.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3813,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output1.end": [
+          {
+            "source": "AIV0.output1.start",
+            "lag": 533,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output2.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3814,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output2.end": [
+          {
+            "source": "AIV0.output2.start",
+            "lag": 551,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output3.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3815,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output3.end": [
+          {
+            "source": "AIV0.output3.start",
+            "lag": 552,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.END": [
+          {
+            "source": "AIV0.output0.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output1.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output2.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output3.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          }
+        ],
+        "AIV1.output0.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 2816,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output0.end": [
+          {
+            "source": "AIV1.output0.start",
+            "lag": 567,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output1.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3640,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output1.end": [
+          {
+            "source": "AIV1.output1.start",
+            "lag": 495,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output2.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3641,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output2.end": [
+          {
+            "source": "AIV1.output2.start",
+            "lag": 496,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output3.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3642,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output3.end": [
+          {
+            "source": "AIV1.output3.start",
+            "lag": 527,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.END": [
+          {
+            "source": "AIV1.output0.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output1.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output2.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output3.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          }
+        ],
+        "AIC.join1": [
+          {
+            "source": "AIV0.output0.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output1.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output2.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output3.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output0.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output1.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output2.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output3.end",
+            "lag": 14,
+            "kind": "task output join"
+          }
+        ],
+        "AIC.join2": [
+          {
+            "source": "AIC.join1",
+            "lag": 1524,
+            "kind": "retained task join/scalar tail"
+          }
+        ],
+        "AIC.branch": [
+          {
+            "source": "AIC.join2",
+            "lag": 1417,
+            "kind": "retained scalar tail"
+          }
+        ],
+        "AIC.END": [
+          {
+            "source": "AIC.branch",
+            "lag": 3,
+            "kind": "measured unexplained branch-to-END gap"
+          }
+        ],
+        "STOP": [
+          {
+            "source": "AIC.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          },
+          {
+            "source": "AIV0.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          },
+          {
+            "source": "AIV1.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Conservative no scalar overlap",
+      "variant": "serialized_prefix",
+      "makespan": 34850,
+      "savings": 85,
+      "stress_457_plus_191": 35498,
+      "critical_chain": [
+        "origin",
+        "AIV1.key0.done",
+        "AIV1.prefix.start",
+        "AIV1.scale.scalar.end",
+        "AIV1.scale.vector.start",
+        "AIV1.key1.done",
+        "AIV1.value.start",
+        "AIV1.prefix.end",
+        "AIV1.pairedVF.start",
+        "AIV1.pairedVF.end",
+        "AIV1.P2.post",
+        "AIC.PV2.post",
+        "AIV1.P3.post",
+        "AIC.PV3.post",
+        "AIV0.output3.start",
+        "AIV0.output3.end",
+        "AIC.join1",
+        "AIC.join2",
+        "AIC.branch",
+        "AIC.END",
+        "STOP"
+      ],
+      "times": {
+        "origin": 0,
+        "AIC.QK3.post": 24965,
+        "AIV0.score0.received": 24689,
+        "AIV0.key0.done": 24872,
+        "AIV0.prefix.admission": 24761,
+        "AIV1.score0.received": 24706,
+        "AIV1.key0.done": 24889,
+        "AIV1.prefix.admission": 24778,
+        "AIV0.score1.ready": 24974,
+        "AIV1.score1.ready": 24974,
+        "AIV0.prefix.start": 24872,
+        "AIV1.prefix.start": 24889,
+        "AIV0.scale.scalar.end": 24987,
+        "AIV1.scale.scalar.end": 25004,
+        "AIV0.scale.vector.start": 24987,
+        "AIV1.scale.vector.start": 25004,
+        "AIV0.key1.done": 25079,
+        "AIV1.key1.done": 25096,
+        "AIV0.value.start": 25079,
+        "AIV1.value.start": 25096,
+        "AIV0.prefix.end": 25264,
+        "AIV1.prefix.end": 25281,
+        "AIV0.pairedVF.start": 25264,
+        "AIV1.pairedVF.start": 25281,
+        "AIV0.pairedVF.end": 25622,
+        "AIV1.pairedVF.end": 25639,
+        "AIV0.P2.post": 25672,
+        "AIV1.P2.post": 25692,
+        "AIC.PV2.post": 25995,
+        "AIV0.P3.post": 27168,
+        "AIV1.P3.post": 27172,
+        "AIC.PV3.post": 27478,
+        "AIV0.output0.start": 30481,
+        "AIV0.output1.start": 31291,
+        "AIV0.output2.start": 31292,
+        "AIV0.output3.start": 31293,
+        "AIV1.output0.start": 30294,
+        "AIV1.output1.start": 31118,
+        "AIV1.output2.start": 31119,
+        "AIV1.output3.start": 31120,
+        "AIV0.output0.end": 31039,
+        "AIV0.output1.end": 31824,
+        "AIV0.output2.end": 31843,
+        "AIV0.output3.end": 31845,
+        "AIV1.output0.end": 30861,
+        "AIV1.output1.end": 31613,
+        "AIV1.output2.end": 31615,
+        "AIV1.output3.end": 31647,
+        "AIV0.END": 33829,
+        "AIV1.END": 33654,
+        "AIC.join1": 31859,
+        "AIC.join2": 33383,
+        "AIC.branch": 34800,
+        "AIC.END": 34803,
+        "STOP": 34850
+      },
+      "shared_hbm": {
+        "policy": "fixed measured shared-bus envelopes; new overlap rejected",
+        "mte2": [
+          {
+            "core": "AIV0",
+            "kind": "query",
+            "index": 0,
+            "start": 5411,
+            "end": 5977,
+            "initiation": 200,
+            "measured_service_contention_residual": 366
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 0,
+            "start": 5469,
+            "end": 6212,
+            "initiation": 200,
+            "measured_service_contention_residual": 543
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 1,
+            "start": 5753,
+            "end": 7002,
+            "initiation": 200,
+            "measured_service_contention_residual": 1049
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 2,
+            "start": 13619,
+            "end": 14301,
+            "initiation": 200,
+            "measured_service_contention_residual": 482
+          },
+          {
+            "core": "AIV0",
+            "kind": "packed",
+            "index": 3,
+            "start": 14124,
+            "end": 14841,
+            "initiation": 200,
+            "measured_service_contention_residual": 517
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 0,
+            "start": 5498,
+            "end": 6271,
+            "initiation": 200,
+            "measured_service_contention_residual": 573
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 1,
+            "start": 5781,
+            "end": 7080,
+            "initiation": 200,
+            "measured_service_contention_residual": 1099
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 2,
+            "start": 17042,
+            "end": 17608,
+            "initiation": 200,
+            "measured_service_contention_residual": 366
+          },
+          {
+            "core": "AIV0",
+            "kind": "scales",
+            "index": 3,
+            "start": 17224,
+            "end": 17793,
+            "initiation": 200,
+            "measured_service_contention_residual": 369
+          },
+          {
+            "core": "AIV1",
+            "kind": "query",
+            "index": 0,
+            "start": 5554,
+            "end": 6382,
+            "initiation": 200,
+            "measured_service_contention_residual": 628
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 0,
+            "start": 5612,
+            "end": 6638,
+            "initiation": 200,
+            "measured_service_contention_residual": 826
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 1,
+            "start": 5896,
+            "end": 7332,
+            "initiation": 200,
+            "measured_service_contention_residual": 1236
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 2,
+            "start": 13654,
+            "end": 14580,
+            "initiation": 200,
+            "measured_service_contention_residual": 726
+          },
+          {
+            "core": "AIV1",
+            "kind": "packed",
+            "index": 3,
+            "start": 14195,
+            "end": 15158,
+            "initiation": 200,
+            "measured_service_contention_residual": 763
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 0,
+            "start": 5641,
+            "end": 6724,
+            "initiation": 200,
+            "measured_service_contention_residual": 883
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 1,
+            "start": 5924,
+            "end": 7398,
+            "initiation": 200,
+            "measured_service_contention_residual": 1274
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 2,
+            "start": 17166,
+            "end": 17717,
+            "initiation": 200,
+            "measured_service_contention_residual": 351
+          },
+          {
+            "core": "AIV1",
+            "kind": "scales",
+            "index": 3,
+            "start": 17350,
+            "end": 17911,
+            "initiation": 200,
+            "measured_service_contention_residual": 361
+          }
+        ],
+        "output_common_shift": -85,
+        "latest_ingress": 17911,
+        "earliest_output": 30294,
+        "aic_policy": "unchanged AIC memory traffic and upstream scalar cold costs"
+      },
+      "edges": {
+        "origin": [],
+        "AIC.QK3.post": [
+          {
+            "source": "origin",
+            "lag": 24965,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.score0.received": [
+          {
+            "source": "origin",
+            "lag": 24689,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.key0.done": [
+          {
+            "source": "origin",
+            "lag": 24872,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.prefix.admission": [
+          {
+            "source": "origin",
+            "lag": 24761,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV0.score1.ready": [
+          {
+            "source": "AIC.QK3.post",
+            "lag": 9,
+            "kind": "score data"
+          }
+        ],
+        "AIV0.prefix.start": [
+          {
+            "source": "AIV0.prefix.admission",
+            "lag": 0,
+            "kind": "source issue"
+          },
+          {
+            "source": "AIV0.key0.done",
+            "lag": 0,
+            "kind": "conservative whole-prefix serialization"
+          }
+        ],
+        "AIV0.scale.scalar.end": [
+          {
+            "source": "AIV0.prefix.start",
+            "lag": 115,
+            "kind": "retained descriptor cost"
+          }
+        ],
+        "AIV0.scale.vector.start": [
+          {
+            "source": "AIV0.scale.scalar.end",
+            "lag": 0,
+            "kind": "descriptor ready"
+          },
+          {
+            "source": "AIV0.key0.done",
+            "lag": 0,
+            "kind": "single AIV Vector queue"
+          }
+        ],
+        "AIV0.key1.done": [
+          {
+            "source": "AIV0.scale.vector.start",
+            "lag": 92,
+            "kind": "key scale VF service"
+          }
+        ],
+        "AIV0.value.start": [
+          {
+            "source": "AIV0.key1.done",
+            "lag": 0,
+            "kind": "Vector order"
+          },
+          {
+            "source": "AIV0.score1.ready",
+            "lag": 0,
+            "kind": "retained score wait"
+          }
+        ],
+        "AIV0.prefix.end": [
+          {
+            "source": "AIV0.value.start",
+            "lag": 185,
+            "kind": "retained value preparation/admission"
+          }
+        ],
+        "AIV0.pairedVF.start": [
+          {
+            "source": "AIV0.prefix.end",
+            "lag": 0,
+            "kind": "retained/added pre-VF residual"
+          },
+          {
+            "source": "AIV0.score1.ready",
+            "lag": 0,
+            "kind": "score1 data"
+          },
+          {
+            "source": "AIV0.score0.received",
+            "lag": 0,
+            "kind": "score0 data"
+          }
+        ],
+        "AIV0.pairedVF.end": [
+          {
+            "source": "AIV0.pairedVF.start",
+            "lag": 358,
+            "kind": "paired VF unchanged"
+          }
+        ],
+        "AIV0.P2.post": [
+          {
+            "source": "AIV0.pairedVF.end",
+            "lag": 50,
+            "kind": "P2 copy/fence"
+          }
+        ],
+        "AIV1.score0.received": [
+          {
+            "source": "origin",
+            "lag": 24706,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.key0.done": [
+          {
+            "source": "origin",
+            "lag": 24889,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.prefix.admission": [
+          {
+            "source": "origin",
+            "lag": 24778,
+            "kind": "retained upstream work"
+          }
+        ],
+        "AIV1.score1.ready": [
+          {
+            "source": "AIC.QK3.post",
+            "lag": 9,
+            "kind": "score data"
+          }
+        ],
+        "AIV1.prefix.start": [
+          {
+            "source": "AIV1.prefix.admission",
+            "lag": 0,
+            "kind": "source issue"
+          },
+          {
+            "source": "AIV1.key0.done",
+            "lag": 0,
+            "kind": "conservative whole-prefix serialization"
+          }
+        ],
+        "AIV1.scale.scalar.end": [
+          {
+            "source": "AIV1.prefix.start",
+            "lag": 115,
+            "kind": "retained descriptor cost"
+          }
+        ],
+        "AIV1.scale.vector.start": [
+          {
+            "source": "AIV1.scale.scalar.end",
+            "lag": 0,
+            "kind": "descriptor ready"
+          },
+          {
+            "source": "AIV1.key0.done",
+            "lag": 0,
+            "kind": "single AIV Vector queue"
+          }
+        ],
+        "AIV1.key1.done": [
+          {
+            "source": "AIV1.scale.vector.start",
+            "lag": 92,
+            "kind": "key scale VF service"
+          }
+        ],
+        "AIV1.value.start": [
+          {
+            "source": "AIV1.key1.done",
+            "lag": 0,
+            "kind": "Vector order"
+          },
+          {
+            "source": "AIV1.score1.ready",
+            "lag": 0,
+            "kind": "retained score wait"
+          }
+        ],
+        "AIV1.prefix.end": [
+          {
+            "source": "AIV1.value.start",
+            "lag": 185,
+            "kind": "retained value preparation/admission"
+          }
+        ],
+        "AIV1.pairedVF.start": [
+          {
+            "source": "AIV1.prefix.end",
+            "lag": 0,
+            "kind": "retained/added pre-VF residual"
+          },
+          {
+            "source": "AIV1.score1.ready",
+            "lag": 0,
+            "kind": "score1 data"
+          },
+          {
+            "source": "AIV1.score0.received",
+            "lag": 0,
+            "kind": "score0 data"
+          }
+        ],
+        "AIV1.pairedVF.end": [
+          {
+            "source": "AIV1.pairedVF.start",
+            "lag": 358,
+            "kind": "paired VF unchanged"
+          }
+        ],
+        "AIV1.P2.post": [
+          {
+            "source": "AIV1.pairedVF.end",
+            "lag": 53,
+            "kind": "P2 copy/fence"
+          }
+        ],
+        "AIC.PV2.post": [
+          {
+            "source": "AIV0.P2.post",
+            "lag": 303,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIV1.P2.post",
+            "lag": 303,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIC.QK3.post",
+            "lag": 1,
+            "kind": "single AIC product issue queue"
+          }
+        ],
+        "AIV0.P3.post": [
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1173,
+            "kind": "ordered recurrence and P3 publication"
+          }
+        ],
+        "AIV1.P3.post": [
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1177,
+            "kind": "ordered recurrence and P3 publication"
+          }
+        ],
+        "AIC.PV3.post": [
+          {
+            "source": "AIV0.P3.post",
+            "lag": 306,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIV1.P3.post",
+            "lag": 306,
+            "kind": "quorum + unchanged GEMM/Fixpipe"
+          },
+          {
+            "source": "AIC.PV2.post",
+            "lag": 1,
+            "kind": "single AIC product issue queue"
+          }
+        ],
+        "AIV0.output0.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3003,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output0.end": [
+          {
+            "source": "AIV0.output0.start",
+            "lag": 558,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output1.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3813,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output1.end": [
+          {
+            "source": "AIV0.output1.start",
+            "lag": 533,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output2.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3814,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output2.end": [
+          {
+            "source": "AIV0.output2.start",
+            "lag": 551,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.output3.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3815,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV0.output3.end": [
+          {
+            "source": "AIV0.output3.start",
+            "lag": 552,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV0.END": [
+          {
+            "source": "AIV0.output0.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output1.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output2.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV0.output3.end",
+            "lag": 1984,
+            "kind": "role terminal work"
+          }
+        ],
+        "AIV1.output0.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 2816,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output0.end": [
+          {
+            "source": "AIV1.output0.start",
+            "lag": 567,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output1.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3640,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output1.end": [
+          {
+            "source": "AIV1.output1.start",
+            "lag": 495,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output2.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3641,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output2.end": [
+          {
+            "source": "AIV1.output2.start",
+            "lag": 496,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.output3.start": [
+          {
+            "source": "AIC.PV3.post",
+            "lag": 3642,
+            "kind": "retained normalize/output scalar work"
+          }
+        ],
+        "AIV1.output3.end": [
+          {
+            "source": "AIV1.output3.start",
+            "lag": 527,
+            "kind": "measured shared-HBM envelope"
+          }
+        ],
+        "AIV1.END": [
+          {
+            "source": "AIV1.output0.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output1.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output2.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          },
+          {
+            "source": "AIV1.output3.end",
+            "lag": 2007,
+            "kind": "role terminal work"
+          }
+        ],
+        "AIC.join1": [
+          {
+            "source": "AIV0.output0.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output1.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output2.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV0.output3.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output0.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output1.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output2.end",
+            "lag": 14,
+            "kind": "task output join"
+          },
+          {
+            "source": "AIV1.output3.end",
+            "lag": 14,
+            "kind": "task output join"
+          }
+        ],
+        "AIC.join2": [
+          {
+            "source": "AIC.join1",
+            "lag": 1524,
+            "kind": "retained task join/scalar tail"
+          }
+        ],
+        "AIC.branch": [
+          {
+            "source": "AIC.join2",
+            "lag": 1417,
+            "kind": "retained scalar tail"
+          }
+        ],
+        "AIC.END": [
+          {
+            "source": "AIC.branch",
+            "lag": 3,
+            "kind": "measured unexplained branch-to-END gap"
+          }
+        ],
+        "STOP": [
+          {
+            "source": "AIC.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          },
+          {
+            "source": "AIV0.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          },
+          {
+            "source": "AIV1.END",
+            "lag": 47,
+            "kind": "model stop latency"
+          }
+        ]
+      }
+    }
+  ],
+  "combination": "K+KV = KV; no additive saving",
+  "held_out_slot01": {
+    "measured": 36494,
+    "status": "not predicted: local final-pair model cannot forecast new prologue"
+  },
+  "uncertainty": "457+191 sensitivity is an observed-scale stress scenario, not a probabilistic bound",
+  "validation": "Independent longest-path and event-readiness solvers match all nodes; two baselines replay exactly; finite ring horizons and cycle negative pass"
+}
