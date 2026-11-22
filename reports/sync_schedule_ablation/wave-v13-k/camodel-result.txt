@@ -1,0 +1,6 @@
+launch  N  208  pre-rotated/st0 stage 0  oracle  grid 1  tiles 4  tail 16  heads 6/1  one-block depth-2 wrap and drain
+PASS workspace telemetry: 6 per-head records, all other words intact
+Model RUN TIME: 29235.6 ms
+[INFO] Total tick: 37203
+[INFO] Model stopped successfully.
+PASS softmax-register-vf: one block, four tiles, depth 2, BF16 oracle worst ULP 0.

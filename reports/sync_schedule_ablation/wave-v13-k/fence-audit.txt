@@ -1,0 +1,8 @@
+ok       PIPE_FIX  flag (mode 2, FIX_S(eventId))
+ok       PIPE_MTE3 flag (mode 2, MTE3_S(eventId))
+ok       PIPE_FIX  static_cast<uint16_t>(kOptFlagScoresReady + kWindow) (mode 2, FIX_S(eventId))
+ok       PIPE_FIX  static_cast<uint16_t>(kOptFlagContextReady) (mode 2, FIX_S(eventId))
+ok       PIPE_FIX  static_cast<uint16_t>(kOptFlagSlotFree + kSlot) (mode 2, FIX_S(eventId))
+ok       PIPE_MTE3 static_cast<uint16_t>(kOptFlagProbsReady) (mode 2, MTE3_S(eventId))
+ok       PIPE_MTE3 static_cast<uint16_t>(kOptFlagSlotReady + slot) (mode 2, MTE3_S(eventId))
+PASS 7 fenced announcements from audit_cross_core_fences.py; negative control rejected

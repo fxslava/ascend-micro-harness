@@ -6,6 +6,7 @@ reports/decode_comparison_*/trace.json -text
 reports/fused_decode_opt_json_*/trace.json -text
 reports/decode_trace_comparison_*/matched_context_128_overlay.json -text
 reports/decode_trace_comparison_*/old_bf16_n16_source/trace.json -text
+reports/sync_schedule_ablation/wave-v13-k/inputs.sha256 -text
 
 # Frozen Wave 1 E8 source and byte-exact golden payloads.
 routines/routine_e8_bf16_dequant_simt.hpp text eol=lf

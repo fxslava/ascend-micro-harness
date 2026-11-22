@@ -1,0 +1,4 @@
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:2272 halGetSocVersion:halGetSocVersion soc_version:Ascend950PR_9589
+HOST PASS native packed-input attention oracle at 0 BF16 ULP for 1536 outputs.
+HOST PASS depth-2 geometry: grid=1, tiles=4, context=208, tail=16

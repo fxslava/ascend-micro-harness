@@ -1,0 +1,19 @@
+--- a/src/decode/turboquant_fused_decode.cpp
++++ b/src/decode/turboquant_fused_decode.cpp
+@@ -519,8 +519,14 @@
+             ((secondAbsolute & task.pageMask) << fd::kDecodeTileRowsShift);
+         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady));
+         vector_.template PreparePairLogits<0>();
+-        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady + 1));
+-        vector_.template PreparePairLogits<1>();
++        if (task.numTiles - first <= 3) {
++            // The final pair's resident key scales do not depend on score 1.
++            vector_.template PreparePairLogits<1>();
++            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady + 1));
++        } else {
++            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady + 1));
++            vector_.template PreparePairLogits<1>();
++        }
+         const uint32_t secondValid = second == task.lastTile ? task.lastValid : kCubeTileRows;
+         vector_.ComputePreparedSoftmaxPair(firstContext, firstPage, secondContext, secondPage, secondValid);
+     }
